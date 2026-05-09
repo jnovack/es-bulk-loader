@@ -764,7 +764,7 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 	}
 
 	if shouldCreateIndex {
-		body := buildCreateIndexBody(*settingsFile, *mappingsFile, defaultPipeline, variables)
+		body := buildCreateIndexBody(es, *settingsFile, *mappingsFile, defaultPipeline, variables)
 		createIndex := *index
 		if *aliasMode {
 			createIndex = createdIndex
@@ -1505,16 +1505,50 @@ func flushAndCheck(es *elasticsearch.Client, index string) {
 	}
 }
 
+// clusterReplicaCount queries the cluster node count and returns the appropriate
+// number_of_replicas value for the topology.
+// ADR: docs/decisions/0001-replica-count-from-node-count.md
+func clusterReplicaCount(es *elasticsearch.Client) int {
+	if es == nil {
+		return 0
+	}
+	res, err := es.Nodes.Info()
+	if err != nil {
+		log.Warn().Err(err).Msg("Could not query cluster nodes; defaulting to 0 replicas")
+		return 0
+	}
+	defer res.Body.Close()
+	if res.IsError() {
+		log.Warn().Int("status_code", res.StatusCode).Msg("Cluster nodes query failed; defaulting to 0 replicas")
+		return 0
+	}
+
+	var body struct {
+		Nodes map[string]json.RawMessage `json:"nodes"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		log.Warn().Err(err).Msg("Could not parse cluster nodes response; defaulting to 0 replicas")
+		return 0
+	}
+
+	if len(body.Nodes) > 1 {
+		return 1
+	}
+	return 0
+}
+
 // buildCreateIndexBody centralizes this code path so package behavior stays consistent.
-func buildCreateIndexBody(settingsFile, mappingsFile, defaultPipeline string, variables templateVariables) string {
-	settings := normalizeIndexSettings(settingsFile, defaultPipeline, variables)
+func buildCreateIndexBody(es *elasticsearch.Client, settingsFile, mappingsFile, defaultPipeline string, variables templateVariables) string {
+	// ADR: docs/decisions/0001-replica-count-from-node-count.md
+	replicas := clusterReplicaCount(es)
+	settings := normalizeIndexSettings(settingsFile, defaultPipeline, replicas, variables)
 	mappings := normalizeIndexSection(mappingsFile, "mappings", variables)
 
 	return fmt.Sprintf(`{"settings": %s, "mappings": %s}`, settings, mappings)
 }
 
 // normalizeIndexSettings centralizes this code path so package behavior stays consistent.
-func normalizeIndexSettings(path, defaultPipeline string, variables templateVariables) string {
+func normalizeIndexSettings(path, defaultPipeline string, replicas int, variables templateVariables) string {
 	settings := make(map[string]json.RawMessage)
 	if path != "" {
 		content, err := readTemplatedFile(path, variables)
@@ -1560,6 +1594,11 @@ func normalizeIndexSettings(path, defaultPipeline string, variables templateVari
 			log.Info().Str("pipeline", defaultPipeline).Msg("Using first declared pipeline as index.default_pipeline")
 		}
 	}
+
+	// ADR: docs/decisions/0001-replica-count-from-node-count.md — override whatever
+	// the settings file specifies so the value is always topology-correct.
+	settings["number_of_replicas"] = json.RawMessage(strconv.Itoa(replicas))
+	log.Info().Int("number_of_replicas", replicas).Msg("Setting index replica count from cluster topology")
 
 	normalized, err := json.Marshal(settings)
 	if err != nil {

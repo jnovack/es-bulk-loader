@@ -49,7 +49,7 @@ func TestNormalizeIndexSettingsUsesFirstPipelineWhenUnset(t *testing.T) {
 		t.Fatalf("write settings fixture: %v", err)
 	}
 
-	normalized := normalizeIndexSettings(path, "first-pipeline", nil)
+	normalized := normalizeIndexSettings(path, "first-pipeline", 0, nil)
 
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(normalized), &parsed); err != nil {
@@ -74,7 +74,7 @@ func TestNormalizeIndexSettingsPreservesExplicitDefault(t *testing.T) {
 		t.Fatalf("write settings fixture: %v", err)
 	}
 
-	normalized := normalizeIndexSettings(path, "first-pipeline", nil)
+	normalized := normalizeIndexSettings(path, "first-pipeline", 0, nil)
 
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(normalized), &parsed); err != nil {
@@ -96,7 +96,9 @@ func TestNormalizeIndexSettingsFlattensNestedIndexObject(t *testing.T) {
 		t.Fatalf("write settings fixture: %v", err)
 	}
 
-	normalized := normalizeIndexSettings(path, "first-pipeline", nil)
+	// Pass replicas=1 so the override value differs from the fixture value of 0,
+	// proving the topology value wins rather than the assertion passing by coincidence.
+	normalized := normalizeIndexSettings(path, "first-pipeline", 1, nil)
 
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(normalized), &parsed); err != nil {
@@ -112,8 +114,9 @@ func TestNormalizeIndexSettingsFlattensNestedIndexObject(t *testing.T) {
 	if got := parsed["number_of_shards"]; got != float64(1) {
 		t.Fatalf("expected number_of_shards to be flattened, got %#v", got)
 	}
-	if got := parsed["number_of_replicas"]; got != float64(0) {
-		t.Fatalf("expected number_of_replicas to be flattened, got %#v", got)
+	// Fixture specifies 0 but topology override is 1 — override must win.
+	if got := parsed["number_of_replicas"]; got != float64(1) {
+		t.Fatalf("expected number_of_replicas to reflect topology override, got %#v", got)
 	}
 	if got := parsed["default_pipeline"]; got != "first-pipeline" {
 		t.Fatalf("expected default_pipeline to be injected, got %#v", got)

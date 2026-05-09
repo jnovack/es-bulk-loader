@@ -200,7 +200,7 @@ func TestBuildCreateIndexBodySupportsWrappedAndRawSections(t *testing.T) {
 	wrappedSettings := writeTempJSON(t, tempDir, `{"settings":{"index.default_pipeline":"wrapped-pipeline"}}`)
 	rawMappings := writeTempJSON(t, tempDir, `{"properties":{"lookup_id":{"type":"keyword"}}}`)
 
-	body := buildCreateIndexBody(wrappedSettings, rawMappings, "ignored-default", buildTemplateVariables("runtime-index", nil))
+	body := buildCreateIndexBody(nil, wrappedSettings, rawMappings, "ignored-default", buildTemplateVariables("runtime-index", nil))
 
 	var parsed map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
@@ -642,6 +642,10 @@ func TestRunAliasFirstCreateUpsertsTransformsAfterAliasUpdate(t *testing.T) {
 		case method == http.MethodHead && path == "/collection":
 			w.WriteHeader(http.StatusNotFound)
 			return
+		case method == http.MethodGet && path == "/_nodes":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"nodes":{"node1":{}}}`))
+			return
 		case method == http.MethodPut && strings.HasPrefix(path, "/collection-"):
 			recordOp("index.create")
 			createdIndex = strings.TrimPrefix(path, "/")
@@ -766,6 +770,10 @@ func TestRunNonAliasCreateUpsertsTransformsAfterBulkLoad(t *testing.T) {
 				w.WriteHeader(http.StatusNotFound)
 			}
 			return
+		case method == http.MethodGet && path == "/_nodes":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"nodes":{"node1":{}}}`))
+			return
 		case method == http.MethodPut && path == "/collection":
 			recordOp("index.create")
 			indexReady = true
@@ -875,6 +883,10 @@ func TestRunCreatesPipelinesBeforeIndexWhenDefaultPipelineIsConfigured(t *testin
 			recordOp("pipeline.put")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{"acknowledged":true}`))
+			return
+		case method == http.MethodGet && path == "/_nodes":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"nodes":{"node1":{}}}`))
 			return
 		case method == http.MethodPut && path == "/cards":
 			recordOp("index.create")
