@@ -14,6 +14,7 @@ document loading, and optional enrich execution as one repeatable CLI or CI work
 - Bulk JSON loading with configurable batch sizes and optional `_id` override
 - Enrich execution after load, including source-index refresh before policy execution
 - Transform upsert/start lifecycle with source-index filtering from config
+- Mapping preflight guard that validates declared root field types and `date_detection` before bulk inserts
 - Practical input normalization for wrapped settings, nested `index` settings, and `index.*` keys
 - Safe-by-default policy deletion, with an explicit destructive override for dependent pipeline cleanup
 - Graceful handling for clusters that do not expose enrich APIs
@@ -170,13 +171,25 @@ When combined, the execution order is:
 
 1. Run `-nuke` first, if requested.
 2. Run the selected data action, if any (one of `-add`, `-flush`, or `-delete`).
-3. Create the index when needed, applying settings and mappings.
-4. Run `-sync-managed`, if requested.
+3. Create required ingest pipelines for index creation when `index.default_pipeline` is configured.
+4. Create the index when needed, applying settings and mappings.
 5. Bulk load data, if a data action was selected.
-6. Refresh the source index and execute enrich policies when `-enrich` is requested.
-7. Start selected transforms after enrich execution (or immediately after load when enrich is disabled).
+6. Update alias pointers, when alias mode creates a new concrete index.
+7. Create or update enrich policies during `-sync-managed` once the source index/alias is ready.
+8. Refresh the source index and execute enrich policies when `-enrich` is requested.
+9. Create or update selected transforms during `-sync-managed`.
+10. Start selected transforms after enrich execution (or immediately after transform upsert when enrich is disabled).
 
 That ordering matters. The loader is intentionally opinionated so CI runs and operator workflows stay predictable.
+
+When `-mappings` is provided, the loader derives a pre-bulk validation plan
+from the declared mapping and validates effective index mappings before loading
+documents:
+
+- Optional `mappings.date_detection` is checked when explicitly declared.
+- Declared top-level field `type` mappings are verified against effective index mappings.
+
+This fails early when effective mappings drift from declared mapping intent.
 
 ## Command-Line Flags
 
@@ -197,6 +210,9 @@ or from the command-line.
 | `-policies` | Optional path to JSON file with one or more enrich policy definitions |
 | `-transforms` | Optional path to JSON file with one or more transform definitions |
 | `-batch` | Number of documents per bulk insert (default: 1000) |
+| `-bulk-retry-attempts` | Total bulk API request attempts for retryable failures, including the first attempt (default: 4) |
+| `-bulk-retry-backoff-base` | Base backoff duration for retryable bulk failures (default: 500ms) |
+| `-bulk-retry-backoff-max` | Maximum backoff duration for retryable bulk failures (default: 5s) |
 | `-add` | Append data to an existing index or create the index first if it does not exist |
 | `-flush` | Delete all documents from an existing index without deleting the index, then load replacement data |
 | `-delete` | Recreate data target before loading data: deletes concrete index in normal mode; rolls alias to a new timestamped index in `-alias` mode |
@@ -314,7 +330,7 @@ When `-transforms` is provided, definitions are read from a keyed JSON object:
 - `body`: native Elasticsearch transform definition passed directly to the transform APIs.
 
 Only transforms whose `source_index` matches the current `-index` are selected for the run.
-During `-sync-managed`, selected transforms are stopped, upserted, and then started after enrich execution (or after load when enrich is disabled).
+During `-sync-managed`, selected transforms are stopped, upserted after data load and alias updates, and then started after enrich execution (or immediately after upsert when enrich is disabled).
 During `-nuke`, selected transforms are force-deleted.
 
 Definition file formats are documented in [docs/PIPELINES.md](docs/PIPELINES.md) and [docs/POLICIES.md](docs/POLICIES.md).
