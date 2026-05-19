@@ -933,6 +933,9 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 		result.EnrichFailed = enrichResult.Failed
 	}
 	if effectiveSyncManaged && len(transformSyncNames) > 0 {
+		// ADR: Keep transform readiness local to this stage; see
+		// adr/0002-refresh-write-index-before-starting-managed-transforms.md.
+		refreshIndex(es, writeIndex)
 		stopTransformsBestEffort(es, transformSyncNames)
 		createOrUpdateTransforms(es, transformDefinitions, transformSyncNames)
 		startTransforms(es, transformSyncNames)
@@ -2675,10 +2678,12 @@ func valueReferencesPolicy(value any, policy string) bool {
 
 // ─── Enrich Execution ──────────────────────────────────────────────────────────
 
-// refreshIndex centralizes this code path so package behavior stays consistent.
+// refreshIndex forces an immediate index refresh so subsequent reads see all
+// recently written documents. Called before enrich policy execution and before
+// batch transform start to eliminate the ES refresh-window race.
 func refreshIndex(es *elasticsearch.Client, index string) {
 	res, err := es.Indices.Refresh(es.Indices.Refresh.WithIndex(index))
-	checkErr("refreshing index before enrich execution", err)
+	checkErr("refreshing index", err)
 	defer res.Body.Close()
 
 	if res.IsError() {
@@ -2687,10 +2692,10 @@ func refreshIndex(es *elasticsearch.Client, index string) {
 			Str("index", index).
 			Int("status_code", res.StatusCode).
 			Str("body", string(body)).
-			Msg("Failed to refresh index before enrich execution")
+			Msg("Failed to refresh index")
 	}
 
-	log.Info().Str("index", index).Msg("Refreshed index before executing enrich policy")
+	log.Info().Str("index", index).Msg("Refreshed index")
 }
 
 // runEnrichPolicies centralizes this code path so package behavior stays consistent.

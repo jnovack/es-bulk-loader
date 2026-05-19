@@ -670,6 +670,11 @@ func TestRunAliasFirstCreateUpsertsTransformsAfterAliasUpdate(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"acknowledged":true}`))
 			return
+		case method == http.MethodPost && createdIndex != "" && path == "/"+createdIndex+"/_refresh":
+			recordOp("index.refresh")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"_shards":{"total":1,"successful":1,"failed":0}}`))
+			return
 		case method == http.MethodGet && path == "/_transform/collection-to-binder":
 			recordOp("transform.get")
 			w.Header().Set("Content-Type", "application/json")
@@ -785,6 +790,11 @@ func TestRunNonAliasCreateUpsertsTransformsAfterBulkLoad(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"errors":false,"items":[{"index":{"_index":"collection","_id":"1","status":201}}]}`))
 			return
+		case method == http.MethodPost && path == "/collection/_refresh":
+			recordOp("index.refresh")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"_shards":{"total":1,"successful":1,"failed":0}}`))
+			return
 		case method == http.MethodGet && path == "/_transform/collection-to-binder":
 			recordOp("transform.get")
 			w.Header().Set("Content-Type", "application/json")
@@ -848,6 +858,124 @@ func TestRunNonAliasCreateUpsertsTransformsAfterBulkLoad(t *testing.T) {
 	}
 	if transformPutIdx <= bulkIdx {
 		t.Fatalf("expected transform.put after bulk, got operations %v", operations)
+	}
+}
+
+// TestRunRefreshesIndexBeforeStartingTransforms verifies that a _refresh is issued
+// against the write index before any batch transform is started, preventing the
+// ES refresh-window race where a transform reads 0 docs from an unrefreshed index.
+func TestRunRefreshesIndexBeforeStartingTransforms(t *testing.T) {
+	t.Parallel()
+
+	var (
+		mu         sync.Mutex
+		operations []string
+		indexReady bool
+	)
+	recordOp := func(op string) {
+		mu.Lock()
+		defer mu.Unlock()
+		operations = append(operations, op)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		method := r.Method
+		path := r.URL.Path
+
+		switch {
+		case method == http.MethodHead && path == "/collection":
+			if indexReady {
+				w.WriteHeader(http.StatusOK)
+			} else {
+				w.WriteHeader(http.StatusNotFound)
+			}
+			return
+		case method == http.MethodGet && path == "/_nodes":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"nodes":{"node1":{}}}`))
+			return
+		case method == http.MethodPut && path == "/collection":
+			recordOp("index.create")
+			indexReady = true
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"acknowledged":true}`))
+			return
+		case method == http.MethodPost && path == "/_bulk":
+			recordOp("bulk")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"errors":false,"items":[{"index":{"_index":"collection","_id":"1","status":201}}]}`))
+			return
+		case method == http.MethodPost && path == "/collection/_refresh":
+			recordOp("index.refresh")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"_shards":{"total":1,"successful":1,"failed":0}}`))
+			return
+		case method == http.MethodGet && path == "/_transform/collection-to-binder":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"count":0,"transforms":[]}`))
+			return
+		case method == http.MethodPost && path == "/_transform/collection-to-binder/_stop":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":{"type":"resource_not_found_exception"}}`))
+			return
+		case method == http.MethodPut && path == "/_transform/collection-to-binder":
+			recordOp("transform.put")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"acknowledged":true}`))
+			return
+		case method == http.MethodPost && path == "/_transform/collection-to-binder/_start":
+			recordOp("transform.start")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"acknowledged":true}`))
+			return
+		default:
+			t.Fatalf("unexpected request: %s %s", method, path)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	tempDir := t.TempDir()
+	dataPath := filepath.Join(tempDir, "data.json")
+	if err := os.WriteFile(dataPath, []byte(`[{"id":"1","name":"card"}]`), 0o644); err != nil {
+		t.Fatalf("write data fixture: %v", err)
+	}
+	transformsPath := filepath.Join(tempDir, "transforms.json")
+	if err := os.WriteFile(transformsPath, []byte(`{
+  "collection-to-binder": {
+    "source_index": "collection",
+    "body": {"source":{"index":"collection"},"dest":{"index":"binder"}}
+  }
+}`), 0o644); err != nil {
+		t.Fatalf("write transforms fixture: %v", err)
+	}
+
+	_, err := Run(context.Background(), Options{
+		URL:            server.URL,
+		Index:          "collection",
+		DataFile:       dataPath,
+		AddToIndex:     true,
+		SyncManaged:    true,
+		TransformsFile: transformsPath,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	refreshIdx := firstOperationIndex(operations, "index.refresh")
+	startIdx := firstOperationIndex(operations, "transform.start")
+
+	if refreshIdx == -1 {
+		t.Fatalf("expected index.refresh operation, got %v", operations)
+	}
+	if startIdx == -1 {
+		t.Fatalf("expected transform.start operation, got %v", operations)
+	}
+	if startIdx <= refreshIdx {
+		t.Fatalf("expected transform.start after index.refresh, got operations %v", operations)
 	}
 }
 
