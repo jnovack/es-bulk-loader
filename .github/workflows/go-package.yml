@@ -1,10 +1,12 @@
-name: Go Cross-Compile and Release
+name: Go Release Binaries
+# Builds cross-compiled binaries for linux/amd64, linux/arm64, and windows/amd64
+# and attaches them to the GitHub release created by the semver tag.
 
 on:
   push:
     tags:
-      - "v*.*.*" # e.g. PASS v1.0.0
-      - "!v*-*" # e.g. IGNORE on v1.0.0-pre1
+      - "v*.*.*"
+      - "!v*-*"
   workflow_dispatch:
 
 jobs:
@@ -19,113 +21,80 @@ jobs:
         run: |
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
             echo "is_valid=true" >> "${GITHUB_OUTPUT}"
-          elif [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          elif [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-((alpha|beta|pre|rc)([.-][0-9A-Za-z]+)*))?(\+[0-9A-Za-z.-]+)?$ ]]; then
             echo "is_valid=true" >> "${GITHUB_OUTPUT}"
           else
             echo "is_valid=false" >> "${GITHUB_OUTPUT}"
             echo "Tag ${GITHUB_REF_NAME} is not a full semver tag like v1.3.0"
           fi
 
-  build:
+  create_release:
     runs-on: ubuntu-latest
     needs: validate_tag
     if: needs.validate_tag.outputs.is_valid == 'true'
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PREV=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || git rev-list --max-parents=0 HEAD)
+          NOTES=$(git log "${PREV}..HEAD" --no-merges --pretty=format:"* %s (%h)")
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" \
+            --notes "${NOTES}" \
+            --verify-tag
+
+  build:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    needs: create_release
+    permissions:
+      contents: write
     strategy:
       matrix:
-        goos: [linux, windows, darwin]
-        goarch: [amd64, arm64]
+        include:
+          - goos: linux
+            goarch: amd64
+            artifact: ${{ github.event.repository.name }}-linux-amd64
+          - goos: linux
+            goarch: arm64
+            artifact: ${{ github.event.repository.name }}-linux-arm64
+          - goos: windows
+            goarch: amd64
+            artifact: ${{ github.event.repository.name }}-windows-amd64.exe
+
     steps:
-      - name: Checkout
+      - name: Check out the repo
         uses: actions/checkout@v6
 
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: "1.25.x"
+          go-version-file: go.mod
+          cache: true
 
-      - name: Set release date
-        run: |
-          echo "BUILD_RFC3339=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> $GITHUB_ENV
-
-      - name: Determine version
-        id: vars
-        run: |
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            VERSION="${GITHUB_REF_NAME}"
-          else
-            SHORT_SHA=$(git rev-parse --short HEAD)
-            VERSION="dev-${SHORT_SHA}"
-          fi
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-
-      - name: Build
-        run: |
-          echo "Building for ${{ matrix.goos }}/${{ matrix.goarch }}"
-          mkdir -p dist
-          VERSION=${{ steps.vars.outputs.version }}
-          BUILD_RFC3339=${BUILD_RFC3339}
-          REVISION=${GITHUB_SHA}
-          BIN_NAME="${{ vars.GOLANG_APPLICATION }}-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}"
-          if [ "${{ matrix.goos }}" = "windows" ]; then
-            BIN_NAME="${BIN_NAME}.exe"
-          fi
-          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
-            go build -ldflags="-s -w -X main.version=${VERSION} -X main.buildRFC3339=${BUILD_RFC3339} -X main.revision=${REVISION}" \
-            -o "dist/${BIN_NAME}" ./cmd/${{ vars.GOLANG_APPLICATION }}
-
-      - name: Package archive
-        run: |
-          cd dist
-          VERSION=${{ steps.vars.outputs.version }}
-          BASE="${{ vars.GOLANG_APPLICATION }}-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}"
-          if [ "${{ matrix.goos }}" = "windows" ]; then
-            zip "${BASE}.zip" "${BASE}.exe"
-            rm "${BASE}.exe"
-          else
-            tar -czf "${BASE}.tar.gz" "${BASE}"
-            rm "${BASE}"
-          fi
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v6
-        with:
-          name: ${{ vars.GOLANG_APPLICATION }}-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/*
-
-  release:
-    needs: [build, validate_tag]
-    if: needs.validate_tag.outputs.is_valid == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Download all build artifacts
-        uses: actions/download-artifact@v8
-        with:
-          path: dist
-
-      - name: Generate release notes
-        id: notes
-        run: |
-          echo "notes<<EOF" >> $GITHUB_OUTPUT
-          echo "## Changes since last release" >> $GITHUB_OUTPUT
-          git fetch --tags
-          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
-          if [ -n "$PREV_TAG" ]; then
-            git log --pretty=format:'- %s' ${PREV_TAG}..HEAD >> $GITHUB_OUTPUT
-          else
-            git log --pretty=format:'- %s' >> $GITHUB_OUTPUT
-          fi
-          echo >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          body: ${{ steps.notes.outputs.notes }}
-          files: dist/**/*
+      - name: Build binary
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          go build \
+            -ldflags "-s -w \
+              -X main.version=${{ github.ref_name }} \
+              -X main.revision=${{ github.sha }} \
+              -X main.buildRFC3339=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+            -o ${{ matrix.artifact }} \
+            ./cmd/${{ github.event.repository.name }}/main.go
+
+      - name: Upload binary to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.ref_name }}" "${{ matrix.artifact }}"
