@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -747,6 +748,140 @@ func TestRunAliasFirstCreateUpsertsTransformsAfterAliasUpdate(t *testing.T) {
 	}
 }
 
+// TestRunNDJSONAliasFirstCreateUpsertsTransformsAfterAliasUpdate verifies behavior for the related scenario.
+func TestRunNDJSONAliasFirstCreateUpsertsTransformsAfterAliasUpdate(t *testing.T) {
+	t.Parallel()
+
+	var (
+		mu           sync.Mutex
+		operations   []string
+		aliasUpdated bool
+		createdIndex string
+	)
+	recordOp := func(op string) {
+		mu.Lock()
+		defer mu.Unlock()
+		operations = append(operations, op)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		method := r.Method
+		path := r.URL.Path
+
+		switch {
+		case method == http.MethodGet && path == "/_alias/collection":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":{"type":"index_not_found_exception"}}`))
+			return
+		case method == http.MethodHead && path == "/collection":
+			w.WriteHeader(http.StatusNotFound)
+			return
+		case method == http.MethodGet && path == "/_nodes":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"nodes":{"node1":{}}}`))
+			return
+		case method == http.MethodPut && strings.HasPrefix(path, "/collection-"):
+			recordOp("index.create")
+			createdIndex = strings.TrimPrefix(path, "/")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"acknowledged":true}`))
+			return
+		case method == http.MethodHead && strings.HasPrefix(path, "/collection-"):
+			if createdIndex != "" && path == "/"+createdIndex {
+				w.WriteHeader(http.StatusOK)
+			} else {
+				w.WriteHeader(http.StatusNotFound)
+			}
+			return
+		case method == http.MethodPost && path == "/_bulk":
+			recordOp("bulk")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"errors":false,"items":[{"index":{"_index":"collection","_id":"1","status":201}}]}`))
+			return
+		case method == http.MethodPost && path == "/_aliases":
+			recordOp("alias.update")
+			aliasUpdated = true
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"acknowledged":true}`))
+			return
+		case method == http.MethodPost && createdIndex != "" && path == "/"+createdIndex+"/_refresh":
+			recordOp("index.refresh")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"_shards":{"total":1,"successful":1,"failed":0}}`))
+			return
+		case method == http.MethodGet && path == "/_transform/collection-to-binder":
+			recordOp("transform.get")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"count":0,"transforms":[]}`))
+			return
+		case method == http.MethodPost && path == "/_transform/collection-to-binder/_stop":
+			recordOp("transform.stop")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":{"type":"resource_not_found_exception"}}`))
+			return
+		case method == http.MethodPut && path == "/_transform/collection-to-binder":
+			recordOp("transform.put")
+			if !aliasUpdated {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":{"type":"validation_exception","reason":"Validation Failed: 1: no such index [collection];"},"status":400}`))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"acknowledged":true}`))
+			return
+		case method == http.MethodPost && path == "/_transform/collection-to-binder/_start":
+			recordOp("transform.start")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"acknowledged":true}`))
+			return
+		default:
+			t.Fatalf("unexpected request: %s %s", method, path)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	tempDir := t.TempDir()
+	dataPath := filepath.Join(tempDir, "data.ndjson")
+	if err := os.WriteFile(dataPath, []byte("{\"id\":\"1\",\"name\":\"card\"}\n"), 0o644); err != nil {
+		t.Fatalf("write data fixture: %v", err)
+	}
+	transformsPath := filepath.Join(tempDir, "transforms.json")
+	if err := os.WriteFile(transformsPath, []byte(`{
+  "collection-to-binder": {
+    "source_index": "collection",
+    "body": {"source":{"index":"collection"},"dest":{"index":"binder"}}
+  }
+}`), 0o644); err != nil {
+		t.Fatalf("write transforms fixture: %v", err)
+	}
+
+	_, err := Run(context.Background(), Options{
+		URL:            server.URL,
+		Index:          "collection",
+		DataFile:       dataPath,
+		DeleteIndex:    true,
+		SyncManaged:    true,
+		AliasMode:      true,
+		TransformsFile: transformsPath,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	aliasIdx := firstOperationIndex(operations, "alias.update")
+	transformPutIdx := firstOperationIndex(operations, "transform.put")
+	if aliasIdx == -1 || transformPutIdx == -1 {
+		t.Fatalf("expected alias.update and transform.put operations, got %v", operations)
+	}
+	if transformPutIdx <= aliasIdx {
+		t.Fatalf("expected transform.put after alias.update, got operations %v", operations)
+	}
+}
+
 // TestRunNonAliasCreateUpsertsTransformsAfterBulkLoad verifies behavior for the related scenario.
 func TestRunNonAliasCreateUpsertsTransformsAfterBulkLoad(t *testing.T) {
 	t.Parallel()
@@ -824,6 +959,120 @@ func TestRunNonAliasCreateUpsertsTransformsAfterBulkLoad(t *testing.T) {
 	tempDir := t.TempDir()
 	dataPath := filepath.Join(tempDir, "data.json")
 	if err := os.WriteFile(dataPath, []byte(`[{"id":"1","name":"card"}]`), 0o644); err != nil {
+		t.Fatalf("write data fixture: %v", err)
+	}
+	transformsPath := filepath.Join(tempDir, "transforms.json")
+	if err := os.WriteFile(transformsPath, []byte(`{
+  "collection-to-binder": {
+    "source_index": "collection",
+    "body": {"source":{"index":"collection"},"dest":{"index":"binder"}}
+  }
+}`), 0o644); err != nil {
+		t.Fatalf("write transforms fixture: %v", err)
+	}
+
+	_, err := Run(context.Background(), Options{
+		URL:            server.URL,
+		Index:          "collection",
+		DataFile:       dataPath,
+		AddToIndex:     true,
+		SyncManaged:    true,
+		TransformsFile: transformsPath,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	bulkIdx := firstOperationIndex(operations, "bulk")
+	transformPutIdx := firstOperationIndex(operations, "transform.put")
+	if bulkIdx == -1 || transformPutIdx == -1 {
+		t.Fatalf("expected bulk and transform.put operations, got %v", operations)
+	}
+	if transformPutIdx <= bulkIdx {
+		t.Fatalf("expected transform.put after bulk, got operations %v", operations)
+	}
+}
+
+// TestRunNDJSONNonAliasCreateUpsertsTransformsAfterBulkLoad verifies behavior for the related scenario.
+func TestRunNDJSONNonAliasCreateUpsertsTransformsAfterBulkLoad(t *testing.T) {
+	t.Parallel()
+
+	var (
+		mu         sync.Mutex
+		operations []string
+		indexReady bool
+	)
+	recordOp := func(op string) {
+		mu.Lock()
+		defer mu.Unlock()
+		operations = append(operations, op)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		method := r.Method
+		path := r.URL.Path
+
+		switch {
+		case method == http.MethodHead && path == "/collection":
+			if indexReady {
+				w.WriteHeader(http.StatusOK)
+			} else {
+				w.WriteHeader(http.StatusNotFound)
+			}
+			return
+		case method == http.MethodGet && path == "/_nodes":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"nodes":{"node1":{}}}`))
+			return
+		case method == http.MethodPut && path == "/collection":
+			recordOp("index.create")
+			indexReady = true
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"acknowledged":true}`))
+			return
+		case method == http.MethodPost && path == "/_bulk":
+			recordOp("bulk")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"errors":false,"items":[{"index":{"_index":"collection","_id":"1","status":201}}]}`))
+			return
+		case method == http.MethodPost && path == "/collection/_refresh":
+			recordOp("index.refresh")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"_shards":{"total":1,"successful":1,"failed":0}}`))
+			return
+		case method == http.MethodGet && path == "/_transform/collection-to-binder":
+			recordOp("transform.get")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"count":0,"transforms":[]}`))
+			return
+		case method == http.MethodPost && path == "/_transform/collection-to-binder/_stop":
+			recordOp("transform.stop")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":{"type":"resource_not_found_exception"}}`))
+			return
+		case method == http.MethodPut && path == "/_transform/collection-to-binder":
+			recordOp("transform.put")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"acknowledged":true}`))
+			return
+		case method == http.MethodPost && path == "/_transform/collection-to-binder/_start":
+			recordOp("transform.start")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"acknowledged":true}`))
+			return
+		default:
+			t.Fatalf("unexpected request: %s %s", method, path)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	tempDir := t.TempDir()
+	dataPath := filepath.Join(tempDir, "data.ndjson")
+	if err := os.WriteFile(dataPath, []byte("{\"id\":\"1\",\"name\":\"card\"}\n"), 0o644); err != nil {
 		t.Fatalf("write data fixture: %v", err)
 	}
 	transformsPath := filepath.Join(tempDir, "transforms.json")
@@ -1120,6 +1369,48 @@ func TestRunRetriesBulkOnRetryableStatus(t *testing.T) {
 	}
 }
 
+// TestRunNDJSONRetriesBulkOnRetryableStatus verifies behavior for the related scenario.
+func TestRunNDJSONRetriesBulkOnRetryableStatus(t *testing.T) {
+	t.Parallel()
+
+	var bulkAttempts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/cards":
+			w.WriteHeader(http.StatusOK)
+			return
+		case r.Method == http.MethodPost && r.URL.Path == "/_bulk":
+			bulkAttempts++
+			if bulkAttempts == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte(`{"error":true,"message":"transient"}`))
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"errors":false,"items":[{"index":{"_index":"cards","_id":"1","status":201}}]}`))
+			return
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	_, err := Run(context.Background(), Options{
+		URL:        server.URL,
+		Index:      "cards",
+		DataFile:   writeBulkNDJSONFixture(t),
+		AddToIndex: true,
+		BatchSize:  1,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if bulkAttempts != 2 {
+		t.Fatalf("expected 2 bulk attempts, got %d", bulkAttempts)
+	}
+}
+
 // TestRunRetriesBulkOnTransportFailure verifies behavior for the related scenario.
 func TestRunRetriesBulkOnTransportFailure(t *testing.T) {
 	t.Parallel()
@@ -1169,6 +1460,55 @@ func TestRunRetriesBulkOnTransportFailure(t *testing.T) {
 	}
 }
 
+// TestRunNDJSONRetriesBulkOnTransportFailure verifies behavior for the related scenario.
+func TestRunNDJSONRetriesBulkOnTransportFailure(t *testing.T) {
+	t.Parallel()
+
+	var bulkAttempts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/cards":
+			w.WriteHeader(http.StatusOK)
+			return
+		case r.Method == http.MethodPost && r.URL.Path == "/_bulk":
+			bulkAttempts++
+			if bulkAttempts == 1 {
+				hijacker, ok := w.(http.Hijacker)
+				if !ok {
+					t.Fatal("response writer does not support hijacking")
+				}
+				conn, _, err := hijacker.Hijack()
+				if err != nil {
+					t.Fatalf("hijack returned error: %v", err)
+				}
+				_ = conn.Close()
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"errors":false,"items":[{"index":{"_index":"cards","_id":"1","status":201}}]}`))
+			return
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	_, err := Run(context.Background(), Options{
+		URL:        server.URL,
+		Index:      "cards",
+		DataFile:   writeBulkNDJSONFixture(t),
+		AddToIndex: true,
+		BatchSize:  1,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if bulkAttempts != 2 {
+		t.Fatalf("expected 2 bulk attempts, got %d", bulkAttempts)
+	}
+}
+
 // TestRunDoesNotRetryBulkOnBadRequest verifies behavior for the related scenario.
 func TestRunDoesNotRetryBulkOnBadRequest(t *testing.T) {
 	t.Parallel()
@@ -1206,6 +1546,43 @@ func TestRunDoesNotRetryBulkOnBadRequest(t *testing.T) {
 	}
 }
 
+// TestRunNDJSONDoesNotRetryBulkOnBadRequest verifies behavior for the related scenario.
+func TestRunNDJSONDoesNotRetryBulkOnBadRequest(t *testing.T) {
+	t.Parallel()
+
+	var bulkAttempts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/cards":
+			w.WriteHeader(http.StatusOK)
+			return
+		case r.Method == http.MethodPost && r.URL.Path == "/_bulk":
+			bulkAttempts++
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":true,"message":"bad request"}`))
+			return
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	_, err := Run(context.Background(), Options{
+		URL:        server.URL,
+		Index:      "cards",
+		DataFile:   writeBulkNDJSONFixture(t),
+		AddToIndex: true,
+		BatchSize:  1,
+	})
+	if err == nil {
+		t.Fatal("expected Run to fail")
+	}
+	if bulkAttempts != 1 {
+		t.Fatalf("expected 1 bulk attempt, got %d", bulkAttempts)
+	}
+}
+
 // TestRunExhaustsRetriesOnRetryableStatus verifies behavior for the related scenario.
 func TestRunExhaustsRetriesOnRetryableStatus(t *testing.T) {
 	t.Parallel()
@@ -1232,6 +1609,44 @@ func TestRunExhaustsRetriesOnRetryableStatus(t *testing.T) {
 		URL:               server.URL,
 		Index:             "cards",
 		DataFile:          writeBulkDataFixture(t),
+		AddToIndex:        true,
+		BatchSize:         1,
+		BulkRetryAttempts: 3,
+	})
+	if err == nil {
+		t.Fatal("expected Run to fail")
+	}
+	if bulkAttempts != 3 {
+		t.Fatalf("expected 3 bulk attempts, got %d", bulkAttempts)
+	}
+}
+
+// TestRunNDJSONExhaustsRetriesOnRetryableStatus verifies behavior for the related scenario.
+func TestRunNDJSONExhaustsRetriesOnRetryableStatus(t *testing.T) {
+	t.Parallel()
+
+	var bulkAttempts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/cards":
+			w.WriteHeader(http.StatusOK)
+			return
+		case r.Method == http.MethodPost && r.URL.Path == "/_bulk":
+			bulkAttempts++
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":true,"message":"too many requests"}`))
+			return
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	_, err := Run(context.Background(), Options{
+		URL:               server.URL,
+		Index:             "cards",
+		DataFile:          writeBulkNDJSONFixture(t),
 		AddToIndex:        true,
 		BatchSize:         1,
 		BulkRetryAttempts: 3,
@@ -1296,6 +1711,58 @@ func TestRunRetryBackoffCapsAtConfiguredMax(t *testing.T) {
 	}
 }
 
+// TestRunNDJSONRetryBackoffCapsAtConfiguredMax verifies behavior for the related scenario.
+func TestRunNDJSONRetryBackoffCapsAtConfiguredMax(t *testing.T) {
+	previousSleep := sleepWithContext
+	sleeps := make([]time.Duration, 0, 3)
+	sleepWithContext = func(_ context.Context, d time.Duration) error {
+		sleeps = append(sleeps, d)
+		return nil
+	}
+	t.Cleanup(func() {
+		sleepWithContext = previousSleep
+	})
+
+	var bulkAttempts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/cards":
+			w.WriteHeader(http.StatusOK)
+			return
+		case r.Method == http.MethodPost && r.URL.Path == "/_bulk":
+			bulkAttempts++
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":true,"message":"transient"}`))
+			return
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	_, err := Run(context.Background(), Options{
+		URL:                  server.URL,
+		Index:                "cards",
+		DataFile:             writeBulkNDJSONFixture(t),
+		AddToIndex:           true,
+		BatchSize:            1,
+		BulkRetryAttempts:    4,
+		BulkRetryBackoffBase: 200 * time.Millisecond,
+		BulkRetryBackoffMax:  300 * time.Millisecond,
+	})
+	if err == nil {
+		t.Fatal("expected Run to fail")
+	}
+	if bulkAttempts != 4 {
+		t.Fatalf("expected 4 bulk attempts, got %d", bulkAttempts)
+	}
+	wantSleeps := []time.Duration{200 * time.Millisecond, 300 * time.Millisecond, 300 * time.Millisecond}
+	if !reflect.DeepEqual(sleeps, wantSleeps) {
+		t.Fatalf("retry sleeps mismatch: got %v want %v", sleeps, wantSleeps)
+	}
+}
+
 // writeBulkDataFixture centralizes this code path so package behavior stays consistent.
 func writeBulkDataFixture(t *testing.T) string {
 	t.Helper()
@@ -1305,6 +1772,179 @@ func writeBulkDataFixture(t *testing.T) string {
 		t.Fatalf("write bulk fixture: %v", err)
 	}
 	return path
+}
+
+// writeBulkNDJSONFixture writes a minimal NDJSON data file for tests.
+// Mirrors writeBulkDataFixture but in NDJSON format.
+func writeBulkNDJSONFixture(t *testing.T) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "bulk.ndjson")
+	if err := os.WriteFile(path, []byte("{\"id\":\"1\",\"name\":\"card\"}\n"), 0o644); err != nil {
+		t.Fatalf("write NDJSON bulk fixture: %v", err)
+	}
+	return path
+}
+
+// TestPeekFirstByte verifies behavior for the related scenario.
+func TestPeekFirstByte(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		content string
+		want    byte
+		wantErr bool
+	}{
+		{name: "json array", content: `[{"id":"1"}]`, want: '['},
+		{name: "ndjson", content: "{\"id\":\"1\"}\n", want: '{'},
+		{name: "leading whitespace before array", content: "  \n[{\"id\":\"1\"}]", want: '['},
+		{name: "leading whitespace before object", content: "\t {\"id\":\"1\"}", want: '{'},
+		{name: "empty file", content: "", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			path := filepath.Join(t.TempDir(), "data.txt")
+			if err := os.WriteFile(path, []byte(tt.content), 0o644); err != nil {
+				t.Fatalf("write test file: %v", err)
+			}
+
+			got, err := peekFirstByte(path)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("peekFirstByte returned error: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("peekFirstByte(%q) = %q, want %q", path, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCountNDJSONLines verifies behavior for the related scenario.
+func TestCountNDJSONLines(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		content string
+		want    int
+	}{
+		{name: "empty", content: "", want: 0},
+		{name: "one line", content: "{\"a\":1}\n", want: 1},
+		{name: "two lines", content: "{\"a\":1}\n{\"b\":2}\n", want: 2},
+		{name: "blank line between docs", content: "{\"a\":1}\n\n{\"b\":2}\n", want: 2},
+		{name: "no trailing newline", content: "{\"a\":1}", want: 1},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			path := filepath.Join(t.TempDir(), "data.ndjson")
+			if err := os.WriteFile(path, []byte(tt.content), 0o644); err != nil {
+				t.Fatalf("write test file: %v", err)
+			}
+
+			got, err := countNDJSONLines(path)
+			if err != nil {
+				t.Fatalf("countNDJSONLines returned error: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("countNDJSONLines(%q) = %d, want %d", path, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestLoadNDJSONProducesCorrectDocuments verifies behavior for the related scenario.
+func TestLoadNDJSONProducesCorrectDocuments(t *testing.T) {
+	t.Parallel()
+
+	type bulkLine struct {
+		Index map[string]string `json:"index"`
+	}
+
+	wantDocs := []string{
+		`{"id":"1","name":"alpha","mana":1}`,
+		`{"id":"2","name":"beta","mana":2}`,
+		`{"id":"3","name":"gamma","mana":3}`,
+	}
+
+	dataPath := filepath.Join(t.TempDir(), "bulk.ndjson")
+	if err := os.WriteFile(dataPath, []byte(strings.Join(wantDocs, "\n")+"\n"), 0o644); err != nil {
+		t.Fatalf("write NDJSON fixture: %v", err)
+	}
+
+	var bulkBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/cards":
+			w.WriteHeader(http.StatusOK)
+			return
+		case r.Method == http.MethodPost && r.URL.Path == "/_bulk":
+			var err error
+			bulkBody, err = io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read bulk body: %v", err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"errors":false,"items":[{"index":{"_index":"cards","_id":"1","status":201}},{"index":{"_index":"cards","_id":"2","status":201}},{"index":{"_index":"cards","_id":"3","status":201}}]}`))
+			return
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	_, err := Run(context.Background(), Options{
+		URL:        server.URL,
+		Index:      "cards",
+		DataFile:   dataPath,
+		AddToIndex: true,
+		BatchSize:  10,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(bulkBody)), "\n")
+	if len(lines) != 6 {
+		t.Fatalf("expected 6 NDJSON lines in bulk body, got %d", len(lines))
+	}
+
+	for i := 0; i < len(lines); i += 2 {
+		var meta bulkLine
+		if err := json.Unmarshal([]byte(lines[i]), &meta); err != nil {
+			t.Fatalf("unmarshal bulk action line %d: %v", i, err)
+		}
+		if meta.Index == nil {
+			t.Fatalf("expected index action on line %d, got %s", i, lines[i])
+		}
+
+		var gotDoc map[string]interface{}
+		if err := json.Unmarshal([]byte(lines[i+1]), &gotDoc); err != nil {
+			t.Fatalf("unmarshal bulk document line %d: %v", i+1, err)
+		}
+		var wantDoc map[string]interface{}
+		if err := json.Unmarshal([]byte(wantDocs[i/2]), &wantDoc); err != nil {
+			t.Fatalf("unmarshal expected document %d: %v", i/2, err)
+		}
+		if !reflect.DeepEqual(gotDoc, wantDoc) {
+			t.Fatalf("document %d mismatch: got %v want %v", i/2, gotDoc, wantDoc)
+		}
+	}
 }
 
 // firstOperationIndex centralizes this code path so package behavior stays consistent.

@@ -1,6 +1,7 @@
 package loader
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -816,82 +817,50 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 		}
 		log.Info().Msg("Starting bulk insert")
 
-		f, err := os.Open(*dataFile)
-		checkErr("opening data file", err)
-		defer f.Close()
-
-		dec := json.NewDecoder(f)
-		tok, err := dec.Token()
-		if err != nil || tok != json.Delim('[') {
-			fatal().Msg("Data file must be a JSON array")
-		}
-
-		log.Debug().Str("data_file", *dataFile).Msg("Counting documents in data file")
-		total := 0
-		for dec.More() {
-			var tmp map[string]interface{}
-			if err := dec.Decode(&tmp); err != nil {
-				fatal().Err(err).Msg("Error counting objects in data file")
-			}
-			total++
-		}
-		log.Debug().Str("data_file", *dataFile).Int("total", total).Msg("Document count complete")
-
-		if _, err := f.Seek(0, 0); err != nil {
-			fatal().Err(err).Msg("Error rewinding data file")
-		}
-		dec = json.NewDecoder(f)
-		_, err = dec.Token()
+		// adr/0003-ndjson-data-file-support.md — format detected from first non-whitespace byte.
+		first, err := peekFirstByte(*dataFile)
 		if err != nil {
-			fatal().Err(err).Msg("Error re-reading data file")
+			fatal().Err(err).Msg("Cannot read data file")
 		}
 
 		overallStart := time.Now()
-		batch := make([]map[string]interface{}, 0, *batchSize)
-		processed := 0
 		succeededTotal := 0
 		failedTotal := 0
-		for dec.More() {
-			var doc map[string]interface{}
-			if err := dec.Decode(&doc); err != nil {
-				fatal().Err(err).Msg("Error decoding object in data file")
-			}
-			batch = append(batch, doc)
-			if len(batch) == *batchSize {
-				batchResult := bulkInsert(
-					ctx,
-					es,
-					writeIndex,
-					batch,
-					processed+len(batch),
-					total,
-					*bulkRetryAttempts,
-					*bulkRetryBackoffBase,
-					*bulkRetryBackoffMax,
-					*idField,
-				)
-				processed += len(batch)
-				succeededTotal += batchResult.Succeeded
-				failedTotal += batchResult.Failed
-				batch = batch[:0]
-			}
-		}
-		if len(batch) > 0 {
-			batchResult := bulkInsert(
+		processed := 0
+
+		switch first {
+		case '[':
+			loadJSONArray(
 				ctx,
 				es,
+				*dataFile,
 				writeIndex,
-				batch,
-				processed+len(batch),
-				total,
+				*batchSize,
 				*bulkRetryAttempts,
 				*bulkRetryBackoffBase,
 				*bulkRetryBackoffMax,
 				*idField,
+				&succeededTotal,
+				&failedTotal,
+				&processed,
 			)
-			processed += len(batch)
-			succeededTotal += batchResult.Succeeded
-			failedTotal += batchResult.Failed
+		case '{':
+			loadNDJSON(
+				ctx,
+				es,
+				*dataFile,
+				writeIndex,
+				*batchSize,
+				*bulkRetryAttempts,
+				*bulkRetryBackoffBase,
+				*bulkRetryBackoffMax,
+				*idField,
+				&succeededTotal,
+				&failedTotal,
+				&processed,
+			)
+		default:
+			fatal().Msgf("Data file first byte %q is neither '[' (JSON array) nor '{' (NDJSON)", first)
 		}
 
 		overallDuration := time.Since(overallStart)
@@ -3012,6 +2981,218 @@ func transformStartAlreadyStarted(statusCode int, body []byte) bool {
 }
 
 // ─── Bulk Insert ───────────────────────────────────────────────────────────────
+
+// peekFirstByte opens path and returns the first non-whitespace byte without
+// consuming it. The file is opened and closed internally; the caller does not
+// hold an open file handle after this call. Used to detect JSON array vs NDJSON
+// format before creating a decoder.
+// adr/0003-ndjson-data-file-support.md
+func peekFirstByte(path string) (byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	br := bufio.NewReader(f)
+	for {
+		b, err := br.ReadByte()
+		if err != nil {
+			return 0, err
+		}
+		if b != ' ' && b != '\t' && b != '\r' && b != '\n' {
+			return b, nil
+		}
+	}
+}
+
+// countNDJSONLines counts non-empty lines in path without parsing JSON.
+// Used to obtain a document total for progress reporting before the NDJSON
+// decode pass. The 10 MB scanner buffer accommodates large Elasticsearch
+// documents that would otherwise exceed the default 64 KB scanner limit.
+// adr/0003-ndjson-data-file-support.md
+func countNDJSONLines(path string) (int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 1<<20), 10<<20)
+	var n int
+	for sc.Scan() {
+		if len(bytes.TrimSpace(sc.Bytes())) > 0 {
+			n++
+		}
+	}
+
+	return n, sc.Err()
+}
+
+// loadJSONArray loads documents from a JSON array file into index using the
+// ES bulk API. It performs two passes: a count pass for progress reporting and
+// a decode pass that streams documents in batches of batchSize.
+// adr/0003-ndjson-data-file-support.md
+func loadJSONArray(
+	ctx context.Context,
+	es *elasticsearch.Client,
+	dataFile, index string,
+	batchSize int,
+	retryAttempts int,
+	retryBackoffBase, retryBackoffMax time.Duration,
+	idField string,
+	succeededTotal, failedTotal, processed *int,
+) {
+	f, err := os.Open(dataFile)
+	checkErr("opening data file", err)
+	defer f.Close()
+
+	dec := json.NewDecoder(f)
+	tok, err := dec.Token()
+	if err != nil || tok != json.Delim('[') {
+		fatal().Msg("Data file must be a JSON array")
+	}
+
+	log.Debug().Str("data_file", dataFile).Msg("Counting documents in data file")
+	total := 0
+	for dec.More() {
+		var tmp map[string]interface{}
+		if err := dec.Decode(&tmp); err != nil {
+			fatal().Err(err).Msg("Error counting objects in data file")
+		}
+		total++
+	}
+	log.Debug().Str("data_file", dataFile).Int("total", total).Msg("Document count complete")
+
+	if _, err := f.Seek(0, 0); err != nil {
+		fatal().Err(err).Msg("Error rewinding data file")
+	}
+	dec = json.NewDecoder(f)
+	_, err = dec.Token()
+	if err != nil {
+		fatal().Err(err).Msg("Error re-reading data file")
+	}
+
+	batch := make([]map[string]interface{}, 0, batchSize)
+	for dec.More() {
+		var doc map[string]interface{}
+		if err := dec.Decode(&doc); err != nil {
+			fatal().Err(err).Msg("Error decoding object in data file")
+		}
+		batch = append(batch, doc)
+		if len(batch) == batchSize {
+			batchResult := bulkInsert(
+				ctx,
+				es,
+				index,
+				batch,
+				*processed+len(batch),
+				total,
+				retryAttempts,
+				retryBackoffBase,
+				retryBackoffMax,
+				idField,
+			)
+			*processed += len(batch)
+			*succeededTotal += batchResult.Succeeded
+			*failedTotal += batchResult.Failed
+			batch = batch[:0]
+		}
+	}
+	if len(batch) > 0 {
+		batchResult := bulkInsert(
+			ctx,
+			es,
+			index,
+			batch,
+			*processed+len(batch),
+			total,
+			retryAttempts,
+			retryBackoffBase,
+			retryBackoffMax,
+			idField,
+		)
+		*processed += len(batch)
+		*succeededTotal += batchResult.Succeeded
+		*failedTotal += batchResult.Failed
+	}
+}
+
+// loadNDJSON loads documents from an NDJSON file (one JSON object per line)
+// into index using the ES bulk API. It performs a cheap byte-level line-count
+// pass for progress reporting, then streams documents with json.Decoder in
+// batches of batchSize.
+// adr/0003-ndjson-data-file-support.md
+func loadNDJSON(
+	ctx context.Context,
+	es *elasticsearch.Client,
+	dataFile, index string,
+	batchSize int,
+	retryAttempts int,
+	retryBackoffBase, retryBackoffMax time.Duration,
+	idField string,
+	succeededTotal, failedTotal, processed *int,
+) {
+	total, err := countNDJSONLines(dataFile)
+	if err != nil {
+		fatal().Err(err).Msg("Error counting NDJSON lines")
+	}
+	log.Debug().Str("data_file", dataFile).Int("total", total).Msg("NDJSON line count complete")
+
+	f, err := os.Open(dataFile)
+	if err != nil {
+		fatal().Err(err).Msg("Error opening NDJSON data file")
+	}
+	defer f.Close()
+
+	dec := json.NewDecoder(bufio.NewReaderSize(f, 1<<20))
+	batch := make([]map[string]interface{}, 0, batchSize)
+
+	for dec.More() {
+		var doc map[string]interface{}
+		if err := dec.Decode(&doc); err != nil {
+			fatal().Err(err).Msg("Error decoding NDJSON document")
+		}
+		batch = append(batch, doc)
+		if len(batch) == batchSize {
+			batchResult := bulkInsert(
+				ctx,
+				es,
+				index,
+				batch,
+				*processed+len(batch),
+				total,
+				retryAttempts,
+				retryBackoffBase,
+				retryBackoffMax,
+				idField,
+			)
+			*processed += len(batch)
+			*succeededTotal += batchResult.Succeeded
+			*failedTotal += batchResult.Failed
+			batch = batch[:0]
+		}
+	}
+
+	if len(batch) > 0 {
+		batchResult := bulkInsert(
+			ctx,
+			es,
+			index,
+			batch,
+			*processed+len(batch),
+			total,
+			retryAttempts,
+			retryBackoffBase,
+			retryBackoffMax,
+			idField,
+		)
+		*processed += len(batch)
+		*succeededTotal += batchResult.Succeeded
+		*failedTotal += batchResult.Failed
+	}
+}
 
 // bulkInsert handles a batch of documents and validates per-item bulk response status.
 func bulkInsert(

@@ -11,7 +11,7 @@ document loading, and optional enrich execution as one repeatable CLI or CI work
 - Managed Elasticsearch resources: settings, mappings, ingest pipelines, enrich policies, and transforms
 - Keyed JSON definitions for multiple pipelines or policies in a single file
 - Automatic default-pipeline selection from the first declared pipeline when settings leave it unset
-- Bulk JSON loading with configurable batch sizes and optional `_id` override
+- Bulk JSON array or NDJSON loading with configurable batch sizes and optional `_id` override
 - Enrich execution after load, including source-index refresh before policy execution
 - Transform upsert/start lifecycle with source-index filtering from config
 - Mapping preflight guard that validates declared root field types and `date_detection` before bulk inserts
@@ -216,7 +216,7 @@ or from the command-line.
 | `-add` | Append data to an existing index or create the index first if it does not exist |
 | `-flush` | Delete all documents from an existing index without deleting the index, then load replacement data |
 | `-delete` | Recreate data target before loading data: deletes concrete index in normal mode; rolls alias to a new timestamped index in `-alias` mode |
-| `-data` | Path to JSON array of documents to load (**required with** `-add`, `-flush`, or `-delete`) |
+| `-data` | Path to a JSON array or NDJSON document file to load (**required with** `-add`, `-flush`, or `-delete`) |
 | `-sync-managed` | Create or update declared ingest pipelines, enrich policies, and transforms |
 | `-nuke` | Delete the current index and declared managed resources first, including dependent pipelines that reference declared enrich policies |
 | `-id` | Field to use in the document to override _id (default: not set) |
@@ -248,6 +248,31 @@ Common combinations:
 - `-nuke -delete -sync-managed`: force a full teardown first, then rebuild cleanly
 - `-nuke`: remove the current index and declared managed resources without loading new data
 - `-delete -alias -keep-last 2`: roll to a new timestamped index, repoint alias, then keep only the newest two generations
+
+### Data File Formats
+
+Two formats are accepted. Format is detected automatically from the first
+non-whitespace byte; no flag is required.
+
+**JSON array** (original format):
+
+```json
+[
+  { "id": "1", "name": "Alice" },
+  { "id": "2", "name": "Bob" }
+]
+```
+
+**NDJSON** (newline-delimited JSON, one object per line):
+
+```text
+{"id":"1","name":"Alice"}
+{"id":"2","name":"Bob"}
+```
+
+NDJSON is preferred for large datasets. It enables streaming decode with
+O(1) memory per document and is the canonical format for ES bulk-API
+interchange.
 
 ## Alias Mode
 
