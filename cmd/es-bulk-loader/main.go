@@ -18,22 +18,21 @@ import (
 
 // ─── Build Metadata ────────────────────────────────────────────────────────────
 
+// Release builds override these variables with -ldflags. When a value remains
+// at its default, populateBuildMetadataFromBuildInfo fills it from available
+// module or VCS build information.
 var (
-	// version defines package-level state shared by related execution paths.
-	version = "dev"
-	// buildRFC3339 defines package-level state shared by related execution paths.
+	version      = "dev"
 	buildRFC3339 = "1970-01-01T00:00:00Z"
-	// revision defines package-level state shared by related execution paths.
-	revision = "local"
+	revision     = "local"
 )
 
+// These defaults are both development values and sentinels used to detect
+// fields that were not overridden at link time.
 const (
-	// defaultVersion defines package-level values shared by related execution paths.
-	defaultVersion = "dev"
-	// defaultBuildRFC3339 defines package-level values shared by related execution paths.
+	defaultVersion      = "dev"
 	defaultBuildRFC3339 = "1970-01-01T00:00:00Z"
-	// defaultRevision defines package-level values shared by related execution paths.
-	defaultRevision = "local"
+	defaultRevision     = "local"
 )
 
 // ─── Enrich Flag Parsing ───────────────────────────────────────────────────────
@@ -173,7 +172,7 @@ func main() {
 	bulkRetryBackoffMax := flag.Duration("bulk-retry-backoff-max", 5*time.Second, "Maximum backoff for retryable bulk failures")
 	deleteIndex := flag.Bool("delete", false, "Delete index if it exists")
 	addToIndex := flag.Bool("add", false, "Add documents to existing index")
-	flushIndex := flag.Bool("flush", false, "Delete all documents from an existing index without deleting the index")
+	flushIndex := flag.Bool("flush", false, "Delete existing documents without deleting the index, then load replacement documents from -data (-data is required)")
 	syncManaged := flag.Bool("sync-managed", false, "Create or update declared ingest pipelines, enrich policies, and transforms")
 	aliasMode := flag.Bool("alias", false, "Treat -index as an alias; create timestamped indices as <alias>-YYYYMMDDHHMMSS and repoint the alias on recreate")
 	keepLast := flag.Int("keep-last", 0, "When -alias is set, keep only the newest N timestamped indices matching <alias>-YYYYMMDDHHMMSS (0 disables pruning)")

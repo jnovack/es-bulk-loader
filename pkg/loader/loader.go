@@ -86,11 +86,20 @@ func (e *RunError) Is(target error) bool {
 	return errors.Is(e.Kind, target)
 }
 
-// EnrichOptions groups state used to coordinate related package behavior.
+// EnrichOptions selects enrich policies for execution. When Policies is
+// non-empty, it enables enrich and takes precedence over All and Raw.
+// Otherwise Enabled must be true; All, or an empty Raw value, selects all
+// policies, while a non-empty Raw value is parsed as a comma-separated list.
 type EnrichOptions struct {
-	Enabled  bool
-	All      bool
-	Raw      string
+	// Enabled enables selection when Policies is empty.
+	Enabled bool
+	// All selects every policy when Enabled is true and Policies is empty.
+	All bool
+	// Raw is a comma-separated policy list used when Enabled is true and
+	// Policies is empty.
+	Raw string
+	// Policies is an explicit policy list. A non-empty list enables enrich
+	// and takes precedence over All and Raw.
 	Policies []string
 }
 
@@ -202,6 +211,23 @@ const (
 	defaultBulkRetryBackoffBase = 500 * time.Millisecond
 	// defaultBulkRetryBackoffMax defines package-level values shared by related execution paths.
 	defaultBulkRetryBackoffMax = 5 * time.Second
+	// indexVisibilityMaxAttempts bounds index-creation visibility checks.
+	indexVisibilityMaxAttempts = 20
+	// indexVisibilityPollInterval controls the delay between visibility checks.
+	indexVisibilityPollInterval = 250 * time.Millisecond
+)
+
+// timestampedIndexCollisionLimit bounds existence checks while searching
+// consecutive one-second timestamp suffixes.
+const timestampedIndexCollisionLimit = 300
+
+const (
+	// initialEnrichPollInterval keeps the first few task checks responsive.
+	initialEnrichPollInterval = 2 * time.Second
+	// subsequentEnrichPollInterval reduces load for longer-running tasks.
+	subsequentEnrichPollInterval = 5 * time.Second
+	// enrichPollIntervalEscalationCount is the first poll to use the longer interval.
+	enrichPollIntervalEscalationCount = 6
 )
 
 // enrichPolicySummary groups state used to coordinate related package behavior.
@@ -284,41 +310,6 @@ func sleepForDuration(ctx context.Context, d time.Duration) error {
 }
 
 // ─── Option Parsing Helpers ────────────────────────────────────────────────────
-
-// String returns the canonical textual form used by callers and logs.
-func (e *enrichFlagValue) String() string {
-	if e == nil {
-		return ""
-	}
-	if e.all {
-		return "all"
-	}
-	return e.raw
-}
-
-// Set parses and stores caller-provided configuration input.
-func (e *enrichFlagValue) Set(value string) error {
-	e.enabled = true
-	trimmed := strings.TrimSpace(value)
-	switch trimmed {
-	case "", "true":
-		e.all = true
-		e.raw = ""
-	case "false":
-		e.enabled = false
-		e.all = false
-		e.raw = ""
-	default:
-		e.all = false
-		e.raw = trimmed
-	}
-	return nil
-}
-
-// IsBoolFlag reports support for bare boolean flag syntax.
-func (e *enrichFlagValue) IsBoolFlag() bool {
-	return true
-}
 
 // explicitPolicies applies method-specific behavior to keep package workflows consistent.
 func (e *enrichFlagValue) explicitPolicies() []string {
@@ -601,11 +592,11 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 	for logical, desired := range policyPlan.LogicalToDesired {
 		policyNameMapping[logical] = desired
 	}
-	resolvePipelinePolicyFallbacks(es, pipelineDefinitions, pipelineNames, policyNameMapping)
+	resolvePipelinePolicyFallbacks(ctx, es, pipelineDefinitions, pipelineNames, policyNameMapping)
 	pipelineDefinitions = rewritePipelinePolicyReferences(pipelineDefinitions, pipelineNames, policyNameMapping)
 	policyDefinitions := policyPlan.Definitions
 	policyNames := policyPlan.DesiredNames
-	policyDeleteNames := resolveManagedPolicyDeleteNames(es, policyPlan.LogicalNames)
+	policyDeleteNames := resolveManagedPolicyDeleteNames(ctx, es, policyPlan.LogicalNames)
 	transformDefinitions, transformNames, transformErr := resolveTransformsForSource(logicalTransformDefinitions, logicalTransformNames, *index)
 	if transformErr != nil {
 		fatal().Err(transformErr).Msg("Failed to resolve transform definitions")
@@ -631,9 +622,9 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 	aliasTargets := []string(nil)
 	exists := false
 	if *aliasMode {
-		aliasTargets = resolveAliasTargets(es, *index)
+		aliasTargets = resolveAliasTargets(ctx, es, *index)
 		if len(aliasTargets) == 0 {
-			indexPresent, err := indexExists(es, *index)
+			indexPresent, err := indexExists(ctx, es, *index)
 			checkErr("checking if index exists", err)
 			if indexPresent {
 				aliasTargets = []string{*index}
@@ -648,7 +639,7 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 		}
 	} else {
 		var err error
-		exists, err = indexExists(es, *index)
+		exists, err = indexExists(ctx, es, *index)
 		checkErr("checking if index exists", err)
 	}
 
@@ -661,7 +652,7 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 			} else {
 				warn(fmt.Sprintf("Alias %q does not currently resolve to an index. Nuke will still remove declared managed resources", *index))
 			}
-			generations := listTimestampedIndices(es, *index)
+			generations := listTimestampedIndices(ctx, es, *index)
 			if len(generations) > 0 {
 				names := make([]string, 0, len(generations))
 				for _, generation := range generations {
@@ -681,7 +672,7 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 			}
 		}
 
-		deleteManagedResources(es, pipelineNames, policyDeleteNames, transformNames, true)
+		deleteManagedResources(ctx, es, pipelineNames, policyDeleteNames, transformNames, true)
 	}
 
 	switch action {
@@ -706,7 +697,7 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 		if *aliasMode {
 			log.Info().Str("alias", *index).Msg("Alias mode delete keeps existing managed resources (pipelines, policies, transforms); use -nuke for destructive managed-resource cleanup")
 		} else {
-			deleteManagedResources(es, pipelineNames, policyDeleteNames, transformNames, false)
+			deleteManagedResources(ctx, es, pipelineNames, policyDeleteNames, transformNames, false)
 		}
 	case dataActionFlush:
 		if *aliasMode {
@@ -750,7 +741,7 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 	writeIndex := *index
 	createdIndex := ""
 	if *aliasMode && shouldCreateIndex {
-		createdIndex = nextAvailableTimestampedIndexName(es, *index, time.Now().UTC())
+		createdIndex = nextAvailableTimestampedIndexName(ctx, es, *index, time.Now().UTC())
 		writeIndex = createdIndex
 		log.Info().Str("alias", *index).Str("index", createdIndex).Msg("Preparing timestamped index for alias")
 	}
@@ -761,7 +752,7 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 	}
 
 	if shouldCreateIndex && effectiveSyncManaged {
-		createPipelines(es, pipelineDefinitions, pipelineNames)
+		createPipelines(ctx, es, pipelineDefinitions, pipelineNames)
 	}
 
 	if shouldCreateIndex {
@@ -781,7 +772,7 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 				Str("body", string(responseBody)).
 				Msg("Failed to create index")
 		}
-		waitForIndex(es, createIndex)
+		waitForIndex(ctx, es, createIndex)
 		exists = true
 		if *aliasMode {
 			log.Info().Str("alias", *index).Str("index", createIndex).Msg("Index created for alias")
@@ -794,14 +785,14 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 	transformSyncNames := make([]string, 0)
 	if effectiveSyncManaged && exists {
 		if !shouldCreateIndex {
-			createPipelines(es, pipelineDefinitions, pipelineNames)
+			createPipelines(ctx, es, pipelineDefinitions, pipelineNames)
 		}
 		if len(transformNames) > 0 {
 			transformSyncNames = append(transformSyncNames, transformNames...)
 		}
 		if !deferPolicyCreationUntilAliasSwap {
-			createPolicies(es, policyDefinitions, policyNames)
-			garbageCollectManagedPolicies(es, policyPlan.LogicalNames, policyPlan.DesiredSet)
+			createPolicies(ctx, es, policyDefinitions, policyNames)
+			garbageCollectManagedPolicies(ctx, es, policyPlan.LogicalNames, policyPlan.DesiredSet)
 		}
 	}
 
@@ -883,19 +874,19 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 	}
 
 	if *aliasMode && shouldCreateIndex {
-		updateAlias(es, *index, createdIndex)
+		updateAlias(ctx, es, *index, createdIndex)
 	}
 	if deferPolicyCreationUntilAliasSwap {
-		createPolicies(es, policyDefinitions, policyNames)
-		garbageCollectManagedPolicies(es, policyPlan.LogicalNames, policyPlan.DesiredSet)
+		createPolicies(ctx, es, policyDefinitions, policyNames)
+		garbageCollectManagedPolicies(ctx, es, policyPlan.LogicalNames, policyPlan.DesiredSet)
 	}
 	if *aliasMode && *keepLast > 0 {
-		pruneTimestampedIndices(es, *index, *keepLast)
+		pruneTimestampedIndices(ctx, es, *index, *keepLast)
 	}
 
 	if enrich.enabled {
 		refreshIndex(es, writeIndex)
-		enrichResult := runEnrichPolicies(es, enrichSelection, policyNames)
+		enrichResult := runEnrichPolicies(ctx, es, enrichSelection, policyNames)
 		result.EnrichSelected = enrichResult.Selected
 		result.EnrichMissing = enrichResult.Missing
 		result.EnrichSucceeded = enrichResult.Succeeded
@@ -905,9 +896,9 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 		// ADR: Keep transform readiness local to this stage; see
 		// adr/0002-refresh-write-index-before-starting-managed-transforms.md.
 		refreshIndex(es, writeIndex)
-		stopTransformsBestEffort(es, transformSyncNames)
-		createOrUpdateTransforms(es, transformDefinitions, transformSyncNames)
-		startTransforms(es, transformSyncNames)
+		stopTransformsBestEffort(ctx, es, transformSyncNames)
+		createOrUpdateTransforms(ctx, es, transformDefinitions, transformSyncNames)
+		startTransforms(ctx, es, transformSyncNames)
 	}
 
 	return result, nil
@@ -1148,33 +1139,15 @@ func resolveFieldType(mappings map[string]any, fieldPath string) (string, bool) 
 
 // ─── Index/Alias Utilities ─────────────────────────────────────────────────────
 
-// parseLogLevel centralizes this code path so package behavior stays consistent.
-func parseLogLevel(level string) (zerolog.Level, error) {
-	switch strings.ToLower(strings.TrimSpace(level)) {
-	case "trace":
-		return zerolog.TraceLevel, nil
-	case "debug":
-		return zerolog.DebugLevel, nil
-	case "info":
-		return zerolog.InfoLevel, nil
-	case "warn":
-		return zerolog.WarnLevel, nil
-	case "error":
-		return zerolog.ErrorLevel, nil
-	default:
-		return zerolog.NoLevel, fmt.Errorf("expected one of trace, debug, info, warn, error")
-	}
-}
-
 // buildTimestampedIndexName centralizes this code path so package behavior stays consistent.
 func buildTimestampedIndexName(alias string, now time.Time) string {
 	return fmt.Sprintf("%s-%s", alias, now.Format("20060102150405"))
 }
 
 // nextAvailableTimestampedIndexName centralizes this code path so package behavior stays consistent.
-func nextAvailableTimestampedIndexName(es *elasticsearch.Client, alias string, base time.Time) string {
+func nextAvailableTimestampedIndexName(ctx context.Context, es *elasticsearch.Client, alias string, base time.Time) string {
 	name, err := nextAvailableTimestampedIndexNameWithCheck(alias, base, func(candidate string) (bool, error) {
-		return indexExists(es, candidate)
+		return indexExists(ctx, es, candidate)
 	})
 	checkErr("finding available timestamped index name", err)
 	return name
@@ -1183,7 +1156,7 @@ func nextAvailableTimestampedIndexName(es *elasticsearch.Client, alias string, b
 // nextAvailableTimestampedIndexNameWithCheck centralizes this code path so package behavior stays consistent.
 func nextAvailableTimestampedIndexNameWithCheck(alias string, base time.Time, existsFn func(candidate string) (bool, error)) (string, error) {
 	candidateTime := base.UTC()
-	for attempt := 0; attempt < 300; attempt++ {
+	for attempt := 0; attempt < timestampedIndexCollisionLimit; attempt++ {
 		candidate := buildTimestampedIndexName(alias, candidateTime)
 		exists, err := existsFn(candidate)
 		if err != nil {
@@ -1204,8 +1177,8 @@ func nextAvailableTimestampedIndexNameWithCheck(alias string, base time.Time, ex
 }
 
 // resolveAliasTargets centralizes this code path so package behavior stays consistent.
-func resolveAliasTargets(es *elasticsearch.Client, alias string) []string {
-	res, err := es.Indices.GetAlias(es.Indices.GetAlias.WithName(alias))
+func resolveAliasTargets(ctx context.Context, es *elasticsearch.Client, alias string) []string {
+	res, err := es.Indices.GetAlias(es.Indices.GetAlias.WithName(alias), es.Indices.GetAlias.WithContext(ctx))
 	checkErr("resolving alias targets", err)
 	defer res.Body.Close()
 
@@ -1235,8 +1208,8 @@ func resolveAliasTargets(es *elasticsearch.Client, alias string) []string {
 }
 
 // updateAlias centralizes this code path so package behavior stays consistent.
-func updateAlias(es *elasticsearch.Client, alias, index string) {
-	current := resolveAliasTargets(es, alias)
+func updateAlias(ctx context.Context, es *elasticsearch.Client, alias, index string) {
+	current := resolveAliasTargets(ctx, es, alias)
 
 	actions := make([]map[string]map[string]any, 0, len(current)+1)
 	for _, existing := range current {
@@ -1257,7 +1230,7 @@ func updateAlias(es *elasticsearch.Client, alias, index string) {
 
 	payload, err := json.Marshal(map[string]any{"actions": actions})
 	checkErr("serializing alias actions", err)
-	res, err := es.Indices.UpdateAliases(strings.NewReader(string(payload)))
+	res, err := es.Indices.UpdateAliases(strings.NewReader(string(payload)), es.Indices.UpdateAliases.WithContext(ctx))
 	checkErr("updating alias", err)
 	defer res.Body.Close()
 
@@ -1289,9 +1262,9 @@ type timestampedIndex struct {
 }
 
 // listTimestampedIndices centralizes this code path so package behavior stays consistent.
-func listTimestampedIndices(es *elasticsearch.Client, alias string) []timestampedIndex {
+func listTimestampedIndices(ctx context.Context, es *elasticsearch.Client, alias string) []timestampedIndex {
 	pattern := alias + "-*"
-	res, err := es.Indices.Get([]string{pattern})
+	res, err := es.Indices.Get([]string{pattern}, es.Indices.Get.WithContext(ctx))
 	checkErr("listing timestamped indices", err)
 	defer res.Body.Close()
 
@@ -1347,12 +1320,12 @@ func parseTimestampedIndexName(alias, index string) (time.Time, bool) {
 }
 
 // pruneTimestampedIndices centralizes this code path so package behavior stays consistent.
-func pruneTimestampedIndices(es *elasticsearch.Client, alias string, keepLast int) {
+func pruneTimestampedIndices(ctx context.Context, es *elasticsearch.Client, alias string, keepLast int) {
 	if keepLast <= 0 {
 		return
 	}
 
-	all := listTimestampedIndices(es, alias)
+	all := listTimestampedIndices(ctx, es, alias)
 	if len(all) <= keepLast {
 		return
 	}
@@ -1418,8 +1391,11 @@ func selectedDataAction(addToIndex, flushIndex, deleteIndex bool) (dataAction, e
 }
 
 // indexExists centralizes this code path so package behavior stays consistent.
-func indexExists(es *elasticsearch.Client, index string) (bool, error) {
-	res, err := es.Indices.Exists([]string{index})
+func indexExists(ctx context.Context, es *elasticsearch.Client, index string) (bool, error) {
+	res, err := es.Indices.Exists(
+		[]string{index},
+		es.Indices.Exists.WithContext(ctx),
+	)
 	if err != nil {
 		return false, err
 	}
@@ -1436,14 +1412,16 @@ func indexExists(es *elasticsearch.Client, index string) (bool, error) {
 }
 
 // waitForIndex centralizes this code path so package behavior stays consistent.
-func waitForIndex(es *elasticsearch.Client, index string) {
-	for i := 0; i < 20; i++ {
-		exists, err := indexExists(es, index)
+func waitForIndex(ctx context.Context, es *elasticsearch.Client, index string) {
+	for i := 0; i < indexVisibilityMaxAttempts; i++ {
+		exists, err := indexExists(ctx, es, index)
 		checkErr("waiting for index creation", err)
 		if exists {
 			return
 		}
-		time.Sleep(250 * time.Millisecond)
+		if err := sleepWithContext(ctx, indexVisibilityPollInterval); err != nil {
+			fatal().Err(err).Str("index", index).Msg("Context cancelled while waiting for index to become visible")
+		}
 	}
 
 	fatal().Str("index", index).Msg("Index create was acknowledged but the index did not become visible")
@@ -1472,8 +1450,30 @@ func flushAndCheck(es *elasticsearch.Client, index string) {
 	checkErr("flushing index", err)
 	defer res.Body.Close()
 
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		fatal().Err(err).Str("index", index).Msg("Unable to read index flush response body")
+	}
 	if res.IsError() {
-		fatal().Str("index", index).Msg("Failed to flush index")
+		fatal().
+			Str("index", index).
+			Int("status_code", res.StatusCode).
+			Str("body", string(body)).
+			Msg("Failed to flush index")
+	}
+
+	var result struct {
+		Failures []json.RawMessage `json:"failures"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		fatal().Err(err).Str("index", index).Msg("Unable to parse index flush response body")
+	}
+	if len(result.Failures) > 0 {
+		fatal().
+			Str("index", index).
+			Int("shard_failures", len(result.Failures)).
+			Str("first_failure", string(result.Failures[0])).
+			Msg("Index flush completed with shard-level failures")
 	}
 }
 
@@ -1751,13 +1751,13 @@ func rewritePipelinePolicyReferences(definitions namedDefinitions, names []strin
 }
 
 // resolvePipelinePolicyFallbacks centralizes this code path so package behavior stays consistent.
-func resolvePipelinePolicyFallbacks(es *elasticsearch.Client, definitions namedDefinitions, names []string, policyNameMapping map[string]string) {
+func resolvePipelinePolicyFallbacks(ctx context.Context, es *elasticsearch.Client, definitions namedDefinitions, names []string, policyNameMapping map[string]string) {
 	referenced := collectReferencedPolicyNamesFromPipelines(definitions, names)
 	if len(referenced) == 0 {
 		return
 	}
 
-	available, supported := getEnrichPolicies(es)
+	available, supported := getEnrichPolicies(ctx, es)
 	if !supported {
 		return
 	}
@@ -1865,12 +1865,12 @@ func collectPolicyNamesInValue(value any, seen map[string]struct{}) {
 }
 
 // resolveManagedPolicyDeleteNames centralizes this code path so package behavior stays consistent.
-func resolveManagedPolicyDeleteNames(es *elasticsearch.Client, logicalNames []string) []string {
+func resolveManagedPolicyDeleteNames(ctx context.Context, es *elasticsearch.Client, logicalNames []string) []string {
 	if len(logicalNames) == 0 {
 		return nil
 	}
 
-	available, supported := getEnrichPolicies(es)
+	available, supported := getEnrichPolicies(ctx, es)
 	if !supported {
 		return nil
 	}
@@ -1994,12 +1994,12 @@ func resolveTransformsForSource(definitions namedDefinitions, names []string, so
 }
 
 // garbageCollectManagedPolicies centralizes this code path so package behavior stays consistent.
-func garbageCollectManagedPolicies(es *elasticsearch.Client, logicalNames []string, desiredSet map[string]struct{}) {
+func garbageCollectManagedPolicies(ctx context.Context, es *elasticsearch.Client, logicalNames []string, desiredSet map[string]struct{}) {
 	if len(logicalNames) == 0 {
 		return
 	}
 
-	available, supported := getEnrichPolicies(es)
+	available, supported := getEnrichPolicies(ctx, es)
 	if !supported {
 		return
 	}
@@ -2020,7 +2020,7 @@ func garbageCollectManagedPolicies(es *elasticsearch.Client, logicalNames []stri
 			continue
 		}
 
-		referencing := findPipelinesReferencingPolicy(es, policy)
+		referencing := findPipelinesReferencingPolicy(ctx, es, policy)
 		if len(referencing) > 0 {
 			log.Debug().
 				Str("policy", policy).
@@ -2029,15 +2029,15 @@ func garbageCollectManagedPolicies(es *elasticsearch.Client, logicalNames []stri
 			continue
 		}
 
-		deletePolicyBestEffort(es, policy)
+		deletePolicyBestEffort(ctx, es, policy)
 	}
 }
 
 // deletePolicyBestEffort centralizes this code path so package behavior stays consistent.
-func deletePolicyBestEffort(es *elasticsearch.Client, policy string) {
+func deletePolicyBestEffort(ctx context.Context, es *elasticsearch.Client, policy string) {
 	res, err := es.EnrichDeletePolicy(
 		policy,
-		es.EnrichDeletePolicy.WithContext(context.Background()),
+		es.EnrichDeletePolicy.WithContext(ctx),
 		es.EnrichDeletePolicy.WithHeader(map[string]string{
 			"Accept": "application/json",
 		}),
@@ -2110,12 +2110,12 @@ func readTemplatedFile(path string, variables templateVariables) ([]byte, error)
 // ─── Managed Resource Lifecycle ────────────────────────────────────────────────
 
 // createPipelines centralizes this code path so package behavior stays consistent.
-func createPipelines(es *elasticsearch.Client, definitions namedDefinitions, names []string) {
+func createPipelines(ctx context.Context, es *elasticsearch.Client, definitions namedDefinitions, names []string) {
 	for _, name := range names {
 		res, err := es.Ingest.PutPipeline(
 			name,
 			strings.NewReader(string(definitions[name])),
-			es.Ingest.PutPipeline.WithContext(context.Background()),
+			es.Ingest.PutPipeline.WithContext(ctx),
 		)
 		checkErr("creating pipeline", err)
 
@@ -2135,11 +2135,11 @@ func createPipelines(es *elasticsearch.Client, definitions namedDefinitions, nam
 }
 
 // deletePipelines centralizes this code path so package behavior stays consistent.
-func deletePipelines(es *elasticsearch.Client, names []string) {
+func deletePipelines(ctx context.Context, es *elasticsearch.Client, names []string) {
 	for _, name := range names {
 		res, err := es.Ingest.DeletePipeline(
 			name,
-			es.Ingest.DeletePipeline.WithContext(context.Background()),
+			es.Ingest.DeletePipeline.WithContext(ctx),
 		)
 		checkErr("deleting pipeline", err)
 
@@ -2164,10 +2164,10 @@ func deletePipelines(es *elasticsearch.Client, names []string) {
 }
 
 // createPolicies centralizes this code path so package behavior stays consistent.
-func createPolicies(es *elasticsearch.Client, definitions namedDefinitions, names []string) {
+func createPolicies(ctx context.Context, es *elasticsearch.Client, definitions namedDefinitions, names []string) {
 	for _, name := range names {
 		for attempt := 1; attempt <= 5; attempt++ {
-			res, err := putPolicy(es, name, definitions[name])
+			res, err := putPolicy(ctx, es, name, definitions[name])
 			checkErr("creating enrich policy", err)
 
 			if !res.IsError() {
@@ -2193,7 +2193,9 @@ func createPolicies(es *elasticsearch.Client, definitions namedDefinitions, name
 					Int("status_code", res.StatusCode).
 					Str("body", string(body)).
 					Msg("Source index for enrich policy is not visible yet; retrying enrich policy creation")
-				time.Sleep(500 * time.Millisecond)
+				if err := sleepWithContext(ctx, 500*time.Millisecond); err != nil {
+					fatal().Err(err).Str("policy", name).Msg("Context cancelled during enrich policy retry")
+				}
 				continue
 			}
 			if hasElasticsearchErrorType(body, "resource_already_exists_exception") {
@@ -2213,11 +2215,11 @@ func createPolicies(es *elasticsearch.Client, definitions namedDefinitions, name
 }
 
 // putPolicy centralizes this code path so package behavior stays consistent.
-func putPolicy(es *elasticsearch.Client, name string, definition json.RawMessage) (*esapi.Response, error) {
+func putPolicy(ctx context.Context, es *elasticsearch.Client, name string, definition json.RawMessage) (*esapi.Response, error) {
 	return es.EnrichPutPolicy(
 		name,
 		strings.NewReader(string(definition)),
-		es.EnrichPutPolicy.WithContext(context.Background()),
+		es.EnrichPutPolicy.WithContext(ctx),
 		es.EnrichPutPolicy.WithHeader(map[string]string{
 			"Content-Type": "application/json",
 			"Accept":       "application/json",
@@ -2226,12 +2228,12 @@ func putPolicy(es *elasticsearch.Client, name string, definition json.RawMessage
 }
 
 // deletePolicies centralizes this code path so package behavior stays consistent.
-func deletePolicies(es *elasticsearch.Client, names []string, nuke bool) {
+func deletePolicies(ctx context.Context, es *elasticsearch.Client, names []string, nuke bool) {
 	for _, name := range names {
 		for attempt := 1; attempt <= 2; attempt++ {
 			res, err := es.EnrichDeletePolicy(
 				name,
-				es.EnrichDeletePolicy.WithContext(context.Background()),
+				es.EnrichDeletePolicy.WithContext(ctx),
 				es.EnrichDeletePolicy.WithHeader(map[string]string{
 					"Accept": "application/json",
 				}),
@@ -2255,7 +2257,7 @@ func deletePolicies(es *elasticsearch.Client, names []string, nuke bool) {
 				body, _ := io.ReadAll(res.Body)
 				res.Body.Close()
 				if res.StatusCode == http.StatusConflict && nuke && policyDeleteBlockedByPipelineReference(body) && attempt == 1 {
-					referencing := findPipelinesReferencingPolicy(es, name)
+					referencing := findPipelinesReferencingPolicy(ctx, es, name)
 					if len(referencing) == 0 {
 						fatal().
 							Str("policy", name).
@@ -2268,7 +2270,7 @@ func deletePolicies(es *elasticsearch.Client, names []string, nuke bool) {
 						Str("policy", name).
 						Strs("pipelines", referencing).
 						Msg("Nuke mode deleting pipelines that reference this enrich policy before retrying policy deletion")
-					deletePipelinesForNuke(es, referencing)
+					deletePipelinesForNuke(ctx, es, referencing)
 					continue
 				}
 
@@ -2287,20 +2289,24 @@ func deletePolicies(es *elasticsearch.Client, names []string, nuke bool) {
 }
 
 // deleteManagedResources centralizes this code path so package behavior stays consistent.
-func deleteManagedResources(es *elasticsearch.Client, pipelineNames []string, policyNames []string, transformNames []string, nuke bool) {
+func deleteManagedResources(ctx context.Context, es *elasticsearch.Client, pipelineNames []string, policyNames []string, transformNames []string, nuke bool) {
 	if len(pipelineNames) > 0 {
-		deletePipelines(es, pipelineNames)
+		if nuke {
+			deletePipelinesForNuke(ctx, es, pipelineNames)
+		} else {
+			deletePipelines(ctx, es, pipelineNames)
+		}
 	}
 	if len(policyNames) > 0 {
-		deletePolicies(es, policyNames, nuke)
+		deletePolicies(ctx, es, policyNames, nuke)
 	}
 	if len(transformNames) > 0 {
-		deleteTransforms(es, transformNames)
+		deleteTransforms(ctx, es, transformNames)
 	}
 }
 
 // createOrUpdateTransforms centralizes this code path so package behavior stays consistent.
-func createOrUpdateTransforms(es *elasticsearch.Client, definitions namedDefinitions, names []string) {
+func createOrUpdateTransforms(ctx context.Context, es *elasticsearch.Client, definitions namedDefinitions, names []string) {
 	for _, name := range names {
 		definition, ok := definitions[name]
 		if !ok {
@@ -2312,14 +2318,14 @@ func createOrUpdateTransforms(es *elasticsearch.Client, definitions namedDefinit
 		// instead — stopTransformsBestEffort has already stopped the
 		// transform, and deleteTransforms uses DeleteDestIndex: false to
 		// preserve the destination index.
-		if transformExists(es, name) {
-			deleteTransforms(es, []string{name})
+		if transformExists(ctx, es, name) {
+			deleteTransforms(ctx, es, []string{name})
 		}
 
 		res, err := es.TransformPutTransform(
 			strings.NewReader(string(definition)),
 			name,
-			es.TransformPutTransform.WithContext(context.Background()),
+			es.TransformPutTransform.WithContext(ctx),
 			es.TransformPutTransform.WithHeader(map[string]string{
 				"Content-Type": "application/json",
 				"Accept":       "application/json",
@@ -2340,9 +2346,9 @@ func createOrUpdateTransforms(es *elasticsearch.Client, definitions namedDefinit
 }
 
 // transformExists centralizes this code path so package behavior stays consistent.
-func transformExists(es *elasticsearch.Client, name string) bool {
+func transformExists(ctx context.Context, es *elasticsearch.Client, name string) bool {
 	res, err := es.TransformGetTransform(
-		es.TransformGetTransform.WithContext(context.Background()),
+		es.TransformGetTransform.WithContext(ctx),
 		es.TransformGetTransform.WithTransformID(name),
 		es.TransformGetTransform.WithAllowNoMatch(true),
 	)
@@ -2370,11 +2376,11 @@ func transformExists(es *elasticsearch.Client, name string) bool {
 }
 
 // stopTransformsBestEffort centralizes this code path so package behavior stays consistent.
-func stopTransformsBestEffort(es *elasticsearch.Client, names []string) {
+func stopTransformsBestEffort(ctx context.Context, es *elasticsearch.Client, names []string) {
 	for _, name := range names {
 		res, err := es.TransformStopTransform(
 			name,
-			es.TransformStopTransform.WithContext(context.Background()),
+			es.TransformStopTransform.WithContext(ctx),
 			es.TransformStopTransform.WithForce(true),
 			es.TransformStopTransform.WithWaitForCompletion(true),
 			es.TransformStopTransform.WithTimeout(30*time.Second),
@@ -2403,11 +2409,11 @@ func stopTransformsBestEffort(es *elasticsearch.Client, names []string) {
 }
 
 // deleteTransforms centralizes this code path so package behavior stays consistent.
-func deleteTransforms(es *elasticsearch.Client, names []string) {
+func deleteTransforms(ctx context.Context, es *elasticsearch.Client, names []string) {
 	for _, name := range names {
 		res, err := es.TransformDeleteTransform(
 			name,
-			es.TransformDeleteTransform.WithContext(context.Background()),
+			es.TransformDeleteTransform.WithContext(ctx),
 			es.TransformDeleteTransform.WithForce(true),
 			es.TransformDeleteTransform.WithDeleteDestIndex(false),
 			es.TransformDeleteTransform.WithHeader(map[string]string{
@@ -2434,11 +2440,11 @@ func deleteTransforms(es *elasticsearch.Client, names []string) {
 }
 
 // startTransforms centralizes this code path so package behavior stays consistent.
-func startTransforms(es *elasticsearch.Client, names []string) {
+func startTransforms(ctx context.Context, es *elasticsearch.Client, names []string) {
 	for _, name := range names {
 		res, err := es.TransformStartTransform(
 			name,
-			es.TransformStartTransform.WithContext(context.Background()),
+			es.TransformStartTransform.WithContext(ctx),
 			es.TransformStartTransform.WithTimeout(30*time.Second),
 			es.TransformStartTransform.WithHeader(map[string]string{
 				"Accept": "application/json",
@@ -2465,11 +2471,11 @@ func startTransforms(es *elasticsearch.Client, names []string) {
 }
 
 // deletePipelinesForNuke centralizes this code path so package behavior stays consistent.
-func deletePipelinesForNuke(es *elasticsearch.Client, names []string) {
+func deletePipelinesForNuke(ctx context.Context, es *elasticsearch.Client, names []string) {
 	for _, name := range names {
 		res, err := es.Ingest.DeletePipeline(
 			name,
-			es.Ingest.DeletePipeline.WithContext(context.Background()),
+			es.Ingest.DeletePipeline.WithContext(ctx),
 		)
 		checkErr("deleting pipeline", err)
 
@@ -2482,7 +2488,7 @@ func deletePipelinesForNuke(es *elasticsearch.Client, names []string) {
 			body, _ := io.ReadAll(res.Body)
 			res.Body.Close()
 			if res.StatusCode == http.StatusBadRequest && pipelineDeleteBlockedByDefaultIndex(body) {
-				indices := findIndicesUsingDefaultPipeline(es, name)
+				indices := findIndicesUsingDefaultPipeline(ctx, es, name)
 				if len(indices) == 0 {
 					fatal().
 						Str("pipeline", name).
@@ -2495,8 +2501,8 @@ func deletePipelinesForNuke(es *elasticsearch.Client, names []string) {
 					Str("pipeline", name).
 					Strs("indices", indices).
 					Msg("Nuke mode clearing index.default_pipeline on indices that use this pipeline before retrying pipeline deletion")
-				clearDefaultPipelineForIndices(es, indices)
-				deletePipelines(es, []string{name})
+				clearDefaultPipelineForIndices(ctx, es, indices)
+				deletePipelines(ctx, es, []string{name})
 				continue
 			}
 			fatal().
@@ -2512,9 +2518,9 @@ func deletePipelinesForNuke(es *elasticsearch.Client, names []string) {
 }
 
 // findPipelinesReferencingPolicy centralizes this code path so package behavior stays consistent.
-func findPipelinesReferencingPolicy(es *elasticsearch.Client, policy string) []string {
+func findPipelinesReferencingPolicy(ctx context.Context, es *elasticsearch.Client, policy string) []string {
 	res, err := es.Ingest.GetPipeline(
-		es.Ingest.GetPipeline.WithContext(context.Background()),
+		es.Ingest.GetPipeline.WithContext(ctx),
 	)
 	checkErr("getting ingest pipelines", err)
 	defer res.Body.Close()
@@ -2539,8 +2545,8 @@ func findPipelinesReferencingPolicy(es *elasticsearch.Client, policy string) []s
 }
 
 // findIndicesUsingDefaultPipeline centralizes this code path so package behavior stays consistent.
-func findIndicesUsingDefaultPipeline(es *elasticsearch.Client, pipeline string) []string {
-	res, err := es.Indices.GetSettings(es.Indices.GetSettings.WithName("*"))
+func findIndicesUsingDefaultPipeline(ctx context.Context, es *elasticsearch.Client, pipeline string) []string {
+	res, err := es.Indices.GetSettings(es.Indices.GetSettings.WithName("*"), es.Indices.GetSettings.WithContext(ctx))
 	checkErr("getting index settings", err)
 	defer res.Body.Close()
 
@@ -2577,11 +2583,12 @@ func findIndicesUsingDefaultPipeline(es *elasticsearch.Client, pipeline string) 
 }
 
 // clearDefaultPipelineForIndices centralizes this code path so package behavior stays consistent.
-func clearDefaultPipelineForIndices(es *elasticsearch.Client, indices []string) {
+func clearDefaultPipelineForIndices(ctx context.Context, es *elasticsearch.Client, indices []string) {
 	for _, index := range indices {
 		res, err := es.Indices.PutSettings(
 			strings.NewReader(`{"index.default_pipeline":null}`),
 			es.Indices.PutSettings.WithIndex(index),
+			es.Indices.PutSettings.WithContext(ctx),
 		)
 		checkErr("clearing index.default_pipeline", err)
 
@@ -2668,10 +2675,10 @@ func refreshIndex(es *elasticsearch.Client, index string) {
 }
 
 // runEnrichPolicies centralizes this code path so package behavior stays consistent.
-func runEnrichPolicies(es *elasticsearch.Client, enrich *enrichFlagValue, declared []string) enrichRunSummary {
+func runEnrichPolicies(ctx context.Context, es *elasticsearch.Client, enrich *enrichFlagValue, declared []string) enrichRunSummary {
 	summary := enrichRunSummary{}
 
-	availablePolicies, supported := getEnrichPolicies(es)
+	availablePolicies, supported := getEnrichPolicies(ctx, es)
 	if !supported {
 		return summary
 	}
@@ -2701,7 +2708,7 @@ func runEnrichPolicies(es *elasticsearch.Client, enrich *enrichFlagValue, declar
 	succeeded := 0
 	failed := 0
 	for _, policy := range targets {
-		if executeEnrichPolicy(es, policy) {
+		if executeEnrichPolicy(ctx, es, policy) {
 			succeeded++
 		} else {
 			failed++
@@ -2725,9 +2732,9 @@ func runEnrichPolicies(es *elasticsearch.Client, enrich *enrichFlagValue, declar
 }
 
 // getEnrichPolicies centralizes this code path so package behavior stays consistent.
-func getEnrichPolicies(es *elasticsearch.Client) ([]string, bool) {
+func getEnrichPolicies(ctx context.Context, es *elasticsearch.Client) ([]string, bool) {
 	res, err := es.EnrichGetPolicy(
-		es.EnrichGetPolicy.WithContext(context.Background()),
+		es.EnrichGetPolicy.WithContext(ctx),
 		es.EnrichGetPolicy.WithHeader(map[string]string{
 			"Accept": "application/json",
 		}),
@@ -2833,12 +2840,20 @@ func logEnrichResult(policy string, status *enrichPhaseStatus, startTime time.Ti
 	return !isFailure
 }
 
+// enrichPollInterval returns the task polling cadence for pollCount.
+func enrichPollInterval(pollCount int) time.Duration {
+	if pollCount >= enrichPollIntervalEscalationCount {
+		return subsequentEnrichPollInterval
+	}
+	return initialEnrichPollInterval
+}
+
 // executeEnrichPolicy centralizes this code path so package behavior stays consistent.
-func executeEnrichPolicy(es *elasticsearch.Client, policy string) bool {
+func executeEnrichPolicy(ctx context.Context, es *elasticsearch.Client, policy string) bool {
 	startTime := time.Now()
 	res, err := es.EnrichExecutePolicy(
 		policy,
-		es.EnrichExecutePolicy.WithContext(context.Background()),
+		es.EnrichExecutePolicy.WithContext(ctx),
 		es.EnrichExecutePolicy.WithWaitForCompletion(false),
 		es.EnrichExecutePolicy.WithHeader(map[string]string{
 			"Accept": "application/json",
@@ -2881,11 +2896,13 @@ func executeEnrichPolicy(es *elasticsearch.Client, policy string) bool {
 	}
 
 	taskID := *kickoff.Task
-	pollInterval := 2 * time.Second
 	for pollCount := 1; ; pollCount++ {
-		time.Sleep(pollInterval)
+		if err := sleepWithContext(ctx, enrichPollInterval(pollCount)); err != nil {
+			log.Warn().Err(err).Str("policy", policy).Msg("Context cancelled while polling enrich task")
+			return false
+		}
 
-		taskRes, err := es.Tasks.Get(taskID)
+		taskRes, err := es.Tasks.Get(taskID, es.Tasks.Get.WithContext(ctx))
 		if err != nil {
 			log.Error().Err(err).Str("policy", policy).Str("task", taskID).Msg("Failed to poll enrich policy task")
 			return false
@@ -2925,9 +2942,6 @@ func executeEnrichPolicy(es *elasticsearch.Client, policy string) bool {
 			Float64("elapsed_s", time.Since(startTime).Seconds()).
 			Msg("Enrich policy execution in progress")
 
-		if pollCount == 5 {
-			pollInterval = 5 * time.Second
-		}
 	}
 }
 
@@ -3209,7 +3223,7 @@ func bulkInsert(
 		ctx = context.Background()
 	}
 	var buf strings.Builder
-	for _, doc := range batch {
+	for batchOffset, doc := range batch {
 		meta := map[string]map[string]string{"index": {"_index": index}}
 
 		if idField != "" {
@@ -3220,8 +3234,15 @@ func bulkInsert(
 			}
 		}
 
-		metaLine, _ := json.Marshal(meta)
-		docLine, _ := json.Marshal(doc)
+		documentNumber := inserted - len(batch) + batchOffset + 1
+		metaLine, err := json.Marshal(meta)
+		if err != nil {
+			fatal().Err(err).Int("document", documentNumber).Msg("Unable to serialize bulk action metadata")
+		}
+		docLine, err := json.Marshal(doc)
+		if err != nil {
+			fatal().Err(err).Int("document", documentNumber).Msg("Unable to serialize document for bulk insert")
+		}
 		buf.Write(metaLine)
 		buf.WriteByte('\n')
 		buf.Write(docLine)

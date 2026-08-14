@@ -65,7 +65,12 @@ Trade-offs:
 ## Future Work
 
 The fixed `single-node = 0, multi-node = 1` rule is intentionally conservative.
-A follow-on change tracked in `TODO.md` should make the replica count
-configurable — either as a loader flag, an environment variable, or a template
-variable injected into `settings.json` — so consumers with larger clusters can
-request higher redundancy without forking the loader.
+A follow-on change should make the replica count configurable via a `-replicas`
+loader flag (and its `REPLICAS` environment equivalent), so consumers with larger
+clusters can request higher redundancy without forking the loader. An explicit
+value would take precedence over the topology-derived one; `settings.json` would
+remain overridden as decided above.
+
+Note that injecting the value as a template variable into `settings.json` is not
+a viable alternative: `normalizeIndexSettings` writes `number_of_replicas` after
+the file is templated and parsed, so any templated value is discarded.

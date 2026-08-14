@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,40 +22,412 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// TestEnrichFlagValueBareFlagRunsAllPolicies verifies behavior for the related scenario.
-func TestEnrichFlagValueBareFlagRunsAllPolicies(t *testing.T) {
-	t.Parallel()
+// TestDeleteManagedResourcesUsesNukePipelineRecovery verifies that declared
+// pipelines receive nuke's default-pipeline recovery behavior.
+func TestDeleteManagedResourcesUsesNukePipelineRecovery(t *testing.T) {
+	var (
+		deleteAttempts int
+		clearedDefault bool
+	)
 
-	var enrich enrichFlagValue
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		switch {
+		case r.Method == http.MethodDelete && r.URL.Path == "/_ingest/pipeline/declared-pipeline":
+			deleteAttempts++
+			if deleteAttempts == 1 {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":{"reason":"pipeline [declared-pipeline] cannot be deleted because it is the default pipeline for 1 index(es) including [other-index]"}}`))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"acknowledged":true}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/_settings/*":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"other-index":{"settings":{"index":{"default_pipeline":"declared-pipeline"}}}}`))
+		case r.Method == http.MethodPut && r.URL.Path == "/other-index/_settings":
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read settings request: %v", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			if !strings.Contains(string(body), `"index.default_pipeline":null`) {
+				t.Errorf("unexpected settings request body: %s", body)
+			}
+			clearedDefault = true
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"acknowledged":true}`))
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.RequestURI())
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(server.Close)
 
-	if err := enrich.Set("true"); err != nil {
-		t.Fatalf("Set returned error: %v", err)
+	es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
+	if err != nil {
+		t.Fatalf("new elasticsearch client: %v", err)
 	}
 
-	if !enrich.enabled {
-		t.Fatal("expected enrich flag to be enabled")
+	deleteManagedResources(context.Background(), es, []string{"declared-pipeline"}, nil, nil, true)
+
+	if deleteAttempts != 2 {
+		t.Fatalf("delete attempts = %d, want 2", deleteAttempts)
 	}
-	if !enrich.all {
-		t.Fatal("expected bare enrich flag to target all policies")
-	}
-	if got := enrich.explicitPolicies(); got != nil {
-		t.Fatalf("expected no explicit policies, got %v", got)
+	if !clearedDefault {
+		t.Fatal("expected nuke recovery to clear index.default_pipeline")
 	}
 }
 
-// TestEnrichFlagValueExplicitPolicies verifies behavior for the related scenario.
-func TestEnrichFlagValueExplicitPolicies(t *testing.T) {
-	t.Parallel()
+// TestDeleteManagedResourcesNonNukeUsesOrdinaryPipelineDeletion verifies that
+// normal cleanup does not invoke nuke's cross-index recovery requests.
+func TestDeleteManagedResourcesNonNukeUsesOrdinaryPipelineDeletion(t *testing.T) {
+	deleteAttempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		if r.Method != http.MethodDelete || r.URL.Path != "/_ingest/pipeline/declared-pipeline" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.RequestURI())
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		deleteAttempts++
+		_, _ = w.Write([]byte(`{"acknowledged":true}`))
+	}))
+	t.Cleanup(server.Close)
 
-	var enrich enrichFlagValue
-
-	if err := enrich.Set(" policy-a,policy-b, policy-a ,, policy-c "); err != nil {
-		t.Fatalf("Set returned error: %v", err)
+	es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
+	if err != nil {
+		t.Fatalf("new elasticsearch client: %v", err)
 	}
 
-	want := []string{"policy-a", "policy-b", "policy-c"}
-	if got := enrich.explicitPolicies(); !reflect.DeepEqual(got, want) {
-		t.Fatalf("explicitPolicies mismatch: got %v want %v", got, want)
+	deleteManagedResources(context.Background(), es, []string{"declared-pipeline"}, nil, nil, false)
+
+	if deleteAttempts != 1 {
+		t.Fatalf("delete attempts = %d, want 1", deleteAttempts)
+	}
+}
+
+// TestIndexExistsUsesCallerContext verifies cancellation reaches an in-flight
+// Elasticsearch existence request.
+func TestIndexExistsUsesCallerContext(t *testing.T) {
+	requestStarted := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		close(requestStarted)
+		<-r.Context().Done()
+	}))
+	t.Cleanup(server.Close)
+
+	es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
+	if err != nil {
+		t.Fatalf("new elasticsearch client: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := indexExists(ctx, es, "cards")
+		result <- err
+	}()
+
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("existence request did not start")
+	}
+	cancel()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("indexExists error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("indexExists did not return promptly after cancellation")
+	}
+}
+
+// TestWaitForIndexCancellationStopsPolling verifies cancellation during the
+// polling delay prevents another existence request.
+func TestWaitForIndexCancellationStopsPolling(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		requests++
+		cancel()
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(server.Close)
+
+	es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
+	if err != nil {
+		t.Fatalf("new elasticsearch client: %v", err)
+	}
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		waitForIndex(ctx, es, "cards")
+	}()
+
+	recoveredErr, ok := recovered.(error)
+	if !ok || !errors.Is(recoveredErr, context.Canceled) {
+		t.Fatalf("waitForIndex panic = %#v, want context.Canceled", recovered)
+	}
+	if requests != 1 {
+		t.Fatalf("existence requests = %d, want 1", requests)
+	}
+}
+
+// TestCreatePoliciesCancellationStopsRetry verifies cancellation after an
+// index-not-found response prevents another policy PUT.
+func TestCreatePoliciesCancellationStopsRetry(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		attempts++
+		cancel()
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":{"type":"index_not_found_exception"}}`))
+	}))
+	t.Cleanup(server.Close)
+
+	es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
+	if err != nil {
+		t.Fatalf("new elasticsearch client: %v", err)
+	}
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		createPolicies(ctx, es, namedDefinitions{"policy": json.RawMessage(`{"match":{}}`)}, []string{"policy"})
+	}()
+
+	recoveredErr, ok := recovered.(error)
+	if !ok || !errors.Is(recoveredErr, context.Canceled) {
+		t.Fatalf("createPolicies panic = %#v, want context.Canceled", recovered)
+	}
+	if attempts != 1 {
+		t.Fatalf("policy PUT attempts = %d, want 1", attempts)
+	}
+}
+
+// TestPutPolicyUsesCallerContext verifies cancellation reaches an in-flight
+// enrich-policy request.
+func TestPutPolicyUsesCallerContext(t *testing.T) {
+	requestStarted := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		close(requestStarted)
+		select {
+		case <-r.Context().Done():
+		case <-releaseHandler:
+		}
+	}))
+	t.Cleanup(func() {
+		close(releaseHandler)
+		server.Close()
+	})
+
+	es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
+	if err != nil {
+		t.Fatalf("new elasticsearch client: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		res, err := putPolicy(ctx, es, "policy", json.RawMessage(`{"match":{}}`))
+		if res != nil {
+			res.Body.Close()
+		}
+		result <- err
+	}()
+
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("policy request did not start")
+	}
+	cancel()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("putPolicy error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("putPolicy did not return promptly after cancellation")
+	}
+}
+
+// TestDeletePipelinesUsesCallerContext verifies cancellation reaches an
+// in-flight pipeline delete request, proving ctx now threads from the caller
+// into this managed-resource helper instead of being hardcoded to
+// context.Background().
+func TestDeletePipelinesUsesCallerContext(t *testing.T) {
+	requestStarted := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		close(requestStarted)
+		<-r.Context().Done()
+	}))
+	t.Cleanup(server.Close)
+
+	es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
+	if err != nil {
+		t.Fatalf("new elasticsearch client: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var recovered any
+	done := make(chan struct{})
+	go func() {
+		defer func() {
+			recovered = recover()
+			close(done)
+		}()
+		deletePipelines(ctx, es, []string{"pipeline-a"})
+	}()
+
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("delete pipeline request did not start")
+	}
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("deletePipelines did not return promptly after cancellation")
+	}
+
+	recoveredErr, ok := recovered.(error)
+	if !ok || !errors.Is(recoveredErr, context.Canceled) {
+		t.Fatalf("deletePipelines panic = %#v, want context.Canceled", recovered)
+	}
+}
+
+// TestExecuteEnrichPolicyCancellationStopsPolling verifies that cancelling the
+// caller's context during the Tasks API poll wait stops the loop immediately
+// instead of continuing to poll until the task completes.
+func TestExecuteEnrichPolicyCancellationStopsPolling(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	previousSleep := sleepWithContext
+	sleepCalls := 0
+	sleepWithContext = func(sleepCtx context.Context, _ time.Duration) error {
+		sleepCalls++
+		cancel()
+		return sleepCtx.Err()
+	}
+	t.Cleanup(func() {
+		sleepWithContext = previousSleep
+	})
+
+	taskGetCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		switch {
+		case (r.Method == http.MethodPut || r.Method == http.MethodPost) && r.URL.Path == "/_enrich/policy/policy-a/_execute":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"task":"node:123"}`))
+		case r.URL.Path == "/_tasks/node:123":
+			taskGetCalls++
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"completed":false,"task":{"status":{"phase":"RUNNING"}}}`))
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
+	if err != nil {
+		t.Fatalf("new elasticsearch client: %v", err)
+	}
+
+	result := make(chan bool, 1)
+	go func() {
+		result <- executeEnrichPolicy(ctx, es, "policy-a")
+	}()
+
+	select {
+	case ok := <-result:
+		if ok {
+			t.Fatal("executeEnrichPolicy returned true, want false after cancellation")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("executeEnrichPolicy did not return promptly after cancellation")
+	}
+
+	if sleepCalls != 1 {
+		t.Fatalf("sleepWithContext calls = %d, want 1", sleepCalls)
+	}
+	if taskGetCalls != 0 {
+		t.Fatalf("Tasks.Get calls = %d, want 0 (poll loop should stop before polling again)", taskGetCalls)
+	}
+}
+
+// TestEnrichFromOptions verifies public option precedence and normalization.
+func TestEnrichFromOptions(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		options      EnrichOptions
+		wantEnabled  bool
+		wantAll      bool
+		wantRaw      string
+		wantPolicies []string
+	}{
+		{
+			name:    "disabled raw is ignored",
+			options: EnrichOptions{Raw: "policy-a"},
+		},
+		{
+			name:        "enabled empty selection means all",
+			options:     EnrichOptions{Enabled: true},
+			wantEnabled: true,
+			wantAll:     true,
+		},
+		{
+			name:         "enabled raw selects explicit policies",
+			options:      EnrichOptions{Enabled: true, Raw: " policy-a,policy-b, policy-a ,, policy-c "},
+			wantEnabled:  true,
+			wantRaw:      "policy-a,policy-b, policy-a ,, policy-c",
+			wantPolicies: []string{"policy-a", "policy-b", "policy-c"},
+		},
+		{
+			name:         "policies enable and override all and raw",
+			options:      EnrichOptions{All: true, Raw: "ignored", Policies: []string{"policy-a", "policy-b"}},
+			wantEnabled:  true,
+			wantRaw:      "policy-a,policy-b",
+			wantPolicies: []string{"policy-a", "policy-b"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			enrich := enrichFromOptions(tt.options)
+			if enrich.enabled != tt.wantEnabled {
+				t.Fatalf("enabled = %t, want %t", enrich.enabled, tt.wantEnabled)
+			}
+			if enrich.all != tt.wantAll {
+				t.Fatalf("all = %t, want %t", enrich.all, tt.wantAll)
+			}
+			if enrich.raw != tt.wantRaw {
+				t.Fatalf("raw = %q, want %q", enrich.raw, tt.wantRaw)
+			}
+			if got := enrich.explicitPolicies(); !reflect.DeepEqual(got, tt.wantPolicies) {
+				t.Fatalf("explicitPolicies() = %v, want %v", got, tt.wantPolicies)
+			}
+		})
 	}
 }
 
@@ -91,22 +465,18 @@ func TestResolveEnrichTargetsWarnsForMissingPolicies(t *testing.T) {
 	}
 }
 
-// TestParseLogLevel verifies behavior for the related scenario.
-func TestParseLogLevel(t *testing.T) {
+// TestEnrichPollInterval verifies the polling cadence transitions after five checks.
+func TestEnrichPollInterval(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name    string
-		input   string
-		want    zerolog.Level
-		wantErr bool
+		name      string
+		pollCount int
+		want      time.Duration
 	}{
-		{name: "trace", input: "trace", want: zerolog.TraceLevel},
-		{name: "debug uppercase", input: "DEBUG", want: zerolog.DebugLevel},
-		{name: "info spaced", input: " info ", want: zerolog.InfoLevel},
-		{name: "warn", input: "warn", want: zerolog.WarnLevel},
-		{name: "error", input: "error", want: zerolog.ErrorLevel},
-		{name: "invalid", input: "verbose", wantErr: true},
+		{name: "first poll", pollCount: 1, want: initialEnrichPollInterval},
+		{name: "fifth poll", pollCount: 5, want: initialEnrichPollInterval},
+		{name: "sixth poll", pollCount: 6, want: subsequentEnrichPollInterval},
 	}
 
 	for _, tt := range tests {
@@ -114,18 +484,8 @@ func TestParseLogLevel(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got, err := parseLogLevel(tt.input)
-			if tt.wantErr {
-				if err == nil {
-					t.Fatal("expected error, got nil")
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("parseLogLevel returned error: %v", err)
-			}
-			if got != tt.want {
-				t.Fatalf("parseLogLevel mismatch: got %v want %v", got, tt.want)
+			if got := enrichPollInterval(tt.pollCount); got != tt.want {
+				t.Fatalf("enrichPollInterval(%d) = %s, want %s", tt.pollCount, got, tt.want)
 			}
 		})
 	}
@@ -1327,6 +1687,118 @@ func TestRunCreatesPipelinesBeforeIndexWhenDefaultPipelineIsConfigured(t *testin
 	}
 }
 
+// TestFlushAndCheckValidatesDeleteByQueryResponse verifies that a flush fails
+// on shard failures or malformed responses while tolerating version conflicts.
+func TestFlushAndCheckValidatesDeleteByQueryResponse(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		wantErr bool
+	}{
+		{
+			name: "empty failures succeeds",
+			body: `{"version_conflicts":0,"failures":[]}`,
+		},
+		{
+			name: "version conflicts remain accepted",
+			body: `{"version_conflicts":2,"failures":[]}`,
+		},
+		{
+			name:    "shard failure fails",
+			body:    `{"failures":[{"shard":0,"reason":{"type":"illegal_state_exception","reason":"failed"}}]}`,
+			wantErr: true,
+		},
+		{
+			name:    "malformed success body fails",
+			body:    `{`,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("X-Elastic-Product", "Elasticsearch")
+				if r.Method != http.MethodPost || r.URL.Path != "/cards/_delete_by_query" {
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				if got := r.URL.Query().Get("conflicts"); got != "proceed" {
+					t.Errorf("conflicts query mismatch: got %q want %q", got, "proceed")
+				}
+				if got := r.URL.Query().Get("refresh"); got != "true" {
+					t.Errorf("refresh query mismatch: got %q want %q", got, "true")
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			t.Cleanup(server.Close)
+
+			es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
+			if err != nil {
+				t.Fatalf("new elasticsearch client: %v", err)
+			}
+
+			if !tt.wantErr {
+				flushAndCheck(es, "cards")
+				return
+			}
+
+			runErr := recoverRunError(t, func() {
+				flushAndCheck(es, "cards")
+			})
+			if runErr.Kind != ErrIndexOperation {
+				t.Fatalf("error kind mismatch: got %v want %v", runErr.Kind, ErrIndexOperation)
+			}
+		})
+	}
+}
+
+// TestBulkInsertRejectsUnsupportedDocumentBeforeRequest verifies that payload
+// serialization failures stop the batch before Elasticsearch receives it.
+func TestBulkInsertRejectsUnsupportedDocumentBeforeRequest(t *testing.T) {
+	var requestCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requestCount.Add(1)
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"errors":false,"items":[]}`))
+	}))
+	t.Cleanup(server.Close)
+
+	es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
+	if err != nil {
+		t.Fatalf("new elasticsearch client: %v", err)
+	}
+
+	runErr := recoverRunError(t, func() {
+		bulkInsert(
+			context.Background(),
+			es,
+			"cards",
+			[]map[string]interface{}{
+				{"id": "1"},
+				{"id": "2", "unsupported": func() {}},
+			},
+			2,
+			2,
+			1,
+			time.Millisecond,
+			time.Millisecond,
+			"id",
+		)
+	})
+	if runErr.Kind != ErrBulkFailure {
+		t.Fatalf("error kind mismatch: got %v want %v", runErr.Kind, ErrBulkFailure)
+	}
+	if got := requestCount.Load(); got != 0 {
+		t.Fatalf("bulk request count mismatch: got %d want 0", got)
+	}
+}
+
 // TestRunRetriesBulkOnRetryableStatus verifies behavior for the related scenario.
 func TestRunRetriesBulkOnRetryableStatus(t *testing.T) {
 	t.Parallel()
@@ -1774,6 +2246,27 @@ func writeBulkDataFixture(t *testing.T) string {
 	return path
 }
 
+// recoverRunError invokes fn and returns the RunError it must panic with.
+func recoverRunError(t *testing.T, fn func()) (runErr *RunError) {
+	t.Helper()
+
+	defer func() {
+		recovered := recover()
+		if recovered == nil {
+			t.Fatal("expected function to panic with RunError")
+		}
+
+		var ok bool
+		runErr, ok = recovered.(*RunError)
+		if !ok {
+			t.Fatalf("panic type mismatch: got %T want *RunError", recovered)
+		}
+	}()
+
+	fn()
+	return nil
+}
+
 // writeBulkNDJSONFixture writes a minimal NDJSON data file for tests.
 // Mirrors writeBulkDataFixture but in NDJSON format.
 func writeBulkNDJSONFixture(t *testing.T) string {
@@ -2154,6 +2647,28 @@ func TestNextAvailableTimestampedIndexNameWithCheckPropagatesErrors(t *testing.T
 	})
 	if err == nil {
 		t.Fatal("expected error, got nil")
+	}
+}
+
+// TestNextAvailableTimestampedIndexNameWithCheckStopsAtCollisionLimit verifies
+// that the collision search performs no more than the documented number of checks.
+func TestNextAvailableTimestampedIndexNameWithCheckStopsAtCollisionLimit(t *testing.T) {
+	previousLogger := log.Logger
+	log.Logger = zerolog.Nop()
+	t.Cleanup(func() {
+		log.Logger = previousLogger
+	})
+
+	checks := 0
+	_, err := nextAvailableTimestampedIndexNameWithCheck("cards", time.Date(2026, time.March, 19, 13, 4, 59, 0, time.UTC), func(candidate string) (bool, error) {
+		checks++
+		return true, nil
+	})
+	if err == nil {
+		t.Fatal("expected collision-limit error, got nil")
+	}
+	if checks != timestampedIndexCollisionLimit {
+		t.Fatalf("existence checks = %d, want %d", checks, timestampedIndexCollisionLimit)
 	}
 }
 
