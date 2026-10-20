@@ -21,8 +21,8 @@ func TestClusterReplicaCount(t *testing.T) {
 		expected int
 	}{
 		{
-			name: "nil client returns 0",
-			wantNil: true,
+			name:     "nil client returns 0",
+			wantNil:  true,
 			expected: 0,
 		},
 		{

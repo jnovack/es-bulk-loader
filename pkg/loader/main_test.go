@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -373,6 +375,56 @@ func TestExecuteEnrichPolicyCancellationStopsPolling(t *testing.T) {
 }
 
 // TestEnrichFromOptions verifies public option precedence and normalization.
+// TestRunDoesNotMutateCallerOptions guards the documented Run contract that
+// normalization happens on Run's private copy. Library callers reuse Options
+// across runs; a pointer receiver or in-place map/slice edit would leak
+// defaults (URL, BatchSize, INDEX template variable) back to them.
+func TestRunDoesNotMutateCallerOptions(t *testing.T) {
+	// Not parallel: Run swaps the package-global zerolog logger.
+	tests := []struct {
+		name string
+		opts Options
+	}{
+		{
+			name: "invalid auth returns before client creation",
+			opts: Options{
+				Index:             "products",
+				User:              "u",
+				Pass:              "p",
+				APIKey:            "k",
+				TemplateVariables: map[string]string{"ENV": "test"},
+				Enrich:            EnrichOptions{Policies: []string{"a", "b"}},
+			},
+		},
+		{
+			name: "fails after template variables are built",
+			opts: Options{
+				URL:               "http://127.0.0.1:1",
+				Index:             "products",
+				SyncManaged:       true,
+				PipelinesFile:     filepath.Join(t.TempDir(), "missing-pipelines.json"),
+				TemplateVariables: map[string]string{"ENV": "test", " SPACED ": "x"},
+				Enrich:            EnrichOptions{Policies: []string{"a", "b"}},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			want := tt.opts
+			want.TemplateVariables = maps.Clone(tt.opts.TemplateVariables)
+			want.Enrich.Policies = slices.Clone(tt.opts.Enrich.Policies)
+
+			if _, err := Run(t.Context(), tt.opts); err == nil {
+				t.Fatal("expected Run to fail for this fixture")
+			}
+			if !reflect.DeepEqual(tt.opts, want) {
+				t.Fatalf("Run mutated caller options:\n got %+v\nwant %+v", tt.opts, want)
+			}
+		})
+	}
+}
+
 func TestEnrichFromOptions(t *testing.T) {
 	t.Parallel()
 
@@ -851,7 +903,7 @@ func TestVerifyMappingPreflight(t *testing.T) {
 
 // TestRunStartsTransformsAfterEnrichExecution verifies behavior for the related scenario.
 func TestRunStartsTransformsAfterEnrichExecution(t *testing.T) {
-	t.Parallel()
+	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
 
 	var (
 		mu         sync.Mutex
@@ -976,7 +1028,7 @@ func TestRunStartsTransformsAfterEnrichExecution(t *testing.T) {
 
 // TestRunAliasFirstCreateUpsertsTransformsAfterAliasUpdate verifies behavior for the related scenario.
 func TestRunAliasFirstCreateUpsertsTransformsAfterAliasUpdate(t *testing.T) {
-	t.Parallel()
+	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
 
 	var (
 		mu           sync.Mutex
@@ -1110,7 +1162,7 @@ func TestRunAliasFirstCreateUpsertsTransformsAfterAliasUpdate(t *testing.T) {
 
 // TestRunNDJSONAliasFirstCreateUpsertsTransformsAfterAliasUpdate verifies behavior for the related scenario.
 func TestRunNDJSONAliasFirstCreateUpsertsTransformsAfterAliasUpdate(t *testing.T) {
-	t.Parallel()
+	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
 
 	var (
 		mu           sync.Mutex
@@ -1244,7 +1296,7 @@ func TestRunNDJSONAliasFirstCreateUpsertsTransformsAfterAliasUpdate(t *testing.T
 
 // TestRunNonAliasCreateUpsertsTransformsAfterBulkLoad verifies behavior for the related scenario.
 func TestRunNonAliasCreateUpsertsTransformsAfterBulkLoad(t *testing.T) {
-	t.Parallel()
+	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
 
 	var (
 		mu         sync.Mutex
@@ -1358,7 +1410,7 @@ func TestRunNonAliasCreateUpsertsTransformsAfterBulkLoad(t *testing.T) {
 
 // TestRunNDJSONNonAliasCreateUpsertsTransformsAfterBulkLoad verifies behavior for the related scenario.
 func TestRunNDJSONNonAliasCreateUpsertsTransformsAfterBulkLoad(t *testing.T) {
-	t.Parallel()
+	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
 
 	var (
 		mu         sync.Mutex
@@ -1474,7 +1526,7 @@ func TestRunNDJSONNonAliasCreateUpsertsTransformsAfterBulkLoad(t *testing.T) {
 // against the write index before any batch transform is started, preventing the
 // ES refresh-window race where a transform reads 0 docs from an unrefreshed index.
 func TestRunRefreshesIndexBeforeStartingTransforms(t *testing.T) {
-	t.Parallel()
+	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
 
 	var (
 		mu         sync.Mutex
@@ -1590,7 +1642,7 @@ func TestRunRefreshesIndexBeforeStartingTransforms(t *testing.T) {
 
 // TestRunCreatesPipelinesBeforeIndexWhenDefaultPipelineIsConfigured verifies behavior for the related scenario.
 func TestRunCreatesPipelinesBeforeIndexWhenDefaultPipelineIsConfigured(t *testing.T) {
-	t.Parallel()
+	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
 
 	var (
 		mu         sync.Mutex
@@ -1801,7 +1853,7 @@ func TestBulkInsertRejectsUnsupportedDocumentBeforeRequest(t *testing.T) {
 
 // TestRunRetriesBulkOnRetryableStatus verifies behavior for the related scenario.
 func TestRunRetriesBulkOnRetryableStatus(t *testing.T) {
-	t.Parallel()
+	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
 
 	var bulkAttempts int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1843,7 +1895,7 @@ func TestRunRetriesBulkOnRetryableStatus(t *testing.T) {
 
 // TestRunNDJSONRetriesBulkOnRetryableStatus verifies behavior for the related scenario.
 func TestRunNDJSONRetriesBulkOnRetryableStatus(t *testing.T) {
-	t.Parallel()
+	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
 
 	var bulkAttempts int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1885,7 +1937,7 @@ func TestRunNDJSONRetriesBulkOnRetryableStatus(t *testing.T) {
 
 // TestRunRetriesBulkOnTransportFailure verifies behavior for the related scenario.
 func TestRunRetriesBulkOnTransportFailure(t *testing.T) {
-	t.Parallel()
+	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
 
 	var bulkAttempts int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1934,7 +1986,7 @@ func TestRunRetriesBulkOnTransportFailure(t *testing.T) {
 
 // TestRunNDJSONRetriesBulkOnTransportFailure verifies behavior for the related scenario.
 func TestRunNDJSONRetriesBulkOnTransportFailure(t *testing.T) {
-	t.Parallel()
+	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
 
 	var bulkAttempts int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1983,7 +2035,7 @@ func TestRunNDJSONRetriesBulkOnTransportFailure(t *testing.T) {
 
 // TestRunDoesNotRetryBulkOnBadRequest verifies behavior for the related scenario.
 func TestRunDoesNotRetryBulkOnBadRequest(t *testing.T) {
-	t.Parallel()
+	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
 
 	var bulkAttempts int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2020,7 +2072,7 @@ func TestRunDoesNotRetryBulkOnBadRequest(t *testing.T) {
 
 // TestRunNDJSONDoesNotRetryBulkOnBadRequest verifies behavior for the related scenario.
 func TestRunNDJSONDoesNotRetryBulkOnBadRequest(t *testing.T) {
-	t.Parallel()
+	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
 
 	var bulkAttempts int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2057,7 +2109,7 @@ func TestRunNDJSONDoesNotRetryBulkOnBadRequest(t *testing.T) {
 
 // TestRunExhaustsRetriesOnRetryableStatus verifies behavior for the related scenario.
 func TestRunExhaustsRetriesOnRetryableStatus(t *testing.T) {
-	t.Parallel()
+	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
 
 	var bulkAttempts int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2095,7 +2147,7 @@ func TestRunExhaustsRetriesOnRetryableStatus(t *testing.T) {
 
 // TestRunNDJSONExhaustsRetriesOnRetryableStatus verifies behavior for the related scenario.
 func TestRunNDJSONExhaustsRetriesOnRetryableStatus(t *testing.T) {
-	t.Parallel()
+	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
 
 	var bulkAttempts int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2362,7 +2414,7 @@ func TestCountNDJSONLines(t *testing.T) {
 
 // TestLoadNDJSONProducesCorrectDocuments verifies behavior for the related scenario.
 func TestLoadNDJSONProducesCorrectDocuments(t *testing.T) {
-	t.Parallel()
+	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
 
 	type bulkLine struct {
 		Index map[string]string `json:"index"`

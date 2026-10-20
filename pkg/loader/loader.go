@@ -449,7 +449,11 @@ func withTimestampLogger(base zerolog.Logger) zerolog.Logger {
 
 // ─── Primary Execution Entry Points ────────────────────────────────────────────
 
-// Run centralizes this code path so package behavior stays consistent.
+// Run executes the loader lifecycle for one index; see the package
+// documentation for stage ordering. opts is received by value and zero-valued
+// fields are normalized on Run's private copy, so the caller's Options —
+// including the TemplateVariables map and Enrich.Policies slice — is never
+// modified. TestRunDoesNotMutateCallerOptions guards that contract.
 func Run(ctx context.Context, opts Options) (result Result, err error) {
 	if ctx == nil {
 		ctx = context.Background()
