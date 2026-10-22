@@ -138,9 +138,10 @@ never modifies the pointee.
 ```go
 logger := zerolog.New(os.Stderr).With().Str("stage", "slugs").Logger()
 result, err := loaderpkg.Run(ctx, loaderpkg.Options{
-    URL:    "http://localhost:9200",
-    Index:  "slugs",
-    Logger: &logger,
+    URL:         "http://localhost:9200",
+    Index:       "slugs",
+    SyncManaged: true,
+    Logger:      &logger,
 })
 ```
 
@@ -173,9 +174,10 @@ Sentinel error classes are exposed for classification:
 
 ```go
 result, err := loaderpkg.Run(ctx, loaderpkg.Options{
-    URL:         "http://localhost:9200",
-    Index:       "slugs",
-    SyncManaged: true,
+    URL:            "http://localhost:9200",
+    Index:          "slugs",
+    SyncManaged:    true,
+    TransformsFile: "transforms.json", // definitions with source_index "slugs"
     Transforms: loaderpkg.TransformOptions{
         Wait:        true,             // block until each transform's first checkpoint
         WaitTimeout: 10 * time.Minute, // per transform; <= 0 means 30m
