@@ -111,3 +111,11 @@ Example:
   canonicalized policy JSON.
 - A created policy still needs to be executed before its enrich backing index
   exists.
+- If a pipeline references a logical policy that the run supplies no
+  definition for, and the cluster holds several managed generations
+  (`<logical>-<hash>`) of it, the run fails and names the candidates. The hash
+  has no recency, so the loader never guesses. Supply the definition or delete
+  the stale generations with `DELETE /_enrich/policy/<name>` (`-nuke` only
+  removes policies named in the supplied policies file, so it cannot clear
+  them). This applies to every run that reads a pipelines file, with or
+  without `-sync-managed`.

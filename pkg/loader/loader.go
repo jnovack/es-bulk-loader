@@ -1815,7 +1815,13 @@ func rewritePipelinePolicyReferences(definitions namedDefinitions, names []strin
 	return rewritten
 }
 
-// resolvePipelinePolicyFallbacks centralizes this code path so package behavior stays consistent.
+// resolvePipelinePolicyFallbacks maps logical enrich policy references that the
+// run supplied no definition for onto existing cluster policies. Pre-mapped
+// and exact names win; a single managed generation is adopted; none warns and
+// skips. Several managed generations fail the run: the suffix is a content
+// hash with no recency, so picking one silently binds a pipeline to a stale
+// definition (moxfall: a field fed by it was populated on 0 of 109,373
+// documents, with no error). Never guess between generations.
 func resolvePipelinePolicyFallbacks(ctx context.Context, es *elasticsearch.Client, definitions namedDefinitions, names []string, policyNameMapping map[string]string) {
 	referenced := collectReferencedPolicyNamesFromPipelines(definitions, names)
 	if len(referenced) == 0 {
@@ -1852,18 +1858,22 @@ func resolvePipelinePolicyFallbacks(ctx context.Context, es *elasticsearch.Clien
 			continue
 		}
 
-		slices.Sort(matches)
-		chosen := matches[len(matches)-1]
-		policyNameMapping[policy] = chosen
 		if len(matches) > 1 {
-			log.Warn().
-				Str("logical_policy", policy).
-				Str("policy", chosen).
-				Strs("candidates", matches).
-				Msg("Multiple managed enrich policy names matched logical policy reference; using the lexicographically latest match")
-		} else {
-			log.Info().Str("logical_policy", policy).Str("policy", chosen).Msg("Resolved logical enrich policy reference to managed policy name")
+			slices.Sort(matches)
+			// The candidates go in the wrapped error, not the message:
+			// classifyRunErrorKind reads the message, and a real policy name
+			// containing "enrich" or "bulk" would reclassify this error away
+			// from ErrManagedResource. Do not assign policyNameMapping here.
+			fatal().
+				Err(fmt.Errorf("logical policy %q matches managed generations %s and this run supplied no definition for it; supply its definition or delete the stale generations",
+					policy, strings.Join(matches, ", "))).
+				Str("logical_policy", policy).Strs("candidates", matches).
+				Msg("Ambiguous policy reference")
 		}
+
+		chosen := matches[0]
+		policyNameMapping[policy] = chosen
+		log.Info().Str("logical_policy", policy).Str("policy", chosen).Msg("Resolved logical enrich policy reference to managed policy name")
 	}
 }
 

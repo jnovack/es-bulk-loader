@@ -383,6 +383,8 @@ definitions as part of the run:
   pipelines are rewritten to reference it.
 - Old managed policy versions are garbage-collected when they are unreferenced
   by any pipeline.
+- A pipeline reference to a logical policy with no supplied definition fails
+  the run, naming the candidates, when several managed generations match it.
 - `-delete` fails loudly if a declared enrich policy is still referenced by
   another ingest pipeline. This is the safe default because those references
   may belong to another index workflow.
