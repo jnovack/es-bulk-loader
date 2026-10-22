@@ -71,6 +71,11 @@ Sample config file: [examples/es-bulk-loader.conf](examples/es-bulk-loader.conf)
 
 `es-bulk-loader` can now be called directly in-process from Go via [`pkg/loader`](pkg/loader).
 
+**Compatibility.** The `pkg/loader` type surface and documented behavior
+are stable. Fixes to undocumented or data-corrupting behavior ship in
+minor releases with a release note. Changes to documented behavior get a
+deprecation path.
+
 Full lifecycle run:
 
 ```go
@@ -362,7 +367,7 @@ Definition file formats are documented in [docs/PIPELINES.md](docs/PIPELINES.md)
 
 When `-pipelines` is supplied during index creation, the loader preserves the JSON key order from the pipeline file. If the settings file does not already define a default pipeline, the first declared pipeline becomes the index default pipeline automatically.
 
-Definition files support variable expansion before they are parsed. `${INDEX}` is populated from the current `-index` value (alias name when `-alias` is enabled), and other placeholders fall back to environment variables when present.
+Definition files support variable expansion before they are parsed. `${INDEX}` is populated from the current `-index` value (alias name when `-alias` is enabled), and other `${NAME}` placeholders fall back to environment variables when present. Only the braced `${NAME}` form is expanded; a bare `$NAME` (for example `$HOME`) is left verbatim.
 
 ## JSON Formats
 

@@ -64,7 +64,8 @@ Creating an enrich policy is not the same as executing it.
 Definition files are templated before they are parsed.
 
 - `${INDEX}` expands to the current `-index` value.
-- Other placeholders fall back to environment variables when present.
+- Other `${NAME}` placeholders fall back to environment variables when present.
+- Only the braced `${NAME}` form is expanded. A bare `$NAME` (for example `$HOME`) is left verbatim.
 
 Example:
 

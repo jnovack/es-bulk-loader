@@ -2084,8 +2084,11 @@ func buildTemplateVariables(index string, additional map[string]string) template
 	return variables
 }
 
-// templateVariablePattern defines package-level state shared by related execution paths.
-var templateVariablePattern = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)`)
+// templateVariablePattern recognizes only the braced ${NAME} form. A brace-less
+// $NAME must stay verbatim: matching it let any literal "$word" in a config
+// asset (e.g. $HOME) be silently rewritten from the environment, corrupting
+// cluster configuration. Do not re-add it without a default-off opt-in.
+var templateVariablePattern = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
 
 // readTemplatedFile centralizes this code path so package behavior stays consistent.
 func readTemplatedFile(path string, variables templateVariables) ([]byte, error) {
@@ -2095,9 +2098,7 @@ func readTemplatedFile(path string, variables templateVariables) ([]byte, error)
 	}
 
 	expanded := templateVariablePattern.ReplaceAllStringFunc(string(content), func(match string) string {
-		name := strings.TrimPrefix(match, "$")
-		name = strings.TrimPrefix(name, "{")
-		name = strings.TrimSuffix(name, "}")
+		name := templateVariablePattern.FindStringSubmatch(match)[1]
 
 		if value, ok := variables[name]; ok {
 			return value

@@ -698,6 +698,41 @@ func TestReadTemplatedFileLeavesUnknownVariablesUntouched(t *testing.T) {
 	}
 }
 
+// TestBracelessDollarNameIsNotSubstituted guards the decision that only the
+// braced ${NAME} form is templated: a literal "$HOME" in a config asset must
+// never be rewritten, even when HOME is in the variable map and environment.
+// Not parallel: t.Setenv forbids t.Parallel.
+func TestBracelessDollarNameIsNotSubstituted(t *testing.T) {
+	t.Setenv("HOME", "/should-not-appear")
+
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"home", `{"v":"$HOME"}`, `{"v":"$HOME"}`},
+		{"trailing dollar", `{"v":"foo$"}`, `{"v":"foo$"}`},
+		{"currency", `{"v":"$5.00"}`, `{"v":"$5.00"}`},
+		{"bare trailing dollar", `{"v":"$"}`, `{"v":"$"}`},
+		{"braced still resolves", `{"v":"${INDEX}"}`, `{"v":"runtime-index"}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			variables := buildTemplateVariables("runtime-index", map[string]string{"HOME": "/also-should-not-appear"})
+			path := writeTempJSON(t, t.TempDir(), tt.input)
+
+			content, err := readTemplatedFile(path, variables)
+			if err != nil {
+				t.Fatalf("readTemplatedFile returned error: %v", err)
+			}
+			if got := string(content); got != tt.want {
+				t.Fatalf("content mismatch: got %q want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestBuildTemplateVariablesIncludesAdditionalValues verifies behavior for the related scenario.
 func TestBuildTemplateVariablesIncludesAdditionalValues(t *testing.T) {
 	t.Parallel()

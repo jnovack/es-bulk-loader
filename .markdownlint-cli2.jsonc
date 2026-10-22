@@ -1,0 +1,9 @@
+{
+  "config": {
+    // Table rows cannot be wrapped without breaking the table, so MD013's
+    // 80-column limit applies to prose only.
+    "MD013": {
+      "tables": false
+    }
+  }
+}

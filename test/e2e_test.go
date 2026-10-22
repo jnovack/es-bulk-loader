@@ -604,9 +604,9 @@ func (ctx *scenarioContext) writeFixtures(t *testing.T) {
 		"settings.json": sourceSettingsJSON,
 		"mappings.json": sourceBaseMappingsJSON,
 		"pipelines.json": strings.TrimSpace(fmt.Sprintf(sourcePipelinesJSON,
-			"$SOURCE_PIPELINE_PRIMARY", "$SOURCE_PIPELINE_SECONDARY",
+			"${SOURCE_PIPELINE_PRIMARY}", "${SOURCE_PIPELINE_SECONDARY}",
 		)),
-		"policies.json": strings.TrimSpace(fmt.Sprintf(sourcePoliciesJSON, "$SOURCE_POLICY")),
+		"policies.json": strings.TrimSpace(fmt.Sprintf(sourcePoliciesJSON, "${SOURCE_POLICY}")),
 		"data.json":     sourceInitialDataJSON,
 	})
 
@@ -614,9 +614,9 @@ func (ctx *scenarioContext) writeFixtures(t *testing.T) {
 		"settings.json": sourceSettingsJSON,
 		"mappings.json": sourceSyncMappingsJSON,
 		"pipelines.json": strings.TrimSpace(fmt.Sprintf(sourceSyncPipelinesJSON,
-			"$ALT_SOURCE_PIPELINE_PRIMARY", "$ALT_SOURCE_PIPELINE_SECONDARY",
+			"${ALT_SOURCE_PIPELINE_PRIMARY}", "${ALT_SOURCE_PIPELINE_SECONDARY}",
 		)),
-		"policies.json": strings.TrimSpace(fmt.Sprintf(sourceSyncPoliciesJSON, "$ALT_SOURCE_POLICY")),
+		"policies.json": strings.TrimSpace(fmt.Sprintf(sourceSyncPoliciesJSON, "${ALT_SOURCE_POLICY}")),
 		"data.json":     sourceReplacementDataJSON,
 	})
 
@@ -624,9 +624,9 @@ func (ctx *scenarioContext) writeFixtures(t *testing.T) {
 		"settings.json": sourceSettingsJSON,
 		"mappings.json": sourceSyncMappingsJSON,
 		"pipelines.json": strings.TrimSpace(fmt.Sprintf(sourceSyncPipelinesJSON,
-			"$ALT_SOURCE_PIPELINE_PRIMARY", "$ALT_SOURCE_PIPELINE_SECONDARY",
+			"${ALT_SOURCE_PIPELINE_PRIMARY}", "${ALT_SOURCE_PIPELINE_SECONDARY}",
 		)),
-		"policies.json": strings.TrimSpace(fmt.Sprintf(sourceSyncPoliciesJSON, "$ALT_SOURCE_POLICY")),
+		"policies.json": strings.TrimSpace(fmt.Sprintf(sourceSyncPoliciesJSON, "${ALT_SOURCE_POLICY}")),
 		"data.json":     sourceReplacementDataJSON,
 	})
 
@@ -634,9 +634,9 @@ func (ctx *scenarioContext) writeFixtures(t *testing.T) {
 		"settings.json": sourceSettingsJSON,
 		"mappings.json": sourceSyncMappingsJSON,
 		"pipelines.json": strings.TrimSpace(fmt.Sprintf(sourceSyncPipelinesJSON,
-			"$ALT_SOURCE_PIPELINE_PRIMARY", "$ALT_SOURCE_PIPELINE_SECONDARY",
+			"${ALT_SOURCE_PIPELINE_PRIMARY}", "${ALT_SOURCE_PIPELINE_SECONDARY}",
 		)),
-		"policies.json": strings.TrimSpace(fmt.Sprintf(sourceSyncPoliciesJSON, "$ALT_SOURCE_POLICY")),
+		"policies.json": strings.TrimSpace(fmt.Sprintf(sourceSyncPoliciesJSON, "${ALT_SOURCE_POLICY}")),
 		"data.json":     sourceAppendDataJSON,
 	})
 
@@ -644,7 +644,7 @@ func (ctx *scenarioContext) writeFixtures(t *testing.T) {
 		"settings.json": targetSettingsJSON,
 		"mappings.json": targetMappingsJSON,
 		"pipelines.json": strings.TrimSpace(fmt.Sprintf(targetPipelinesJSON,
-			"$TARGET_PIPELINE_PRIMARY", "$SOURCE_POLICY_NAME", "$TARGET_PIPELINE_SECONDARY",
+			"${TARGET_PIPELINE_PRIMARY}", "${SOURCE_POLICY_NAME}", "${TARGET_PIPELINE_SECONDARY}",
 		)),
 		"data.json": targetDataJSON,
 	})
