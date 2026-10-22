@@ -3340,7 +3340,6 @@ func bulkInsert(
 		Float64("time_taken", duration.Seconds()).
 		Msg("Processed batch")
 
-	// TODO: Persist non-retryable item failures to a dead-letter file for later replay.
 	return bulkInsertResult{Succeeded: succeeded, Failed: failed}
 }
 
