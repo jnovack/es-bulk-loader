@@ -32,7 +32,8 @@ docker run --rm \
 After the run:
 
 - the `slugs` index exists with the configured mappings and normalized settings
-- the first declared pipeline becomes the index default pipeline when settings do not already set one
+- the first declared pipeline becomes the index default pipeline when settings
+  do not already set one
 - source documents have `inclusion_percent` populated by the ingest pipeline
 - the `slugs-by-name` enrich policy is created and executed
 
