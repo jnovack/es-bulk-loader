@@ -623,6 +623,17 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 		defaultPipeline = pipelineNames[0]
 	}
 
+	// Parse the mappings file before the existence check, -nuke and the data
+	// action, so a malformed file fails the run before anything is deleted.
+	preflightPlan := mappingPreflightPlan{}
+	if action.requiresDataFile() {
+		plan, planErr := buildMappingPreflightPlan(*mappingsFile, variables)
+		if planErr != nil {
+			fatal().Err(planErr).Str("path", *mappingsFile).Msg("Failed to build mapping preflight plan")
+		}
+		preflightPlan = plan
+	}
+
 	aliasTargets := []string(nil)
 	exists := false
 	if *aliasMode {
@@ -677,6 +688,16 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 		}
 
 		deleteManagedResources(ctx, es, pipelineNames, policyDeleteNames, transformNames, true)
+	}
+
+	// An existing index must already match the mappings file before -flush
+	// deletes its documents or -sync-managed upserts pipelines and policies
+	// below. -flush and -add never write mappings, so this run cannot repair
+	// a mismatch. Checking after the flush left an emptied index behind a
+	// failed run. Read `exists` here: the switch below rewrites it.
+	preflightExistingIndex := exists && (action == dataActionFlush || action == dataActionAdd)
+	if preflightExistingIndex {
+		requireMappingPreflight(es, *index, preflightPlan)
 	}
 
 	switch action {
@@ -801,14 +822,11 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 	}
 
 	if action.requiresDataFile() {
-		preflightPlan, err := buildMappingPreflightPlan(*mappingsFile, variables)
-		if err != nil {
-			fatal().Err(err).Str("path", *mappingsFile).Msg("Failed to build mapping preflight plan")
-		}
-		if preflightPlan.hasExpectations() {
-			if err := verifyMappingPreflight(es, writeIndex, preflightPlan); err != nil {
-				fatal().Err(err).Str("index", writeIndex).Msg("Mapping preflight failed before bulk insert")
-			}
+		// Created-index path: the index was created above from the mappings
+		// file, so verify it now. The existing-index path was verified before
+		// the data action and is not checked twice.
+		if !preflightExistingIndex {
+			requireMappingPreflight(es, writeIndex, preflightPlan)
 		}
 		log.Info().Msg("Starting bulk insert")
 
@@ -1008,31 +1026,66 @@ func buildMappingPreflightPlan(mappingsFile string, variables templateVariables)
 	return plan, nil
 }
 
-// verifyMappingPreflight centralizes this code path so package behavior stays consistent.
+// requireMappingPreflight fails the run when index's live mappings do not
+// match plan. Both Run call sites (the early existing-index check and the
+// post-create check) go through this helper, so the check cannot drift between
+// the two paths.
+//
+// The fatal message must stay byte-identical: panicWithMessage passes it to
+// classifyRunErrorKind, which matches "bulk" first, so a preflight failure is
+// classified as ErrBulkFailure. TestRunExistingIndexMappingMismatchFailsBeforeMutation
+// pins that kind; changing it is a deliberate decision, not a rename.
+func requireMappingPreflight(es *elasticsearch.Client, index string, plan mappingPreflightPlan) {
+	if !plan.hasExpectations() {
+		return
+	}
+	if err := verifyMappingPreflight(es, index, plan); err != nil {
+		fatal().Err(err).Str("index", index).Msg("Mapping preflight failed before bulk insert")
+	}
+}
+
+// verifyMappingPreflight compares index's live mappings with plan and returns
+// one error listing every mismatch: the date_detection mismatch first, then
+// root fields in sorted order. Returning at the first mismatch while ranging
+// over the RootFieldTypes map made the reported field depend on map order and
+// forced the operator to fix one field per failed run; collecting everything
+// gives a deterministic message that can be fixed in one pass. A mapping fetch
+// failure is returned as-is, because it is not a mismatch.
 func verifyMappingPreflight(es *elasticsearch.Client, index string, plan mappingPreflightPlan) error {
 	mappings, err := fetchIndexMappings(es, index)
 	if err != nil {
 		return err
 	}
 
+	var mismatches []string
 	if plan.DateDetectionExpected != nil {
 		actualDateDetection, present := extractDateDetection(mappings)
 		if !present {
 			actualDateDetection = true
 		}
 		if actualDateDetection != *plan.DateDetectionExpected {
-			return fmt.Errorf("mappings.date_detection is %t, expected %t", actualDateDetection, *plan.DateDetectionExpected)
+			mismatches = append(mismatches, fmt.Sprintf("mappings.date_detection is %t, expected %t", actualDateDetection, *plan.DateDetectionExpected))
 		}
 	}
 
-	for fieldPath, expectedType := range plan.RootFieldTypes {
+	fieldPaths := make([]string, 0, len(plan.RootFieldTypes))
+	for fieldPath := range plan.RootFieldTypes {
+		fieldPaths = append(fieldPaths, fieldPath)
+	}
+	slices.Sort(fieldPaths)
+	for _, fieldPath := range fieldPaths {
+		expectedType := plan.RootFieldTypes[fieldPath]
 		actualType, ok := resolveFieldType(mappings, fieldPath)
 		if !ok {
-			return fmt.Errorf("required mapping for field %q is missing", fieldPath)
+			mismatches = append(mismatches, fmt.Sprintf("required mapping for field %q is missing", fieldPath))
+			continue
 		}
 		if actualType != expectedType {
-			return fmt.Errorf("field %q has type %q, expected %q", fieldPath, actualType, expectedType)
+			mismatches = append(mismatches, fmt.Sprintf("field %q has type %q, expected %q", fieldPath, actualType, expectedType))
 		}
+	}
+	if len(mismatches) > 0 {
+		return fmt.Errorf("index %q mappings do not match the mappings file: %s", index, strings.Join(mismatches, "; "))
 	}
 
 	event := log.Info().

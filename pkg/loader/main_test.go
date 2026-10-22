@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"maps"
 	"net/http"
@@ -934,6 +935,386 @@ func TestVerifyMappingPreflight(t *testing.T) {
 			t.Fatalf("unexpected preflight error: %v", err)
 		}
 	})
+}
+
+// TestVerifyMappingPreflightReportsEveryMismatchInFieldOrder guards the
+// aggregated preflight error: every mismatch class (date_detection against the
+// omitted-means-true default, missing fields, type mismatches) is reported in
+// one error, date_detection first and then fields in sorted order. Repeating
+// the call makes map-iteration nondeterminism fail the exact-string check.
+func TestVerifyMappingPreflightReportsEveryMismatchInFieldOrder(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		if r.Method != http.MethodGet || r.URL.Path != "/target-index/_mapping" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"target-index":{"mappings":{"properties":{"beta":{"type":"text"}}}}}`))
+	}))
+	t.Cleanup(server.Close)
+
+	es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
+	if err != nil {
+		t.Fatalf("new elasticsearch client: %v", err)
+	}
+
+	plan := mappingPreflightPlan{
+		DateDetectionExpected: boolPointer(false),
+		RootFieldTypes:        map[string]string{"gamma": "keyword", "alpha": "long", "beta": "keyword"},
+	}
+	want := `index "target-index" mappings do not match the mappings file: ` +
+		`mappings.date_detection is true, expected false; ` +
+		`required mapping for field "alpha" is missing; ` +
+		`field "beta" has type "text", expected "keyword"; ` +
+		`required mapping for field "gamma" is missing`
+
+	for attempt := 0; attempt < 20; attempt++ {
+		err := verifyMappingPreflight(es, "target-index", plan)
+		if err == nil {
+			t.Fatalf("attempt %d: expected mapping preflight error", attempt)
+		}
+		if got := err.Error(); got != want {
+			t.Fatalf("attempt %d: preflight error mismatch\n got: %s\nwant: %s", attempt, got, want)
+		}
+	}
+}
+
+// preflightRunFixtures holds the shared fixture paths for the mapping
+// preflight Run tests.
+type preflightRunFixtures struct {
+	data              string
+	divergentMappings string
+	matchingMappings  string
+	malformedMappings string
+	pipelines         string
+	policies          string
+}
+
+// writePreflightRunFixtures writes the shared fixtures. The divergent mappings
+// declare two root fields (pipeline_version, new_mapping_only_field) that the
+// stub's live mapping lacks; the matching mappings declare only lookup_id.
+func writePreflightRunFixtures(t *testing.T) preflightRunFixtures {
+	t.Helper()
+	dir := t.TempDir()
+	return preflightRunFixtures{
+		data:              writeTempJSON(t, dir, `[{"id":"1"}]`),
+		divergentMappings: writeTempJSON(t, dir, `{"mappings":{"properties":{"lookup_id":{"type":"keyword"},"pipeline_version":{"type":"integer"},"new_mapping_only_field":{"type":"keyword"}}}}`),
+		matchingMappings:  writeTempJSON(t, dir, `{"mappings":{"properties":{"lookup_id":{"type":"keyword"}}}}`),
+		malformedMappings: writeTempJSON(t, dir, `{"mappings":`),
+		pipelines:         writeTempJSON(t, dir, `{"alt-pipe":{"processors":[]}}`),
+		policies:          writeTempJSON(t, dir, `{"alt-policy":{"match":{"indices":"${INDEX}","match_field":"lookup_id","enrich_fields":["x"]}}}`),
+	}
+}
+
+const (
+	preflightLiveMappings      = `{"cards":{"mappings":{"properties":{"lookup_id":{"type":"keyword"}}}}}`
+	preflightAliasLiveMappings = `{"cards-20260101000000":{"mappings":{"properties":{"lookup_id":{"type":"keyword"}}}}}`
+)
+
+// assertOperationOrder fails unless every operation is present and each one is
+// first recorded before the next. firstOperationIndex returns -1 for a missing
+// operation, and -1 < n is not ordering evidence, so presence is checked first.
+func assertOperationOrder(t *testing.T, ops []string, ordered ...string) {
+	t.Helper()
+	previous := -1
+	for i, operation := range ordered {
+		idx := firstOperationIndex(ops, operation)
+		if idx == -1 {
+			t.Fatalf("expected operation %q to be recorded, got %v", operation, ops)
+		}
+		if i > 0 && idx <= previous {
+			t.Fatalf("expected %q after %q, got operations %v", operation, ordered[i-1], ops)
+		}
+		previous = idx
+	}
+}
+
+// TestRunExistingIndexMappingMismatchFailsBeforeMutation guards the decision
+// that an existing index is verified against the mappings file before -flush
+// deletes documents and before -sync-managed upserts pipelines or policies.
+// It fails if the check moves back after flushAndCheck or after the
+// existing-index managed upserts, which left an emptied index (and changed
+// managed resources) behind a failed run. A mapping fetch failure must stop
+// the run at the same point.
+func TestRunExistingIndexMappingMismatchFailsBeforeMutation(t *testing.T) {
+	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
+
+	fixtures := writePreflightRunFixtures(t)
+	divergentFields := []string{"pipeline_version", "new_mapping_only_field"}
+	fetchFailure := []string{`fetching mappings for index "cards" failed with status 500`}
+
+	tests := []struct {
+		name         string
+		opts         Options
+		stub         preflightStubConfig
+		wantContains []string
+	}{
+		{
+			name:         "flush",
+			opts:         Options{FlushIndex: true, MappingsFile: fixtures.divergentMappings},
+			stub:         preflightStubConfig{indexExists: true, liveMappings: preflightLiveMappings},
+			wantContains: divergentFields,
+		},
+		{
+			name: "flush sync-managed",
+			opts: Options{
+				FlushIndex: true, SyncManaged: true, MappingsFile: fixtures.divergentMappings,
+				PipelinesFile: fixtures.pipelines, PoliciesFile: fixtures.policies,
+			},
+			stub:         preflightStubConfig{indexExists: true, liveMappings: preflightLiveMappings},
+			wantContains: divergentFields,
+		},
+		{
+			name: "add sync-managed",
+			opts: Options{
+				AddToIndex: true, SyncManaged: true, MappingsFile: fixtures.divergentMappings,
+				PipelinesFile: fixtures.pipelines, PoliciesFile: fixtures.policies,
+			},
+			stub:         preflightStubConfig{indexExists: true, liveMappings: preflightLiveMappings},
+			wantContains: divergentFields,
+		},
+		{
+			name: "alias flush sync-managed",
+			opts: Options{
+				AliasMode: true, FlushIndex: true, SyncManaged: true, MappingsFile: fixtures.divergentMappings,
+				PipelinesFile: fixtures.pipelines, PoliciesFile: fixtures.policies,
+			},
+			stub: preflightStubConfig{
+				aliasTargets: []string{"cards-20260101000000"},
+				liveMappings: preflightAliasLiveMappings,
+			},
+			wantContains: divergentFields,
+		},
+		{
+			name: "flush sync-managed mapping fetch failure",
+			opts: Options{
+				FlushIndex: true, SyncManaged: true, MappingsFile: fixtures.matchingMappings,
+				PipelinesFile: fixtures.pipelines, PoliciesFile: fixtures.policies,
+			},
+			stub:         preflightStubConfig{indexExists: true, mappingStatus: http.StatusInternalServerError},
+			wantContains: fetchFailure,
+		},
+		{
+			name: "add sync-managed mapping fetch failure",
+			opts: Options{
+				AddToIndex: true, SyncManaged: true, MappingsFile: fixtures.matchingMappings,
+				PipelinesFile: fixtures.pipelines, PoliciesFile: fixtures.policies,
+			},
+			stub:         preflightStubConfig{indexExists: true, mappingStatus: http.StatusInternalServerError},
+			wantContains: fetchFailure,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stub := newPreflightRunStub(t, tt.stub)
+			opts := tt.opts
+			opts.URL = stub.url
+			opts.Index = "cards"
+			opts.DataFile = fixtures.data
+
+			_, err := Run(t.Context(), opts)
+			if err == nil {
+				t.Fatal("expected Run to fail mapping preflight")
+			}
+			// The kind is pinned deliberately (spec Constraint "Keep the
+			// classification"): the fatal message contains "bulk", so
+			// classifyRunErrorKind yields ErrBulkFailure. Changing it is a
+			// separate decision, not a side effect.
+			if !errors.Is(err, ErrBulkFailure) {
+				t.Fatalf("expected ErrBulkFailure, got %v", err)
+			}
+			for _, want := range tt.wantContains {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("expected error to contain %q, got %v", want, err)
+				}
+			}
+
+			ops := stub.operations()
+			if got := operationCount(ops, "mapping.get"); got != 1 {
+				t.Fatalf("expected exactly one mapping.get, got %d in %v", got, ops)
+			}
+			if got := stub.mappingFetchTargets(); !slices.Equal(got, []string{"cards"}) {
+				t.Fatalf("expected the existing-index check to target %q, got %v", "cards", got)
+			}
+			for _, mutation := range []string{"flush", "pipeline.put", "policy.put", "bulk", "index.create", "index.delete"} {
+				if got := operationCount(ops, mutation); got != 0 {
+					t.Fatalf("expected no %s before the preflight failure, got %d in %v", mutation, got, ops)
+				}
+			}
+		})
+	}
+}
+
+// TestRunExistingIndexVerifiesMappingsBeforeFlush guards the happy path of the
+// early existing-index check: the mapping fetch precedes _delete_by_query, it
+// runs once (not again before bulk), and the run succeeds. It covers -flush,
+// -add and alias mode on an existing target so a second (post-create) check on
+// any of those paths fails the single-check count. A run with no -mappings file
+// has no expectations and must not fetch mappings at all.
+func TestRunExistingIndexVerifiesMappingsBeforeFlush(t *testing.T) {
+	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
+
+	fixtures := writePreflightRunFixtures(t)
+
+	tests := []struct {
+		name         string
+		opts         Options
+		stub         preflightStubConfig
+		noMappings   bool
+		wantMappings int
+		wantFlush    bool
+	}{
+		{name: "flush", opts: Options{FlushIndex: true}, stub: preflightStubConfig{indexExists: true, liveMappings: preflightLiveMappings}, wantMappings: 1, wantFlush: true},
+		{name: "add", opts: Options{AddToIndex: true}, stub: preflightStubConfig{indexExists: true, liveMappings: preflightLiveMappings}, wantMappings: 1},
+		{name: "alias flush", opts: Options{AliasMode: true, FlushIndex: true}, stub: preflightStubConfig{indexExists: true, aliasTargets: []string{"cards-20260101000000"}, liveMappings: preflightAliasLiveMappings}, wantMappings: 1, wantFlush: true},
+		{name: "alias add", opts: Options{AliasMode: true, AddToIndex: true}, stub: preflightStubConfig{indexExists: true, aliasTargets: []string{"cards-20260101000000"}, liveMappings: preflightAliasLiveMappings}, wantMappings: 1},
+		{name: "flush without mappings file", opts: Options{FlushIndex: true}, stub: preflightStubConfig{indexExists: true, liveMappings: preflightLiveMappings}, noMappings: true, wantFlush: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stub := newPreflightRunStub(t, tt.stub)
+			opts := tt.opts
+			opts.URL = stub.url
+			opts.Index = "cards"
+			opts.DataFile = fixtures.data
+			if !tt.noMappings {
+				opts.MappingsFile = fixtures.matchingMappings
+			}
+
+			if _, err := Run(t.Context(), opts); err != nil {
+				t.Fatalf("Run returned error: %v", err)
+			}
+
+			ops := stub.operations()
+			if got := operationCount(ops, "mapping.get"); got != tt.wantMappings {
+				t.Fatalf("expected %d mapping.get, got %d in %v", tt.wantMappings, got, ops)
+			}
+			if got := operationCount(ops, "index.create"); got != 0 {
+				t.Fatalf("expected no index.create on an existing target, got %d in %v", got, ops)
+			}
+			switch {
+			case tt.wantMappings > 0 && tt.wantFlush:
+				assertOperationOrder(t, ops, "mapping.get", "flush", "bulk")
+			case tt.wantMappings > 0:
+				assertOperationOrder(t, ops, "mapping.get", "bulk")
+			case tt.wantFlush:
+				assertOperationOrder(t, ops, "flush", "bulk")
+			}
+		})
+	}
+}
+
+// TestRunCreatedIndexVerifiesMappingsOnceAfterCreate guards the created-index
+// path: when the run creates the index (-delete, or -add/-flush with no
+// existing index or alias target), the mapping check runs exactly once, after
+// the create and before bulk, against the concrete index that was created. In
+// alias mode that is the new timestamped index, not the alias name.
+func TestRunCreatedIndexVerifiesMappingsOnceAfterCreate(t *testing.T) {
+	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
+
+	fixtures := writePreflightRunFixtures(t)
+
+	tests := []struct {
+		name  string
+		opts  Options
+		stub  preflightStubConfig
+		alias bool
+	}{
+		{name: "delete existing", opts: Options{DeleteIndex: true}, stub: preflightStubConfig{indexExists: true}},
+		{name: "flush missing", opts: Options{FlushIndex: true}, stub: preflightStubConfig{indexExists: false}},
+		{name: "add missing", opts: Options{AddToIndex: true}, stub: preflightStubConfig{indexExists: false}},
+		{name: "alias add missing target", opts: Options{AliasMode: true, AddToIndex: true}, alias: true},
+		{name: "alias flush missing target", opts: Options{AliasMode: true, FlushIndex: true}, alias: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := tt.stub
+			cfg.liveMappings = preflightLiveMappings
+			stub := newPreflightRunStub(t, cfg)
+			opts := tt.opts
+			opts.URL = stub.url
+			opts.Index = "cards"
+			opts.DataFile = fixtures.data
+			opts.MappingsFile = fixtures.matchingMappings
+
+			_, err := Run(t.Context(), opts)
+			if err != nil {
+				t.Fatalf("Run returned error: %v", err)
+			}
+
+			ops := stub.operations()
+			if got := operationCount(ops, "mapping.get"); got != 1 {
+				t.Fatalf("expected exactly one mapping.get, got %d in %v", got, ops)
+			}
+			assertOperationOrder(t, ops, "index.create", "mapping.get", "bulk")
+
+			created := stub.createdIndices()
+			if len(created) != 1 {
+				t.Fatalf("expected exactly one created index, got %v", created)
+			}
+			if got := stub.mappingFetchTargets(); !slices.Equal(got, created) {
+				t.Fatalf("expected the mapping check to target the created index %v, got %v", created, got)
+			}
+			if tt.alias {
+				if _, ok := parseTimestampedIndexName("cards", created[0]); !ok {
+					t.Fatalf("expected a timestamped alias generation, got %q", created[0])
+				}
+				assertOperationOrder(t, ops, "bulk", "alias.update")
+			} else if created[0] != "cards" {
+				t.Fatalf("expected concrete index %q to be created, got %q", "cards", created[0])
+			}
+		})
+	}
+}
+
+// TestRunMalformedMappingsFailsBeforeDelete guards that the mappings file is
+// parsed before -nuke and the data action, so a malformed file fails the run
+// before any index is deleted.
+func TestRunMalformedMappingsFailsBeforeDelete(t *testing.T) {
+	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
+
+	fixtures := writePreflightRunFixtures(t)
+
+	tests := []struct {
+		name string
+		opts Options
+	}{
+		{name: "delete", opts: Options{DeleteIndex: true}},
+		{name: "nuke delete", opts: Options{Nuke: true, DeleteIndex: true}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stub := newPreflightRunStub(t, preflightStubConfig{indexExists: true, liveMappings: preflightLiveMappings})
+			opts := tt.opts
+			opts.URL = stub.url
+			opts.Index = "cards"
+			opts.DataFile = fixtures.data
+			opts.MappingsFile = fixtures.malformedMappings
+
+			_, err := Run(t.Context(), opts)
+			if err == nil {
+				t.Fatal("expected Run to fail on a malformed mappings file")
+			}
+			if !errors.Is(err, ErrLoaderExecution) {
+				t.Fatalf("expected ErrLoaderExecution, got %v", err)
+			}
+			if !strings.Contains(err.Error(), "Parsing mappings file") {
+				t.Fatalf("expected a mappings parse failure, got %v", err)
+			}
+			ops := stub.operations()
+			if got := operationCount(ops, "index.delete"); got != 0 {
+				t.Fatalf("expected no index.delete before the parse failure, got %d in %v", got, ops)
+			}
+		})
+	}
 }
 
 // TestRunStartsTransformsAfterEnrichExecution verifies behavior for the related scenario.
@@ -2535,6 +2916,169 @@ func firstOperationIndex(operations []string, operation string) int {
 		}
 	}
 	return -1
+}
+
+// operationCount returns how many times operation was recorded.
+func operationCount(operations []string, operation string) int {
+	count := 0
+	for _, current := range operations {
+		if current == operation {
+			count++
+		}
+	}
+	return count
+}
+
+// preflightStubConfig configures newPreflightRunStub for the mapping
+// preflight ordering tests. All indices live under the name "cards".
+type preflightStubConfig struct {
+	indexExists   bool     // HEAD /cards answers 200 before any create
+	aliasTargets  []string // non-empty: GET /_alias/cards resolves to these indices
+	liveMappings  string   // response body for GET /<index>/_mapping
+	mappingStatus int      // status for GET /<index>/_mapping; 0 means 200
+}
+
+// preflightRunStub is an operation-recording Elasticsearch stub shared by the
+// mapping preflight Run tests. operations lists the order of recorded calls;
+// createdIndices and mappingTargets name the concrete index of each create and
+// mapping fetch, so alias tests can prove the timestamped index was checked.
+type preflightRunStub struct {
+	url string
+
+	mu             sync.Mutex
+	ops            []string
+	created        []string
+	mappingTargets []string
+}
+
+// operations returns a copy of the recorded operation names.
+func (s *preflightRunStub) operations() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.ops)
+}
+
+// createdIndices returns a copy of the index names created through PUT /<index>.
+func (s *preflightRunStub) createdIndices() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.created)
+}
+
+// mappingFetchTargets returns a copy of the index names whose _mapping was fetched.
+func (s *preflightRunStub) mappingFetchTargets() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.mappingTargets)
+}
+
+// newPreflightRunStub starts the shared stub. Unknown requests fail the test
+// with t.Errorf (not t.Fatalf, which must not run off the test goroutine).
+func newPreflightRunStub(t *testing.T, cfg preflightStubConfig) *preflightRunStub {
+	t.Helper()
+
+	stub := &preflightRunStub{}
+	present := map[string]bool{"cards": cfg.indexExists}
+	record := func(op string) {
+		stub.mu.Lock()
+		defer stub.mu.Unlock()
+		stub.ops = append(stub.ops, op)
+	}
+	isIndexPath := func(path string) bool {
+		name := strings.TrimPrefix(path, "/")
+		return name == "cards" || (strings.HasPrefix(name, "cards-") && !strings.Contains(name, "/"))
+	}
+	writeJSON := func(w http.ResponseWriter, status int, body string) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		method := r.Method
+		path := r.URL.Path
+
+		switch {
+		case method == http.MethodHead && isIndexPath(path):
+			record("index.head")
+			stub.mu.Lock()
+			exists := present[strings.TrimPrefix(path, "/")]
+			stub.mu.Unlock()
+			if exists {
+				w.WriteHeader(http.StatusOK)
+			} else {
+				w.WriteHeader(http.StatusNotFound)
+			}
+		case method == http.MethodGet && path == "/_alias/cards":
+			record("alias.get")
+			if len(cfg.aliasTargets) == 0 {
+				writeJSON(w, http.StatusNotFound, `{"error":{"type":"aliases_not_found_exception"},"status":404}`)
+				return
+			}
+			targets := make(map[string]any, len(cfg.aliasTargets))
+			for _, target := range cfg.aliasTargets {
+				targets[target] = map[string]any{"aliases": map[string]any{"cards": map[string]any{}}}
+			}
+			body, _ := json.Marshal(targets)
+			writeJSON(w, http.StatusOK, string(body))
+		case method == http.MethodGet && strings.HasSuffix(path, "/_mapping"):
+			record("mapping.get")
+			stub.mu.Lock()
+			stub.mappingTargets = append(stub.mappingTargets, strings.TrimSuffix(strings.TrimPrefix(path, "/"), "/_mapping"))
+			stub.mu.Unlock()
+			status := cfg.mappingStatus
+			if status == 0 {
+				status = http.StatusOK
+			}
+			if status != http.StatusOK {
+				writeJSON(w, status, fmt.Sprintf(`{"error":{"type":"stub_mapping_failure"},"status":%d}`, status))
+				return
+			}
+			writeJSON(w, http.StatusOK, cfg.liveMappings)
+		case method == http.MethodPost && strings.HasSuffix(path, "/_delete_by_query"):
+			record("flush")
+			writeJSON(w, http.StatusOK, `{"failures":[]}`)
+		case method == http.MethodDelete && isIndexPath(path):
+			record("index.delete")
+			stub.mu.Lock()
+			present[strings.TrimPrefix(path, "/")] = false
+			stub.mu.Unlock()
+			writeJSON(w, http.StatusOK, `{"acknowledged":true}`)
+		case method == http.MethodGet && path == "/_nodes":
+			record("nodes.get")
+			writeJSON(w, http.StatusOK, `{"nodes":{"node1":{}}}`)
+		case method == http.MethodPut && isIndexPath(path):
+			record("index.create")
+			name := strings.TrimPrefix(path, "/")
+			stub.mu.Lock()
+			present[name] = true
+			stub.created = append(stub.created, name)
+			stub.mu.Unlock()
+			writeJSON(w, http.StatusOK, `{"acknowledged":true}`)
+		case method == http.MethodPost && path == "/_bulk":
+			record("bulk")
+			writeJSON(w, http.StatusOK, `{"errors":false,"items":[{"index":{"_index":"cards","_id":"1","status":201}}]}`)
+		case method == http.MethodPost && path == "/_aliases":
+			record("alias.update")
+			writeJSON(w, http.StatusOK, `{"acknowledged":true}`)
+		case method == http.MethodPut && strings.HasPrefix(path, "/_ingest/pipeline/"):
+			record("pipeline.put")
+			writeJSON(w, http.StatusOK, `{"acknowledged":true}`)
+		case method == http.MethodGet && (path == "/_enrich/policy" || path == "/_enrich/policy/"):
+			record("policy.get")
+			writeJSON(w, http.StatusOK, `{"policies":[]}`)
+		case method == http.MethodPut && strings.HasPrefix(path, "/_enrich/policy/"):
+			record("policy.put")
+			writeJSON(w, http.StatusOK, `{"acknowledged":true}`)
+		default:
+			t.Errorf("unexpected request: %s %s", method, path)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	t.Cleanup(server.Close)
+	stub.url = server.URL
+	return stub
 }
 
 // TestSelectedDataAction verifies behavior for the related scenario.

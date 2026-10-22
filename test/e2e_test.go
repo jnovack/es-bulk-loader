@@ -58,6 +58,7 @@ type scenarioContext struct {
 	sourceSyncDir      string
 	sourceReplaceDir   string
 	sourceAppendDir    string
+	sourceDivergentDir string
 	targetReferenceDir string
 }
 
@@ -176,6 +177,13 @@ func TestEndToEndScenarios(t *testing.T) {
 			checks: "third run prunes the oldest timestamped index and keeps newest two",
 			run:    scenarioAliasKeepLastPrunesOldestAfterThirdRun,
 		},
+		{
+			// Appended last: the slice index sets each scenario's e2e-NN prefix.
+			name:   "flush_sync-managed_divergent_mappings_fails",
+			flags:  "-flush -sync-managed",
+			checks: "fails before flush and managed upserts; names every divergent field; documents and managed resources untouched",
+			run:    scenarioFlushSyncManagedDivergentMappingsFails,
+		},
 	}
 
 	for i, sc := range scenarios {
@@ -228,7 +236,6 @@ func scenarioFlush(t *testing.T, ctx *scenarioContext) {
 	assertDocCount(t, ctx, ctx.sourceIndex, 1)
 	assertDefaultPipeline(t, ctx, ctx.sourceIndex, ctx.sourcePipelinePrimary)
 	assertMappingField(t, ctx, ctx.sourceIndex, "lookup_id")
-	assertNoMappingField(t, ctx, ctx.sourceIndex, "new_mapping_only_field")
 	assertPipelineExists(t, ctx, ctx.sourcePipelinePrimary)
 	assertPipelineMissing(t, ctx, ctx.altSourcePipelinePrimary)
 	assertPolicyExists(t, ctx, ctx.sourcePolicy)
@@ -248,7 +255,6 @@ func scenarioFlushSyncManaged(t *testing.T, ctx *scenarioContext) {
 
 	assertDocCount(t, ctx, ctx.sourceIndex, 1)
 	assertDefaultPipeline(t, ctx, ctx.sourceIndex, ctx.sourcePipelinePrimary)
-	assertNoMappingField(t, ctx, ctx.sourceIndex, "new_mapping_only_field")
 	assertPipelineExists(t, ctx, ctx.sourcePipelinePrimary)
 	assertPipelineExists(t, ctx, ctx.altSourcePipelinePrimary)
 	assertPolicyExists(t, ctx, ctx.sourcePolicy)
@@ -269,7 +275,6 @@ func scenarioAdd(t *testing.T, ctx *scenarioContext) {
 	assertDocCount(t, ctx, ctx.sourceIndex, 3)
 	assertPipelineMissing(t, ctx, ctx.altSourcePipelinePrimary)
 	assertPolicyMissing(t, ctx, ctx.altSourcePolicy)
-	assertNoMappingField(t, ctx, ctx.sourceIndex, "new_mapping_only_field")
 
 	doc := getDocument(t, ctx, ctx.sourceIndex, "C3")
 	assertEqual(t, nestedString(doc, "_source", "source_label"), "gamma-20")
@@ -285,7 +290,6 @@ func scenarioAddSyncManaged(t *testing.T, ctx *scenarioContext) {
 	assertDocCount(t, ctx, ctx.sourceIndex, 3)
 	assertPipelineExists(t, ctx, ctx.altSourcePipelinePrimary)
 	assertPolicyExists(t, ctx, ctx.altSourcePolicy)
-	assertNoMappingField(t, ctx, ctx.sourceIndex, "new_mapping_only_field")
 
 	doc := getDocument(t, ctx, ctx.sourceIndex, "C3")
 	assertEqual(t, nestedString(doc, "_source", "source_label"), "gamma-20")
@@ -432,6 +436,29 @@ func scenarioAliasKeepLastPrunesOldestAfterThirdRun(t *testing.T, ctx *scenarioC
 
 	assertEqual(t, singleAliasTarget(t, ctx, ctx.sourceIndex), third)
 	assertDocCount(t, ctx, ctx.sourceIndex, 2)
+}
+
+// scenarioFlushSyncManagedDivergentMappingsFails proves the existing-index
+// mapping preflight runs before -flush deletes documents and before
+// -sync-managed upserts pipelines and policies: a mappings file declaring
+// fields the index lacks fails the run, names every divergent field, and
+// leaves documents, mappings and managed resources as they were.
+func scenarioFlushSyncManagedDivergentMappingsFails(t *testing.T, ctx *scenarioContext) {
+	mustSucceed(t, runLoader(t, ctx, nil, sourceArgs(ctx, ctx.sourceBaseDir, "-delete", true, false, "")))
+	sourcePipelineBefore := pipelineDefinition(t, ctx, ctx.sourcePipelinePrimary)
+
+	result := runLoader(t, ctx, nil, sourceArgs(ctx, ctx.sourceDivergentDir, "-flush", true, false, ""))
+	mustFailWith(t, result, "Mapping preflight failed")
+	mustContain(t, result.output, "pipeline_version")
+	mustContain(t, result.output, "new_mapping_only_field")
+
+	assertDocCount(t, ctx, ctx.sourceIndex, 2)
+	assertNoMappingField(t, ctx, ctx.sourceIndex, "new_mapping_only_field")
+	assertPipelineMissing(t, ctx, ctx.altSourcePipelinePrimary)
+	assertPipelineMissing(t, ctx, ctx.altSourcePipelineSecondary)
+	assertPolicyMissing(t, ctx, ctx.altSourcePolicy)
+	assertPipelineExists(t, ctx, ctx.sourcePipelinePrimary)
+	assertEqual(t, pipelineDefinition(t, ctx, ctx.sourcePipelinePrimary), sourcePipelineBefore)
 }
 
 // ─── Environment and Fixture Setup ─────────────────────────────────────────────
@@ -588,6 +615,7 @@ func newScenarioContext(t *testing.T, prefix string) *scenarioContext {
 		sourceSyncDir:      filepath.Join(root, "source-sync"),
 		sourceReplaceDir:   filepath.Join(root, "source-replace"),
 		sourceAppendDir:    filepath.Join(root, "source-append"),
+		sourceDivergentDir: filepath.Join(root, "source-divergent"),
 		targetReferenceDir: filepath.Join(root, "target-reference"),
 	}
 	ctx.sourcePolicyManaged = managedPolicyNameForLogicalAndIndex(ctx.sourcePolicy, ctx.sourceIndex)
@@ -612,7 +640,7 @@ func (ctx *scenarioContext) writeFixtures(t *testing.T) {
 
 	writeFixtureDir(t, ctx.sourceSyncDir, map[string]string{
 		"settings.json": sourceSettingsJSON,
-		"mappings.json": sourceSyncMappingsJSON,
+		"mappings.json": sourceBaseMappingsJSON,
 		"pipelines.json": strings.TrimSpace(fmt.Sprintf(sourceSyncPipelinesJSON,
 			"${ALT_SOURCE_PIPELINE_PRIMARY}", "${ALT_SOURCE_PIPELINE_SECONDARY}",
 		)),
@@ -622,7 +650,7 @@ func (ctx *scenarioContext) writeFixtures(t *testing.T) {
 
 	writeFixtureDir(t, ctx.sourceReplaceDir, map[string]string{
 		"settings.json": sourceSettingsJSON,
-		"mappings.json": sourceSyncMappingsJSON,
+		"mappings.json": sourceBaseMappingsJSON,
 		"pipelines.json": strings.TrimSpace(fmt.Sprintf(sourceSyncPipelinesJSON,
 			"${ALT_SOURCE_PIPELINE_PRIMARY}", "${ALT_SOURCE_PIPELINE_SECONDARY}",
 		)),
@@ -632,12 +660,22 @@ func (ctx *scenarioContext) writeFixtures(t *testing.T) {
 
 	writeFixtureDir(t, ctx.sourceAppendDir, map[string]string{
 		"settings.json": sourceSettingsJSON,
-		"mappings.json": sourceSyncMappingsJSON,
+		"mappings.json": sourceBaseMappingsJSON,
 		"pipelines.json": strings.TrimSpace(fmt.Sprintf(sourceSyncPipelinesJSON,
 			"${ALT_SOURCE_PIPELINE_PRIMARY}", "${ALT_SOURCE_PIPELINE_SECONDARY}",
 		)),
 		"policies.json": strings.TrimSpace(fmt.Sprintf(sourceSyncPoliciesJSON, "${ALT_SOURCE_POLICY}")),
 		"data.json":     sourceAppendDataJSON,
+	})
+
+	writeFixtureDir(t, ctx.sourceDivergentDir, map[string]string{
+		"settings.json": sourceSettingsJSON,
+		"mappings.json": sourceSyncMappingsJSON,
+		"pipelines.json": strings.TrimSpace(fmt.Sprintf(sourceSyncPipelinesJSON,
+			"${ALT_SOURCE_PIPELINE_PRIMARY}", "${ALT_SOURCE_PIPELINE_SECONDARY}",
+		)),
+		"policies.json": strings.TrimSpace(fmt.Sprintf(sourceSyncPoliciesJSON, "${ALT_SOURCE_POLICY}")),
+		"data.json":     sourceReplacementDataJSON,
 	})
 
 	writeFixtureDir(t, ctx.targetReferenceDir, map[string]string{
@@ -1000,6 +1038,24 @@ func assertPipelineExists(t *testing.T, ctx *scenarioContext, name string) {
 	}
 }
 
+// pipelineDefinition returns the pipeline's stored definition as canonical
+// JSON (object keys sorted by encoding/json), so a before/after comparison
+// catches a rewrite that a presence-only assertion would miss.
+func pipelineDefinition(t *testing.T, ctx *scenarioContext, name string) string {
+	t.Helper()
+	var response map[string]any
+	readJSON(t, doRequest(t, ctx, http.MethodGet, "/_ingest/pipeline/"+name, nil), &response)
+	definition, ok := response[name]
+	if !ok {
+		t.Fatalf("pipeline %q missing from response: %v", name, response)
+	}
+	canonical, err := json.Marshal(definition)
+	if err != nil {
+		t.Fatalf("marshal pipeline %q definition: %v", name, err)
+	}
+	return string(canonical)
+}
+
 // assertPipelineMissing centralizes this code path so package behavior stays consistent.
 func assertPipelineMissing(t *testing.T, ctx *scenarioContext, name string) {
 	t.Helper()
@@ -1337,7 +1393,11 @@ const sourceBaseMappingsJSON = `{
   }
 }`
 
-// sourceSyncMappingsJSON defines package-level values shared by related execution paths.
+// sourceSyncMappingsJSON intentionally declares two root fields
+// (pipeline_version, new_mapping_only_field) that the index created from
+// sourceBaseMappingsJSON lacks. Only the divergent-mappings scenario uses it:
+// -flush/-add never write mappings, so the loader must fail its preflight
+// before mutating the index or managed resources.
 const sourceSyncMappingsJSON = `{
   "mappings": {
     "properties": {
