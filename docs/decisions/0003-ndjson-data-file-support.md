@@ -119,7 +119,8 @@ added (detection byte changes, seek semantics change).
 
 ## References
 
-- [SPEC.ndjson-support.md](../../SPEC.ndjson-support.md)
+- `SPEC.ndjson-support.md`: removed after the feature shipped; recover
+  it with `git show ac23777:SPEC.ndjson-support.md`
 - [pkg/loader/loader.go](../../pkg/loader/loader.go)
 - [pkg/loader/main_test.go](../../pkg/loader/main_test.go)
 - [examples/cards/cards.json](../../examples/cards/cards.json)
