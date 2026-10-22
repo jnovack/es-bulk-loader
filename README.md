@@ -128,6 +128,11 @@ func main() {
 }
 ```
 
+`Options.Replicas` is a `*int`: `nil` derives `number_of_replicas` from
+cluster topology, any non-nil value (including `0`) overrides it for indices
+the run creates, and a negative value fails with `ErrInvalidOptions`. Run
+never modifies the pointee.
+
 Targeted helpers are also available for orchestration:
 
 - `loader.SyncManaged(ctx, opts)`
@@ -253,6 +258,7 @@ Settings can be loaded from a configuration file (e.g.
 | `-index` | Target index name (**required**) |
 | `-alias` | Treat `-index` as an alias and create timestamped indices as `<alias>-YYYYMMDDHHMMSS` when creating a new index |
 | `-keep-last` | With `-alias`, keep only the newest N timestamped indices matching `<alias>-YYYYMMDDHHMMSS` (default: 0, disabled) |
+| `-replicas` | `number_of_replicas` for indices this run creates; env `REPLICAS` (default: -1, derive from cluster node count; values below -1 are rejected) |
 | `-settings` | Optional path to JSON file with index settings |
 | `-mappings` | Optional path to JSON file with index mappings |
 | `-pipelines` | Optional path to JSON file with one or more ingest pipeline definitions |
@@ -531,6 +537,19 @@ Dotted `index.*` keys are also accepted:
 
 All of these shapes are normalized into the create-index request body the
 loader sends to Elasticsearch.
+
+`number_of_replicas` is always chosen by the loader when it creates an index
+(including each alias generation), in this order of precedence:
+
+| Source | Wins? |
+| --- | --- |
+| `-replicas` / `REPLICAS` / `Options.Replicas` | Always, including an explicit `0` |
+| Cluster topology (1 node: `0`, more: `1`) | Only when no override is supplied |
+| `number_of_replicas` in `settings.json` | Never; it is ignored |
+
+The override applies only at index creation. `-add` and `-flush` on an
+existing index never change its replica count. See
+[ADR 0001](docs/decisions/0001-replica-count-from-node-count.md).
 
 ### `mappings.json` (optional)
 

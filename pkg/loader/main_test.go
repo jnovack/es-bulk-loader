@@ -382,10 +382,21 @@ func TestExecuteEnrichPolicyCancellationStopsPolling(t *testing.T) {
 // defaults (URL, BatchSize, INDEX template variable) back to them.
 func TestRunDoesNotMutateCallerOptions(t *testing.T) {
 	// Not parallel: Run swaps the package-global zerolog logger.
+	replicas := 3
 	tests := []struct {
 		name string
 		opts Options
 	}{
+		{
+			name: "replicas pointer is read-only",
+			opts: Options{
+				URL:           "http://127.0.0.1:1",
+				Index:         "products",
+				SyncManaged:   true,
+				PipelinesFile: filepath.Join(t.TempDir(), "missing-pipelines.json"),
+				Replicas:      &replicas,
+			},
+		},
 		{
 			name: "invalid auth returns before client creation",
 			opts: Options{
@@ -415,6 +426,12 @@ func TestRunDoesNotMutateCallerOptions(t *testing.T) {
 			want := tt.opts
 			want.TemplateVariables = maps.Clone(tt.opts.TemplateVariables)
 			want.Enrich.Policies = slices.Clone(tt.opts.Enrich.Policies)
+			// Copying Options copies the pointer, not the pointee: clone it so
+			// DeepEqual compares the value Run could have written through.
+			if tt.opts.Replicas != nil {
+				cloned := *tt.opts.Replicas
+				want.Replicas = &cloned
+			}
 
 			if _, err := Run(t.Context(), tt.opts); err == nil {
 				t.Fatal("expected Run to fail for this fixture")
@@ -614,7 +631,7 @@ func TestBuildCreateIndexBodySupportsWrappedAndRawSections(t *testing.T) {
 	wrappedSettings := writeTempJSON(t, tempDir, `{"settings":{"index.default_pipeline":"wrapped-pipeline"}}`)
 	rawMappings := writeTempJSON(t, tempDir, `{"properties":{"lookup_id":{"type":"keyword"}}}`)
 
-	body := buildCreateIndexBody(nil, wrappedSettings, rawMappings, "ignored-default", buildTemplateVariables("runtime-index", nil))
+	body := buildCreateIndexBody(nil, nil, wrappedSettings, rawMappings, "ignored-default", buildTemplateVariables("runtime-index", nil))
 
 	var parsed map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(body), &parsed); err != nil {

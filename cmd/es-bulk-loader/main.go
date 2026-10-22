@@ -153,6 +153,17 @@ func newConsoleLogger(out io.Writer) zerolog.Logger {
 
 // ─── Main Execution ────────────────────────────────────────────────────────────
 
+// replicasOption maps the -replicas flag to loader.Options.Replicas. Exactly -1
+// means "derive from cluster topology" (nil); every other value, including
+// values below -1, is passed through so loader.Run is the one place that
+// rejects negatives.
+func replicasOption(v int) *int {
+	if v == -1 {
+		return nil
+	}
+	return &v
+}
+
 // main centralizes this code path so package behavior stays consistent.
 func main() {
 	populateBuildMetadataFromBuildInfo()
@@ -176,6 +187,7 @@ func main() {
 	syncManaged := flag.Bool("sync-managed", false, "Create or update declared ingest pipelines, enrich policies, and transforms")
 	aliasMode := flag.Bool("alias", false, "Treat -index as an alias; create timestamped indices as <alias>-YYYYMMDDHHMMSS and repoint the alias on recreate")
 	keepLast := flag.Int("keep-last", 0, "When -alias is set, keep only the newest N timestamped indices matching <alias>-YYYYMMDDHHMMSS (0 disables pruning)")
+	replicas := flag.Int("replicas", -1, "number_of_replicas for indices this run creates; -1 derives it from cluster node count (ADR 0001)")
 	nuke := flag.Bool("nuke", false, "Delete the current index and declared managed resources, including dependent pipelines that reference declared enrich policies")
 	idField := flag.String("id", "", "Field to use to override _id (not normal)")
 	user := flag.String("user", "", "Username for basic auth (optional)")
@@ -234,6 +246,7 @@ func main() {
 		SyncManaged:          *syncManaged,
 		AliasMode:            *aliasMode,
 		KeepLast:             *keepLast,
+		Replicas:             replicasOption(*replicas),
 		Nuke:                 *nuke,
 		IDField:              *idField,
 		User:                 *user,

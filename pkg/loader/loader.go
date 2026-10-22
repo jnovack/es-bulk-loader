@@ -120,8 +120,12 @@ type Options struct {
 	SyncManaged        bool
 	AliasMode          bool
 	KeepLast           int
-	Nuke               bool
-	IDField            string
+	// Replicas, when non-nil, sets number_of_replicas on indices this run
+	// creates, overriding the cluster-topology default (ADR 0001). nil keeps
+	// the topology rule; an explicit 0 is honoured. Must be >= 0.
+	Replicas *int
+	Nuke     bool
+	IDField  string
 	// BulkRetryAttempts controls total bulk request attempts, including the first attempt.
 	BulkRetryAttempts int
 	// BulkRetryBackoffBase controls the first retry wait for retryable bulk failures.
@@ -551,6 +555,9 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 	if *keepLast < 0 {
 		return result, &RunError{Kind: ErrInvalidOptions, Op: "validating keep-last", Err: fmt.Errorf("-keep-last must be 0 or greater")}
 	}
+	if opts.Replicas != nil && *opts.Replicas < 0 {
+		return result, &RunError{Kind: ErrInvalidOptions, Op: "validating replicas", Err: fmt.Errorf("replicas must be 0 or greater")}
+	}
 	if *keepLast > 0 && !*aliasMode {
 		warn("Ignoring -keep-last because -alias is not enabled")
 	}
@@ -789,7 +796,7 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 	}
 
 	if shouldCreateIndex {
-		body := buildCreateIndexBody(es, *settingsFile, *mappingsFile, defaultPipeline, variables)
+		body := buildCreateIndexBody(es, opts.Replicas, *settingsFile, *mappingsFile, defaultPipeline, variables)
 		createIndex := *index
 		if *aliasMode {
 			createIndex = createdIndex
@@ -1622,17 +1629,28 @@ func clusterReplicaCount(es *elasticsearch.Client) int {
 }
 
 // buildCreateIndexBody centralizes this code path so package behavior stays consistent.
-func buildCreateIndexBody(es *elasticsearch.Client, settingsFile, mappingsFile, defaultPipeline string, variables templateVariables) string {
+//
+// replicasOverride, when non-nil, wins over the cluster-topology rule and
+// clusterReplicaCount is not called (no pointless _nodes round trip). It is
+// read-only: the caller owns the pointee.
+func buildCreateIndexBody(es *elasticsearch.Client, replicasOverride *int, settingsFile, mappingsFile, defaultPipeline string, variables templateVariables) string {
 	// ADR: docs/decisions/0001-replica-count-from-node-count.md
-	replicas := clusterReplicaCount(es)
-	settings := normalizeIndexSettings(settingsFile, defaultPipeline, replicas, variables)
+	var replicas int
+	replicasSource := "cluster topology"
+	if replicasOverride != nil {
+		replicas = *replicasOverride
+		replicasSource = "explicit"
+	} else {
+		replicas = clusterReplicaCount(es)
+	}
+	settings := normalizeIndexSettings(settingsFile, defaultPipeline, replicas, replicasSource, variables)
 	mappings := normalizeIndexSection(mappingsFile, "mappings", variables)
 
 	return fmt.Sprintf(`{"settings": %s, "mappings": %s}`, settings, mappings)
 }
 
 // normalizeIndexSettings centralizes this code path so package behavior stays consistent.
-func normalizeIndexSettings(path, defaultPipeline string, replicas int, variables templateVariables) string {
+func normalizeIndexSettings(path, defaultPipeline string, replicas int, replicasSource string, variables templateVariables) string {
 	settings := make(map[string]json.RawMessage)
 	if path != "" {
 		content, err := readTemplatedFile(path, variables)
@@ -1680,9 +1698,10 @@ func normalizeIndexSettings(path, defaultPipeline string, replicas int, variable
 	}
 
 	// ADR: docs/decisions/0001-replica-count-from-node-count.md — override whatever
-	// the settings file specifies so the value is always topology-correct.
+	// the settings file specifies; the caller chose the value (explicit override
+	// or cluster topology) and replicasSource names which rule applied.
 	settings["number_of_replicas"] = json.RawMessage(strconv.Itoa(replicas))
-	log.Info().Int("number_of_replicas", replicas).Msg("Setting index replica count from cluster topology")
+	log.Info().Int("number_of_replicas", replicas).Str("source", replicasSource).Msg("Setting index replica count")
 
 	normalized, err := json.Marshal(settings)
 	if err != nil {

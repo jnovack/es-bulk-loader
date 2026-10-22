@@ -71,6 +71,17 @@ clusters can request higher redundancy without forking the loader. An explicit
 value would take precedence over the topology-derived one; `settings.json` would
 remain overridden as decided above.
 
+**Implemented (amendment).** `-replicas` (env `REPLICAS`, default `-1` for
+auto) and `Options.Replicas *int` now exist. This does not reverse the
+decision above: topology remains the default, and `settings.json` is still
+ignored. The override applies only when the loader creates an index.
+
+| Source | Wins? |
+| --- | --- |
+| `-replicas` / `Options.Replicas` | Always |
+| Cluster topology | Only with no override |
+| `settings.json` | Never |
+
 Note that injecting the value as a template variable into `settings.json` is not
 a viable alternative: `normalizeIndexSettings` writes `number_of_replicas` after
 the file is templated and parsed, so any templated value is discarded.

@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -197,6 +198,13 @@ func TestEndToEndScenarios(t *testing.T) {
 			flags:  "-flush -alias (alias with two targets)",
 			checks: "fails before flush when any alias target's mappings mismatch; names that index; no documents removed",
 			run:    scenarioAliasFlushStaleTargetFailsBeforeFlush,
+		},
+		{
+			// Appended last: the slice index sets each scenario's e2e-NN prefix.
+			name:   "alias_replicas_override_creation_only",
+			flags:  "-delete -alias -replicas 2, then -add -alias with REPLICAS=3",
+			checks: "created generation has number_of_replicas 2; a later add run (env override) does not change the existing index",
+			run:    scenarioAliasReplicasOverrideIsCreationOnly,
 		},
 	}
 
@@ -398,6 +406,32 @@ func scenarioAliasDeleteCreatesTimestampedIndex(t *testing.T, ctx *scenarioConte
 	assertTimestampedIndexName(t, ctx.sourceIndex, targets[0])
 	assertIndexExists(t, ctx, targets[0])
 	assertDocCount(t, ctx, ctx.sourceIndex, 2)
+}
+
+// scenarioAliasReplicasOverrideIsCreationOnly proves -replicas reaches the
+// created alias generation, and that an override on a later -add run never
+// rewrites the existing index (the override applies at creation only).
+func scenarioAliasReplicasOverrideIsCreationOnly(t *testing.T, ctx *scenarioContext) {
+	args := append(sourceArgsNoPolicies(ctx, "-delete", false, false, ""), "-alias", "-replicas", "2")
+	mustSucceed(t, runLoader(t, ctx, nil, args))
+
+	generation := singleAliasTarget(t, ctx, ctx.sourceIndex)
+	assertReplicaSetting(t, ctx, generation, "2")
+
+	addArgs := append(sourceArgsNoPolicies(ctx, "-add", false, false, ""), "-alias")
+	mustSucceed(t, runLoader(t, ctx, map[string]string{"REPLICAS": "3"}, addArgs))
+	assertReplicaSetting(t, ctx, generation, "2")
+}
+
+// assertReplicaSetting fails unless the index's live number_of_replicas equals want.
+func assertReplicaSetting(t *testing.T, ctx *scenarioContext, index, want string) {
+	t.Helper()
+	var response map[string]map[string]map[string]map[string]string
+	readJSON(t, doRequest(t, ctx, http.MethodGet, "/"+index+"/_settings?filter_path=*.settings.index.number_of_replicas", nil), &response)
+	got := response[index]["settings"]["index"]["number_of_replicas"]
+	if got != want {
+		t.Fatalf("number_of_replicas for %s = %q, want %q", index, got, want)
+	}
 }
 
 // scenarioAliasKeepLastPrunesOldestAfterThirdRun centralizes this code path so package behavior stays consistent.
@@ -805,7 +839,13 @@ func runLoader(t *testing.T, ctx *scenarioContext, extraEnv map[string]string, a
 	cmd := exec.Command(ctx.env.binaryPath, args...)
 	cmd.Dir = ctx.env.repoRoot
 
-	env := append(os.Environ(),
+	// REPLICAS is the -replicas env fallback. Drop any inherited value so a
+	// developer's exported REPLICAS cannot change every scenario's replica
+	// count; a scenario that wants it passes it through extraEnv.
+	env := slices.DeleteFunc(os.Environ(), func(kv string) bool {
+		return strings.HasPrefix(kv, "REPLICAS=")
+	})
+	env = append(env,
 		"SOURCE_PIPELINE_PRIMARY="+ctx.sourcePipelinePrimary,
 		"SOURCE_PIPELINE_SECONDARY="+ctx.sourcePipelineSecondary,
 		"SOURCE_POLICY="+ctx.sourcePolicy,

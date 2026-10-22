@@ -2,8 +2,10 @@ package loader
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/elastic/go-elasticsearch/v9"
@@ -127,6 +129,12 @@ func TestNormalizeIndexSettingsReplicaOverridesFixture(t *testing.T) {
 			replicas: 1,
 			expected: 1,
 		},
+		{
+			name:     "fixture string 5 replicas overridden by explicit 2",
+			fixture:  `{"settings":{"index":{"number_of_replicas":"5"}}}`,
+			replicas: 2,
+			expected: 2,
+		},
 	}
 
 	for _, tc := range cases {
@@ -136,7 +144,7 @@ func TestNormalizeIndexSettingsReplicaOverridesFixture(t *testing.T) {
 			dir := t.TempDir()
 			path := writeTempJSON(t, dir, tc.fixture)
 
-			normalized := normalizeIndexSettings(path, "", tc.replicas, nil)
+			normalized := normalizeIndexSettings(path, "", tc.replicas, "explicit", nil)
 
 			var parsed map[string]any
 			if err := json.Unmarshal([]byte(normalized), &parsed); err != nil {
@@ -147,5 +155,146 @@ func TestNormalizeIndexSettingsReplicaOverridesFixture(t *testing.T) {
 				t.Fatalf("number_of_replicas = %v, want %v", got, tc.expected)
 			}
 		})
+	}
+}
+
+// newReplicaStubClient serves a 2-node _nodes body and counts /_nodes hits.
+func newReplicaStubClient(t *testing.T, nodeHits *atomic.Int32) *elasticsearch.Client {
+	t.Helper()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/_nodes" {
+			nodeHits.Add(1)
+		}
+		_, _ = w.Write([]byte(`{"nodes":{"n1":{},"n2":{}}}`))
+	}))
+	t.Cleanup(server.Close)
+
+	es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	return es
+}
+
+// replicasInBody parses the create-index body and returns settings.number_of_replicas.
+func replicasInBody(t *testing.T, body string) float64 {
+	t.Helper()
+
+	var parsed struct {
+		Settings map[string]any `json:"settings"`
+	}
+	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
+		t.Fatalf("parse create body %q: %v", body, err)
+	}
+	got, ok := parsed.Settings["number_of_replicas"].(float64)
+	if !ok {
+		t.Fatalf("number_of_replicas missing or not a number in %q", body)
+	}
+	return got
+}
+
+// TestBuildCreateIndexBodyReplicas verifies override selection: nil derives
+// from topology (and queries /_nodes), any non-nil value wins and never does.
+// ADR: docs/decisions/0001-replica-count-from-node-count.md
+func TestBuildCreateIndexBodyReplicas(t *testing.T) {
+	t.Parallel()
+
+	zero, one, three := 0, 1, 3
+	cases := []struct {
+		name         string
+		override     *int
+		want         float64
+		wantNodeHits int32
+	}{
+		{name: "nil derives from 2-node topology", override: nil, want: 1, wantNodeHits: 1},
+		{name: "explicit 0", override: &zero, want: 0},
+		{name: "explicit 1", override: &one, want: 1},
+		{name: "explicit 3", override: &three, want: 3},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var hits atomic.Int32
+			es := newReplicaStubClient(t, &hits)
+
+			body := buildCreateIndexBody(es, tc.override, "", "", "", nil)
+
+			if got := replicasInBody(t, body); got != tc.want {
+				t.Fatalf("number_of_replicas = %v, want %v", got, tc.want)
+			}
+			if got := hits.Load(); got != tc.wantNodeHits {
+				t.Fatalf("/_nodes hits = %d, want %d", got, tc.wantNodeHits)
+			}
+		})
+	}
+}
+
+// TestExplicitZeroReplicasIsHonouredOnMultiNodeCluster guards the explicit-zero
+// branch: a "simplify to > 0" refactor would silently turn -replicas 0 into the
+// topology default of 1 on a multi-node cluster (a throwaway bulk-load index
+// that deliberately wants no redundancy).
+func TestExplicitZeroReplicasIsHonouredOnMultiNodeCluster(t *testing.T) {
+	t.Parallel()
+
+	var hits atomic.Int32
+	es := newReplicaStubClient(t, &hits)
+	zero := 0
+
+	body := buildCreateIndexBody(es, &zero, "", "", "", nil)
+
+	if got := replicasInBody(t, body); got != 0 {
+		t.Fatalf("number_of_replicas = %v, want 0 on a 2-node cluster", got)
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("topology was queried despite an explicit override")
+	}
+}
+
+// TestRunRejectsNegativeReplicas verifies the single range check lives in Run.
+// Index and an action are set so no earlier validation can produce the same
+// ErrInvalidOptions for the wrong reason; the Op pins the reason.
+func TestRunRejectsNegativeReplicas(t *testing.T) {
+	// Not parallel: Run swaps the package-global zerolog logger.
+	for _, v := range []int{-1, -2} {
+		neg := v
+		_, err := Run(t.Context(), Options{Index: "products", SyncManaged: true, Replicas: &neg})
+		if !errors.Is(err, ErrInvalidOptions) {
+			t.Fatalf("replicas %d: err = %v, want ErrInvalidOptions", v, err)
+		}
+		var runErr *RunError
+		if !errors.As(err, &runErr) || runErr.Op != "validating replicas" {
+			t.Fatalf("replicas %d: err = %v, want Op %q", v, err, "validating replicas")
+		}
+	}
+}
+
+// TestRunExistingIndexWithReplicasOverrideNeitherUpdatesSettingsNorQueriesTopology
+// guards that the override affects creation only: add/flush on an existing
+// index must retain its replicas (no settings PUT) and skip the _nodes query.
+func TestRunExistingIndexWithReplicasOverrideNeitherUpdatesSettingsNorQueriesTopology(t *testing.T) {
+	// Not parallel: Run swaps the package-global zerolog logger.
+	fixtures := writePreflightRunFixtures(t)
+	two := 2
+
+	for _, opts := range []Options{{FlushIndex: true}, {AddToIndex: true}} {
+		stub := newPreflightRunStub(t, preflightStubConfig{indexExists: true, liveMappings: preflightLiveMappings})
+		opts.URL = stub.url
+		opts.Index = "cards"
+		opts.DataFile = fixtures.data
+		opts.MappingsFile = fixtures.matchingMappings
+		opts.Replicas = &two
+
+		if _, err := Run(t.Context(), opts); err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+		ops := stub.operations()
+		if operationCount(ops, "nodes.get") != 0 || operationCount(ops, "index.create") != 0 {
+			t.Fatalf("existing index touched creation path with an override: %v", ops)
+		}
 	}
 }
