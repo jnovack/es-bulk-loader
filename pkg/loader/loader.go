@@ -1052,19 +1052,64 @@ func requireMappingPreflight(es *elasticsearch.Client, index string, plan mappin
 	}
 }
 
-// verifyMappingPreflight compares index's live mappings with plan and returns
-// one error listing every mismatch: the date_detection mismatch first, then
-// root fields in sorted order. Returning at the first mismatch while ranging
-// over the RootFieldTypes map made the reported field depend on map order and
-// forced the operator to fix one field per failed run; collecting everything
-// gives a deterministic message that can be fixed in one pass. A mapping fetch
+// verifyMappingPreflight compares the live mappings behind name with plan and
+// returns one error listing every mismatch. Within an index the
+// date_detection mismatch comes first, then root fields in sorted order.
+// Returning at the first mismatch while ranging over the RootFieldTypes map
+// made the reported field depend on map order and forced the operator to fix
+// one field per failed run; collecting everything gives a deterministic
+// message that can be fixed in one pass.
+//
+// Every concrete index behind an alias is checked, because alias-mode -flush
+// empties every target: verifying only one let a stale sibling be flushed
+// (FIX-ALIASPRE-01). A failure lists each failing index between " | "
+// separators so the indices stay distinct from the "; " between fields. A
+// concrete-index request keeps the plain single-index message. A mapping fetch
 // failure is returned as-is, because it is not a mismatch.
 func verifyMappingPreflight(es *elasticsearch.Client, index string, plan mappingPreflightPlan) error {
-	mappings, err := fetchIndexMappings(es, index)
+	byIndex, err := fetchIndexMappings(es, index)
 	if err != nil {
 		return err
 	}
+	_, concrete := byIndex[index]
 
+	targets := make([]string, 0, len(byIndex))
+	for target := range byIndex {
+		targets = append(targets, target)
+	}
+	slices.Sort(targets)
+
+	var failures []string
+	for _, target := range targets {
+		if m := mappingMismatches(byIndex[target], plan); len(m) > 0 {
+			failures = append(failures, fmt.Sprintf("index %q mappings do not match the mappings file: %s", target, strings.Join(m, "; ")))
+			continue
+		}
+
+		event := log.Info().
+			Str("index", target).
+			Int("root_field_type_checks", len(plan.RootFieldTypes))
+		if !concrete {
+			event = event.Str("alias", index)
+		}
+		if plan.DateDetectionExpected != nil {
+			event = event.Bool("date_detection_expected", *plan.DateDetectionExpected)
+		}
+		event.Msg("Mapping preflight passed")
+	}
+	if len(failures) == 0 {
+		return nil
+	}
+	if concrete {
+		return errors.New(failures[0])
+	}
+	return fmt.Errorf("alias %q: %s", index, strings.Join(failures, " | "))
+}
+
+// mappingMismatches returns one index's mismatches in a fixed order, so every
+// target of an alias is judged by the same rules: date_detection first, then
+// root fields in sorted order.
+func mappingMismatches(mappings map[string]any, plan mappingPreflightPlan) []string {
 	var mismatches []string
 	if plan.DateDetectionExpected != nil {
 		actualDateDetection, present := extractDateDetection(mappings)
@@ -1092,61 +1137,63 @@ func verifyMappingPreflight(es *elasticsearch.Client, index string, plan mapping
 			mismatches = append(mismatches, fmt.Sprintf("field %q has type %q, expected %q", fieldPath, actualType, expectedType))
 		}
 	}
-	if len(mismatches) > 0 {
-		return fmt.Errorf("index %q mappings do not match the mappings file: %s", index, strings.Join(mismatches, "; "))
-	}
-
-	event := log.Info().
-		Str("index", index).
-		Int("root_field_type_checks", len(plan.RootFieldTypes))
-	if plan.DateDetectionExpected != nil {
-		event = event.Bool("date_detection_expected", *plan.DateDetectionExpected)
-	}
-	event.Msg("Mapping preflight passed")
-	return nil
+	return mismatches
 }
 
-// fetchIndexMappings centralizes this code path so package behavior stays consistent.
-func fetchIndexMappings(es *elasticsearch.Client, index string) (map[string]any, error) {
-	res, err := es.Indices.GetMapping(es.Indices.GetMapping.WithIndex(index))
+// fetchIndexMappings returns the mappings of every index in the _mapping
+// response for name, keyed by concrete index name. Elasticsearch keys the
+// response by concrete index, so an alias name is never a key; the old
+// first-entry fallback checked one arbitrary target of a multi-target alias
+// and let the others go unverified (FIX-ALIASPRE-01). Returning every entry
+// lets the caller check them all.
+func fetchIndexMappings(es *elasticsearch.Client, name string) (map[string]map[string]any, error) {
+	res, err := es.Indices.GetMapping(es.Indices.GetMapping.WithIndex(name))
 	if err != nil {
-		return nil, fmt.Errorf("fetching mappings for index %q: %w", index, err)
+		return nil, fmt.Errorf("fetching mappings for index %q: %w", name, err)
 	}
 	defer res.Body.Close()
 
-	body, _ := io.ReadAll(res.Body)
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading mappings response for index %q: %w", name, err)
+	}
 	if res.IsError() {
-		return nil, fmt.Errorf("fetching mappings for index %q failed with status %d: %s", index, res.StatusCode, string(body))
+		return nil, fmt.Errorf("fetching mappings for index %q failed with status %d: %s", name, res.StatusCode, string(body))
 	}
 
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, fmt.Errorf("decoding mappings response for index %q: %w", index, err)
+		return nil, fmt.Errorf("decoding mappings response for index %q: %w", name, err)
 	}
 	if len(payload) == 0 {
-		return nil, fmt.Errorf("mappings response for index %q was empty", index)
+		return nil, fmt.Errorf("mappings response for index %q was empty", name)
 	}
 
-	var selected map[string]any
-	if raw, ok := payload[index]; ok {
-		selected, _ = raw.(map[string]any)
-	} else {
-		for _, raw := range payload {
-			selected, _ = raw.(map[string]any)
-			if selected != nil {
-				break
-			}
+	keys := make([]string, 0, len(payload))
+	for key := range payload {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+
+	result := make(map[string]map[string]any, len(payload))
+	for _, key := range keys {
+		entry, ok := payload[key].(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("mappings response for index %q did not include an object entry", key)
 		}
-	}
-	if selected == nil {
-		return nil, fmt.Errorf("mappings response for index %q did not include an object entry", index)
+		mappings, ok := entry["mappings"].(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("mappings response for index %q did not include a mappings object", key)
+		}
+		result[key] = mappings
 	}
 
-	mappings, ok := selected["mappings"].(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("mappings response for index %q did not include a mappings object", index)
+	// A concrete-index request returns exactly its own entry; anything more is
+	// an unexpected response and must not be checked under the wrong label.
+	if _, ok := payload[name]; ok && len(payload) > 1 {
+		return nil, fmt.Errorf("mappings response for index %q included other indices: %s", name, strings.Join(keys, ", "))
 	}
-	return mappings, nil
+	return result, nil
 }
 
 // extractDateDetection centralizes this code path so package behavior stays consistent.

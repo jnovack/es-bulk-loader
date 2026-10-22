@@ -228,6 +228,9 @@ When the plan runs depends on whether the index already exists:
   before any `-sync-managed` pipeline or policy upsert. Any mismatch, such as a
   declared field the index lacks or a field with a different type, fails the
   run with the index untouched. The error lists every mismatched field.
+  With `-alias`, every concrete index behind the alias is verified, because
+  `-flush` empties each of them. The error names the alias and each failing
+  index, in sorted order, separated by ` | `.
 - **Created index** (`-delete`, or `-add`/`-flush` with no existing index or
   alias target): the check runs once, after the index is created and before
   the bulk load. Managed-resource setup for index creation can happen between

@@ -191,6 +191,13 @@ func TestEndToEndScenarios(t *testing.T) {
 			checks: "unresolved ${VAR} in settings fails before -delete; names the variable; index and documents untouched",
 			run:    scenarioUnresolvedTemplateVariableFailsSafely,
 		},
+		{
+			// Appended last: the slice index sets each scenario's e2e-NN prefix.
+			name:   "alias_flush_stale_target_fails",
+			flags:  "-flush -alias (alias with two targets)",
+			checks: "fails before flush when any alias target's mappings mismatch; names that index; no documents removed",
+			run:    scenarioAliasFlushStaleTargetFailsBeforeFlush,
+		},
 	}
 
 	for i, sc := range scenarios {
@@ -498,6 +505,34 @@ func scenarioUnresolvedTemplateVariableFailsSafely(t *testing.T, ctx *scenarioCo
 	mustFailWith(t, result, "${NOT_SET_ANYWHERE}")
 
 	assertIndexExists(t, ctx, ctx.sourceIndex)
+	assertDocCount(t, ctx, ctx.sourceIndex, 2)
+}
+
+// scenarioAliasFlushStaleTargetFailsBeforeFlush guards that every target of a
+// multi-target alias is verified before -flush: the stale second target must
+// block the run, be named, and leave the seeded documents in place.
+func scenarioAliasFlushStaleTargetFailsBeforeFlush(t *testing.T, ctx *scenarioContext) {
+	mustSucceed(t, runLoader(t, ctx, nil, append(sourceArgsNoPolicies(ctx, "-delete", false, false, ""), "-alias")))
+	seeded := singleAliasTarget(t, ctx, ctx.sourceIndex)
+
+	// No is_write_index, so this does not conflict with the seed's write index.
+	// The name matches YYYYMMDDHHMMSS, so ctx.cleanup removes it.
+	stale := ctx.sourceIndex + "-20000101000000"
+	body := fmt.Sprintf(`{"mappings":{"properties":{"base_value":{"type":"keyword"}}},"aliases":{%q:{}}}`, ctx.sourceIndex)
+	resp := doRequest(t, ctx, http.MethodPut, "/"+stale, []byte(body))
+	respBody, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		t.Fatalf("create stale alias target %s failed: status=%d body=%s", stale, resp.StatusCode, string(respBody))
+	}
+	if got := len(aliasTargets(t, ctx, ctx.sourceIndex)); got != 2 {
+		t.Fatalf("expected alias %s to have 2 targets, got %d", ctx.sourceIndex, got)
+	}
+
+	result := runLoader(t, ctx, nil, append(sourceArgsNoPolicies(ctx, "-flush", false, false, ""), "-alias"))
+	mustFailWith(t, result, "Mapping preflight failed")
+	mustContain(t, result.output, stale)
+	assertDocCount(t, ctx, seeded, 2)
 	assertDocCount(t, ctx, ctx.sourceIndex, 2)
 }
 

@@ -1222,6 +1222,259 @@ func TestVerifyMappingPreflightReportsEveryMismatchInFieldOrder(t *testing.T) {
 	}
 }
 
+// newMappingResponseClient starts an isolated server that answers
+// GET /<requested>/_mapping with the given status and body, and returns a
+// client for it. Each caller gets its own immutable server so parallel
+// subtests never share a mutable response.
+func newMappingResponseClient(t *testing.T, requested string, status int, body string) *elasticsearch.Client {
+	t.Helper()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		if r.Method != http.MethodGet || r.URL.Path != "/"+requested+"/_mapping" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(server.Close)
+
+	es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
+	if err != nil {
+		t.Fatalf("new elasticsearch client: %v", err)
+	}
+	return es
+}
+
+// TestVerifyMappingPreflightChecksEveryAliasTarget guards FIX-ALIASPRE-01:
+// the preflight verifies every concrete index behind an alias and names each
+// failing one in sorted order. It fails if the preflight goes back to checking
+// one map-order entry, because the stale sibling would then pass or the
+// reported index would vary between calls.
+func TestVerifyMappingPreflightChecksEveryAliasTarget(t *testing.T) {
+	t.Parallel()
+
+	plan := mappingPreflightPlan{
+		RootFieldTypes: map[string]string{"lookup_id": "keyword", "base_value": "integer"},
+	}
+	const good = `{"mappings":{"properties":{"lookup_id":{"type":"keyword"},"base_value":{"type":"integer"}}}}`
+	const staleBase = `{"mappings":{"properties":{"lookup_id":{"type":"keyword"},"base_value":{"type":"keyword"}}}}`
+	const missingLookup = `{"mappings":{"properties":{"base_value":{"type":"integer"}}}}`
+	staleMsg := `index "cards-a" mappings do not match the mappings file: field "base_value" has type "keyword", expected "integer"`
+
+	tests := []struct {
+		name      string
+		requested string
+		body      string
+		want      string
+	}{
+		{
+			name:      "both targets match",
+			requested: "cards",
+			body:      `{"cards-a":` + good + `,"cards-b":` + good + `}`,
+		},
+		{
+			name:      "one target stale",
+			requested: "cards",
+			body:      `{"cards-a":` + good + `,"cards-b":` + staleBase + `}`,
+			want:      `alias "cards": index "cards-b" mappings do not match the mappings file: field "base_value" has type "keyword", expected "integer"`,
+		},
+		{
+			name:      "both targets stale, sorted",
+			requested: "cards",
+			body:      `{"cards-b":` + missingLookup + `,"cards-a":` + staleBase + `}`,
+			want: `alias "cards": ` + staleMsg +
+				` | index "cards-b" mappings do not match the mappings file: required mapping for field "lookup_id" is missing`,
+		},
+		{
+			name:      "single-target alias",
+			requested: "cards",
+			body:      `{"cards-a":` + staleBase + `}`,
+			want:      `alias "cards": ` + staleMsg,
+		},
+		{
+			name:      "concrete index",
+			requested: "cards-a",
+			body:      `{"cards-a":` + staleBase + `}`,
+			want:      staleMsg,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			es := newMappingResponseClient(t, tt.requested, http.StatusOK, tt.body)
+			for attempt := 0; attempt < 20; attempt++ {
+				err := verifyMappingPreflight(es, tt.requested, plan)
+				if tt.want == "" {
+					if err != nil {
+						t.Fatalf("attempt %d: unexpected error: %v", attempt, err)
+					}
+					continue
+				}
+				if err == nil {
+					t.Fatalf("attempt %d: expected mapping preflight error", attempt)
+				}
+				if got := err.Error(); got != tt.want {
+					t.Fatalf("attempt %d: preflight error mismatch\n got: %s\nwant: %s", attempt, got, tt.want)
+				}
+			}
+		})
+	}
+}
+
+// TestVerifyMappingPreflightChecksDateDetectionOnEveryAliasTarget guards that
+// the date_detection rule is applied per target, not only the field types.
+func TestVerifyMappingPreflightChecksDateDetectionOnEveryAliasTarget(t *testing.T) {
+	t.Parallel()
+
+	plan := mappingPreflightPlan{DateDetectionExpected: boolPointer(false)}
+	body := `{"cards-a":{"mappings":{"date_detection":false}},"cards-b":{"mappings":{"date_detection":true}}}`
+	es := newMappingResponseClient(t, "cards", http.StatusOK, body)
+
+	err := verifyMappingPreflight(es, "cards", plan)
+	want := `alias "cards": index "cards-b" mappings do not match the mappings file: mappings.date_detection is true, expected false`
+	if err == nil || err.Error() != want {
+		t.Fatalf("got %v, want %s", err, want)
+	}
+}
+
+// TestFetchIndexMappingsRejectsMalformedResponses guards that every
+// fetch-failure shape stays a fetch failure: never a nil error (a pass) and
+// never a mismatch message. Two malformed entries must always name the same
+// (first, sorted) one.
+func TestFetchIndexMappingsRejectsMalformedResponses(t *testing.T) {
+	t.Parallel()
+
+	plan := mappingPreflightPlan{RootFieldTypes: map[string]string{"lookup_id": "keyword"}}
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		want   string
+	}{
+		{"server error", http.StatusInternalServerError, `{"error":"boom"}`, `failed with status 500`},
+		{"undecodable body", http.StatusOK, `not json`, `decoding mappings response`},
+		{"empty response", http.StatusOK, `{}`, `was empty`},
+		{"non-object entry", http.StatusOK, `{"cards-a":1}`, `"cards-a" did not include an object entry`},
+		{"entry without mappings", http.StatusOK, `{"cards-a":{}}`, `"cards-a" did not include a mappings object`},
+		{"two malformed entries name the first", http.StatusOK, `{"cards-z":1,"cards-b":{},"cards-a":2}`, `"cards-a" did not include an object entry`},
+		{"concrete plus other index", http.StatusOK, `{"cards":{"mappings":{}},"cards-x":{"mappings":{}}}`, `included other indices: cards, cards-x`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			es := newMappingResponseClient(t, "cards", tt.status, tt.body)
+			for attempt := 0; attempt < 20; attempt++ {
+				_, err := fetchIndexMappings(es, "cards")
+				if err == nil || !strings.Contains(err.Error(), tt.want) {
+					t.Fatalf("attempt %d: fetchIndexMappings error = %v, want containing %q", attempt, err, tt.want)
+				}
+				err = verifyMappingPreflight(es, "cards", plan)
+				if err == nil || !strings.Contains(err.Error(), tt.want) || strings.Contains(err.Error(), "do not match the mappings file") {
+					t.Fatalf("attempt %d: verifyMappingPreflight error = %v, want fetch failure containing %q", attempt, err, tt.want)
+				}
+			}
+		})
+	}
+
+	t.Run("transport error", func(t *testing.T) {
+		t.Parallel()
+
+		server := httptest.NewServer(http.NotFoundHandler())
+		es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}, MaxRetries: 1, DisableRetry: true})
+		if err != nil {
+			t.Fatalf("new elasticsearch client: %v", err)
+		}
+		server.Close()
+
+		_, err = fetchIndexMappings(es, "cards")
+		if err == nil || !strings.Contains(err.Error(), `fetching mappings for index "cards"`) {
+			t.Fatalf("expected transport error, got %v", err)
+		}
+	})
+
+	t.Run("response body read error", func(t *testing.T) {
+		t.Parallel()
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Elastic-Product", "Elasticsearch")
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Content-Length", "1000")
+			_, _ = w.Write([]byte(`{"cards-a":`))
+		}))
+		t.Cleanup(server.Close)
+		es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}, DisableRetry: true})
+		if err != nil {
+			t.Fatalf("new elasticsearch client: %v", err)
+		}
+
+		err = verifyMappingPreflight(es, "cards", plan)
+		if err == nil || !strings.Contains(err.Error(), `reading mappings response for index "cards"`) {
+			t.Fatalf("expected body read error, got %v", err)
+		}
+	})
+}
+
+// TestVerifyMappingPreflightLogsAliasAndIndexFields guards the alias/index
+// noun rule for the passing-target log: an alias request logs both fields, a
+// concrete request logs only index.
+func TestVerifyMappingPreflightLogsAliasAndIndexFields(t *testing.T) {
+	// Not parallel: swaps the package-global zerolog logger.
+	previousLogger := log.Logger
+	previousLevel := zerolog.GlobalLevel()
+	t.Cleanup(func() {
+		log.Logger = previousLogger
+		zerolog.SetGlobalLevel(previousLevel)
+	})
+	zerolog.SetGlobalLevel(zerolog.TraceLevel)
+
+	plan := mappingPreflightPlan{RootFieldTypes: map[string]string{"lookup_id": "keyword"}}
+	const good = `{"mappings":{"properties":{"lookup_id":{"type":"keyword"}}}}`
+
+	capture := func(requested, body string) []map[string]any {
+		var output bytes.Buffer
+		log.Logger = zerolog.New(&output)
+		es := newMappingResponseClient(t, requested, http.StatusOK, body)
+		if err := verifyMappingPreflight(es, requested, plan); err != nil {
+			t.Fatalf("verifyMappingPreflight returned error: %v", err)
+		}
+		var entries []map[string]any
+		for _, line := range strings.Split(strings.TrimSpace(output.String()), "\n") {
+			var entry map[string]any
+			if err := json.Unmarshal([]byte(line), &entry); err != nil {
+				t.Fatalf("decoding log line %q: %v", line, err)
+			}
+			entries = append(entries, entry)
+		}
+		return entries
+	}
+
+	aliasEntries := capture("cards", `{"cards-a":`+good+`,"cards-b":`+good+`}`)
+	if len(aliasEntries) != 2 {
+		t.Fatalf("expected one passed log per target, got %v", aliasEntries)
+	}
+	for i, wantIndex := range []string{"cards-a", "cards-b"} {
+		if aliasEntries[i]["index"] != wantIndex || aliasEntries[i]["alias"] != "cards" {
+			t.Fatalf("alias log %d = %v, want index %q and alias %q", i, aliasEntries[i], wantIndex, "cards")
+		}
+	}
+
+	concreteEntries := capture("cards-a", `{"cards-a":`+good+`}`)
+	if len(concreteEntries) != 1 || concreteEntries[0]["index"] != "cards-a" {
+		t.Fatalf("unexpected concrete log: %v", concreteEntries)
+	}
+	if _, ok := concreteEntries[0]["alias"]; ok {
+		t.Fatalf("concrete request must not log an alias field: %v", concreteEntries[0])
+	}
+}
+
 // preflightRunFixtures holds the shared fixture paths for the mapping
 // preflight Run tests.
 type preflightRunFixtures struct {
@@ -1386,6 +1639,48 @@ func TestRunExistingIndexMappingMismatchFailsBeforeMutation(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestRunAliasFlushFailsWhenAnyTargetMappingMismatches guards that any stale
+// target behind an alias blocks -flush before any mutation: alias-mode flush
+// empties every target, so verifying only one would let a stale sibling be
+// emptied (FIX-ALIASPRE-01, spec AC 7, 8 and 10).
+func TestRunAliasFlushFailsWhenAnyTargetMappingMismatches(t *testing.T) {
+	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
+
+	fixtures := writePreflightRunFixtures(t)
+	stub := newPreflightRunStub(t, preflightStubConfig{
+		aliasTargets: []string{"cards-20250101000000", "cards-20260101000000"},
+		liveMappings: `{"cards-20250101000000":{"mappings":{"properties":{}}},` +
+			`"cards-20260101000000":{"mappings":{"properties":{"lookup_id":{"type":"keyword"}}}}}`,
+	})
+
+	_, err := Run(t.Context(), Options{
+		URL: stub.url, Index: "cards", DataFile: fixtures.data,
+		AliasMode: true, FlushIndex: true, MappingsFile: fixtures.matchingMappings,
+	})
+	if err == nil {
+		t.Fatal("expected Run to fail mapping preflight")
+	}
+	if !errors.Is(err, ErrBulkFailure) {
+		t.Fatalf("expected ErrBulkFailure, got %v", err)
+	}
+	if want := `alias "cards": index "cards-20250101000000" mappings do not match`; !strings.Contains(err.Error(), want) {
+		t.Fatalf("expected error to contain %q, got %v", want, err)
+	}
+	if bad := `index "cards-20260101000000" mappings do not match`; strings.Contains(err.Error(), bad) {
+		t.Fatalf("matching target must not be reported, got %v", err)
+	}
+
+	ops := stub.operations()
+	if got := operationCount(ops, "mapping.get"); got != 1 {
+		t.Fatalf("expected exactly one mapping.get, got %d in %v", got, ops)
+	}
+	for _, mutation := range []string{"flush", "pipeline.put", "policy.put", "bulk", "index.create", "index.delete"} {
+		if got := operationCount(ops, mutation); got != 0 {
+			t.Fatalf("expected no %s before the preflight failure, got %d in %v", mutation, got, ops)
+		}
 	}
 }
 
