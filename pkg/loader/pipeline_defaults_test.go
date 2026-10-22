@@ -22,7 +22,7 @@ func TestReadNamedDefinitionsPreservesFileOrder(t *testing.T) {
 		t.Fatalf("write pipeline fixture: %v", err)
 	}
 
-	definitions, names := readNamedDefinitions(path, "pipeline", nil)
+	definitions, names := readNamedDefinitions(t.Context(), path, "pipeline", nil)
 
 	if len(definitions) != 2 {
 		t.Fatalf("expected 2 definitions, got %d", len(definitions))
@@ -49,7 +49,7 @@ func TestNormalizeIndexSettingsUsesFirstPipelineWhenUnset(t *testing.T) {
 		t.Fatalf("write settings fixture: %v", err)
 	}
 
-	normalized := normalizeIndexSettings(path, "first-pipeline", 0, "cluster topology", nil)
+	normalized := normalizeIndexSettings(t.Context(), path, "first-pipeline", 0, "cluster topology", nil)
 
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(normalized), &parsed); err != nil {
@@ -74,7 +74,7 @@ func TestNormalizeIndexSettingsPreservesExplicitDefault(t *testing.T) {
 		t.Fatalf("write settings fixture: %v", err)
 	}
 
-	normalized := normalizeIndexSettings(path, "first-pipeline", 0, "cluster topology", nil)
+	normalized := normalizeIndexSettings(t.Context(), path, "first-pipeline", 0, "cluster topology", nil)
 
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(normalized), &parsed); err != nil {
@@ -98,7 +98,7 @@ func TestNormalizeIndexSettingsFlattensNestedIndexObject(t *testing.T) {
 
 	// Pass replicas=1 so the override value differs from the fixture value of 0,
 	// proving the topology value wins rather than the assertion passing by coincidence.
-	normalized := normalizeIndexSettings(path, "first-pipeline", 1, "cluster topology", nil)
+	normalized := normalizeIndexSettings(t.Context(), path, "first-pipeline", 1, "cluster topology", nil)
 
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(normalized), &parsed); err != nil {

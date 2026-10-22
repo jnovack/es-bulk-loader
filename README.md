@@ -133,6 +133,25 @@ cluster topology, any non-nil value (including `0`) overrides it for indices
 the run creates, and a negative value fails with `ErrInvalidOptions`. Run
 never modifies the pointee.
 
+`Options.Logger` is a `*zerolog.Logger` that receives all of Run's log output:
+
+```go
+logger := zerolog.New(os.Stderr).With().Str("stage", "slugs").Logger()
+result, err := loaderpkg.Run(ctx, loaderpkg.Options{
+    URL:    "http://localhost:9200",
+    Index:  "slugs",
+    Logger: &logger,
+})
+```
+
+`nil` is safe and keeps today's behavior: Run logs to the zerolog global
+(`log.Logger`), read but never modified. Run adds a timestamp to a copy of
+whichever logger it uses and never writes the global, so concurrent Runs with
+distinct loggers are safe and need no mutex around Run. A Disabled logger such
+as `zerolog.Nop()` silences Run. A shared writer must itself support
+concurrent writes, and nil-logger callers must not reassign the global while
+Run is in flight.
+
 Targeted helpers are also available for orchestration:
 
 - `loader.SyncManaged(ctx, opts)`

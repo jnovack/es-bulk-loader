@@ -112,8 +112,9 @@ func TestResolvePipelinePolicyFallbacksUnchangedPaths(t *testing.T) {
 // TestAmbiguousPolicyReferenceFailsRunBeforeMutation proves Run recovers the
 // ambiguity as ErrManagedResource before pipeline PUT, flush, deletion or bulk.
 // The candidates contain "enrich" and "bulk" to pin classification
-// independently of resource spelling. Not parallel: Run swaps the global logger.
+// independently of resource spelling.
 func TestAmbiguousPolicyReferenceFailsRunBeforeMutation(t *testing.T) {
+	t.Parallel()
 	var (
 		mu       sync.Mutex
 		requests []string

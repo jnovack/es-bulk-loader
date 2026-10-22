@@ -90,7 +90,7 @@ func TestClusterReplicaCount(t *testing.T) {
 				}
 			}
 
-			got := clusterReplicaCount(es)
+			got := clusterReplicaCount(t.Context(), es)
 			if got != tc.expected {
 				t.Fatalf("clusterReplicaCount() = %d, want %d", got, tc.expected)
 			}
@@ -144,7 +144,7 @@ func TestNormalizeIndexSettingsReplicaOverridesFixture(t *testing.T) {
 			dir := t.TempDir()
 			path := writeTempJSON(t, dir, tc.fixture)
 
-			normalized := normalizeIndexSettings(path, "", tc.replicas, "explicit", nil)
+			normalized := normalizeIndexSettings(t.Context(), path, "", tc.replicas, "explicit", nil)
 
 			var parsed map[string]any
 			if err := json.Unmarshal([]byte(normalized), &parsed); err != nil {
@@ -222,7 +222,7 @@ func TestBuildCreateIndexBodyReplicas(t *testing.T) {
 			var hits atomic.Int32
 			es := newReplicaStubClient(t, &hits)
 
-			body := buildCreateIndexBody(es, tc.override, "", "", "", nil)
+			body := buildCreateIndexBody(t.Context(), es, tc.override, "", "", "", nil)
 
 			if got := replicasInBody(t, body); got != tc.want {
 				t.Fatalf("number_of_replicas = %v, want %v", got, tc.want)
@@ -245,7 +245,7 @@ func TestExplicitZeroReplicasIsHonouredOnMultiNodeCluster(t *testing.T) {
 	es := newReplicaStubClient(t, &hits)
 	zero := 0
 
-	body := buildCreateIndexBody(es, &zero, "", "", "", nil)
+	body := buildCreateIndexBody(t.Context(), es, &zero, "", "", "", nil)
 
 	if got := replicasInBody(t, body); got != 0 {
 		t.Fatalf("number_of_replicas = %v, want 0 on a 2-node cluster", got)
@@ -259,7 +259,7 @@ func TestExplicitZeroReplicasIsHonouredOnMultiNodeCluster(t *testing.T) {
 // Index and an action are set so no earlier validation can produce the same
 // ErrInvalidOptions for the wrong reason; the Op pins the reason.
 func TestRunRejectsNegativeReplicas(t *testing.T) {
-	// Not parallel: Run swaps the package-global zerolog logger.
+	t.Parallel()
 	for _, v := range []int{-1, -2} {
 		neg := v
 		_, err := Run(t.Context(), Options{Index: "products", SyncManaged: true, Replicas: &neg})
@@ -277,7 +277,7 @@ func TestRunRejectsNegativeReplicas(t *testing.T) {
 // guards that the override affects creation only: add/flush on an existing
 // index must retain its replicas (no settings PUT) and skip the _nodes query.
 func TestRunExistingIndexWithReplicasOverrideNeitherUpdatesSettingsNorQueriesTopology(t *testing.T) {
-	// Not parallel: Run swaps the package-global zerolog logger.
+	t.Parallel()
 	fixtures := writePreflightRunFixtures(t)
 	two := 2
 

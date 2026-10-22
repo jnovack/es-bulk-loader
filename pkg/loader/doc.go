@@ -17,6 +17,10 @@
 //     pipelines to make updates deterministic and garbage-collectable.
 //   - transform definitions are filtered by logical source index so a single
 //     transforms file can serve multiple loader runs.
+//   - the run logger travels on the context under a private key, not zerolog's
+//     WithContext, which silently drops a Disabled logger and would turn an
+//     injected zerolog.Nop() back into global output. Run never writes the
+//     global logger, so concurrent Runs need no consumer-side mutex.
 //
 // Failure modes:
 //   - option validation and managed resource failures return typed sentinel errors,

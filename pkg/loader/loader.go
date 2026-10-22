@@ -23,7 +23,6 @@ import (
 	"github.com/elastic/go-elasticsearch/v9"
 	"github.com/elastic/go-elasticsearch/v9/esapi"
 	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 )
 
 // ─── Error Sentinels ───────────────────────────────────────────────────────────
@@ -137,6 +136,11 @@ type Options struct {
 	APIKey              string
 	TemplateVariables   map[string]string
 	Enrich              EnrichOptions
+	// Logger, when non-nil, receives all of Run's log output — including a
+	// Disabled logger such as zerolog.Nop(), which silences Run. nil uses the
+	// zerolog global (log.Logger), read but never modified, so concurrent
+	// Runs with different loggers do not interfere.
+	Logger *zerolog.Logger
 }
 
 // Result groups state used to coordinate related package behavior.
@@ -384,8 +388,8 @@ type fatalEvent struct {
 }
 
 // fatal centralizes this code path so package behavior stays consistent.
-func fatal() *fatalEvent {
-	return &fatalEvent{event: log.WithLevel(zerolog.FatalLevel)}
+func fatal(ctx context.Context) *fatalEvent {
+	return &fatalEvent{event: loggerFrom(ctx).WithLevel(zerolog.FatalLevel)}
 }
 
 // Str applies method-specific behavior to keep package workflows consistent.
@@ -445,11 +449,6 @@ func (f *fatalEvent) Msgf(format string, args ...any) {
 	f.panicWithMessage(fmt.Sprintf(format, args...))
 }
 
-// withTimestampLogger centralizes this code path so package behavior stays consistent.
-func withTimestampLogger(base zerolog.Logger) zerolog.Logger {
-	return base.With().Timestamp().Logger()
-}
-
 // ─── Primary Execution Entry Points ────────────────────────────────────────────
 
 // Run executes the loader lifecycle for one index; see the package
@@ -461,11 +460,11 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	previousLogger := log.Logger
-	log.Logger = withTimestampLogger(log.Logger)
-	defer func() {
-		log.Logger = previousLogger
-	}()
+	// Never write the package-global logger here: swapping it and restoring on
+	// return was a data race between concurrent Runs, which forced consumers to
+	// serialize Runs behind a mutex. The logger travels on ctx instead.
+	logger := resolveRunLogger(opts.Logger)
+	ctx = withRunLogger(ctx, &logger)
 
 	url := &opts.URL
 	insecure := &opts.InsecureSkipVerify
@@ -528,7 +527,7 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 
 	warn := func(message string) {
 		result.Warnings = append(result.Warnings, message)
-		log.Warn().Msg(message)
+		loggerFrom(ctx).Warn().Msg(message)
 	}
 
 	if (*user != "" || *pass != "") && *apiKey != "" {
@@ -591,7 +590,7 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 		cfg.APIKey = *apiKey
 	}
 	es, err := elasticsearch.NewClient(cfg)
-	checkErr("creating Elasticsearch client", err)
+	checkErr(ctx, "creating Elasticsearch client", err)
 
 	variables := buildTemplateVariables(*index, *templateVariables)
 
@@ -603,24 +602,24 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 	if err := preflightTemplateFiles(variables, *settingsFile, *mappingsFile, *pipelinesFile, *policiesFile, *transformsFile); err != nil {
 		return result, err
 	}
-	pipelineDefinitions, pipelineNames := readNamedDefinitions(*pipelinesFile, "pipeline", variables)
-	logicalPolicyDefinitions, logicalPolicyNames := readNamedDefinitions(*policiesFile, "policy", variables)
-	logicalTransformDefinitions, logicalTransformNames := readNamedDefinitions(*transformsFile, "transform", variables)
-	policyPlan := buildManagedPolicyPlan(logicalPolicyDefinitions, logicalPolicyNames)
+	pipelineDefinitions, pipelineNames := readNamedDefinitions(ctx, *pipelinesFile, "pipeline", variables)
+	logicalPolicyDefinitions, logicalPolicyNames := readNamedDefinitions(ctx, *policiesFile, "policy", variables)
+	logicalTransformDefinitions, logicalTransformNames := readNamedDefinitions(ctx, *transformsFile, "transform", variables)
+	policyPlan := buildManagedPolicyPlan(ctx, logicalPolicyDefinitions, logicalPolicyNames)
 	policyNameMapping := make(map[string]string, len(policyPlan.LogicalToDesired))
 	for logical, desired := range policyPlan.LogicalToDesired {
 		policyNameMapping[logical] = desired
 	}
 	resolvePipelinePolicyFallbacks(ctx, es, pipelineDefinitions, pipelineNames, policyNameMapping)
-	pipelineDefinitions = rewritePipelinePolicyReferences(pipelineDefinitions, pipelineNames, policyNameMapping)
+	pipelineDefinitions = rewritePipelinePolicyReferences(ctx, pipelineDefinitions, pipelineNames, policyNameMapping)
 	policyDefinitions := policyPlan.Definitions
 	policyNames := policyPlan.DesiredNames
 	policyDeleteNames := resolveManagedPolicyDeleteNames(ctx, es, policyPlan.LogicalNames)
-	transformDefinitions, transformNames, transformErr := resolveTransformsForSource(logicalTransformDefinitions, logicalTransformNames, *index)
+	transformDefinitions, transformNames, transformErr := resolveTransformsForSource(ctx, logicalTransformDefinitions, logicalTransformNames, *index)
 	if transformErr != nil {
-		fatal().Err(transformErr).Msg("Failed to resolve transform definitions")
+		fatal(ctx).Err(transformErr).Msg("Failed to resolve transform definitions")
 	}
-	logEffectiveManagedAssets(
+	logEffectiveManagedAssets(ctx,
 		*index,
 		*settingsFile,
 		*mappingsFile,
@@ -632,7 +631,7 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 		logicalTransformNames,
 		transformNames,
 	)
-	enrichSelection := remapEnrichSelection(enrich, policyNameMapping)
+	enrichSelection := remapEnrichSelection(ctx, enrich, policyNameMapping)
 	defaultPipeline := ""
 	if effectiveSyncManaged && len(pipelineNames) > 0 {
 		defaultPipeline = pipelineNames[0]
@@ -642,9 +641,9 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 	// action, so a malformed file fails the run before anything is deleted.
 	preflightPlan := mappingPreflightPlan{}
 	if action.requiresDataFile() {
-		plan, planErr := buildMappingPreflightPlan(*mappingsFile, variables)
+		plan, planErr := buildMappingPreflightPlan(ctx, *mappingsFile, variables)
 		if planErr != nil {
-			fatal().Err(planErr).Str("path", *mappingsFile).Msg("Failed to build mapping preflight plan")
+			fatal(ctx).Err(planErr).Str("path", *mappingsFile).Msg("Failed to build mapping preflight plan")
 		}
 		preflightPlan = plan
 	}
@@ -655,7 +654,7 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 		aliasTargets = resolveAliasTargets(ctx, es, *index)
 		if len(aliasTargets) == 0 {
 			indexPresent, err := indexExists(ctx, es, *index)
-			checkErr("checking if index exists", err)
+			checkErr(ctx, "checking if index exists", err)
 			if indexPresent {
 				aliasTargets = []string{*index}
 				warn(fmt.Sprintf("Found concrete index with alias name %q; treating it as the current write target", *index))
@@ -663,21 +662,21 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 		}
 		exists = len(aliasTargets) > 0
 		if exists {
-			log.Info().Str("alias", *index).Strs("indices", aliasTargets).Msg("Resolved alias targets")
+			loggerFrom(ctx).Info().Str("alias", *index).Strs("indices", aliasTargets).Msg("Resolved alias targets")
 		} else {
-			log.Info().Str("alias", *index).Msg("Alias has no current indices")
+			loggerFrom(ctx).Info().Str("alias", *index).Msg("Alias has no current indices")
 		}
 	} else {
 		var err error
 		exists, err = indexExists(ctx, es, *index)
-		checkErr("checking if index exists", err)
+		checkErr(ctx, "checking if index exists", err)
 	}
 
 	if *nuke {
 		if *aliasMode {
 			if len(aliasTargets) > 0 {
-				log.Warn().Str("alias", *index).Strs("indices", aliasTargets).Msg("Nuke deleting alias target indices and declared managed resources")
-				deleteIndices(es, aliasTargets)
+				loggerFrom(ctx).Warn().Str("alias", *index).Strs("indices", aliasTargets).Msg("Nuke deleting alias target indices and declared managed resources")
+				deleteIndices(ctx, es, aliasTargets)
 				aliasTargets = nil
 			} else {
 				warn(fmt.Sprintf("Alias %q does not currently resolve to an index. Nuke will still remove declared managed resources", *index))
@@ -688,14 +687,14 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 				for _, generation := range generations {
 					names = append(names, generation.Name)
 				}
-				log.Warn().Str("alias", *index).Strs("indices", names).Msg("Nuke deleting timestamped indices that match alias pattern")
-				deleteIndices(es, names)
+				loggerFrom(ctx).Warn().Str("alias", *index).Strs("indices", names).Msg("Nuke deleting timestamped indices that match alias pattern")
+				deleteIndices(ctx, es, names)
 			}
 			exists = false
 		} else {
 			if exists {
-				log.Warn().Str("index", *index).Msg("Nuke deleting index and declared managed resources")
-				deleteAndCheck(es, *index)
+				loggerFrom(ctx).Warn().Str("index", *index).Msg("Nuke deleting index and declared managed resources")
+				deleteAndCheck(ctx, es, *index)
 				exists = false
 			} else {
 				warn(fmt.Sprintf("Index %q does not exist. Nuke will still remove declared managed resources", *index))
@@ -712,22 +711,22 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 	// failed run. Read `exists` here: the switch below rewrites it.
 	preflightExistingIndex := exists && (action == dataActionFlush || action == dataActionAdd)
 	if preflightExistingIndex {
-		requireMappingPreflight(es, *index, preflightPlan)
+		requireMappingPreflight(ctx, es, *index, preflightPlan)
 	}
 
 	switch action {
 	case dataActionDelete:
 		if *aliasMode {
 			if len(aliasTargets) > 0 {
-				log.Info().Str("alias", *index).Strs("indices", aliasTargets).Msg("Alias mode delete will roll forward to a new timestamped index")
+				loggerFrom(ctx).Info().Str("alias", *index).Strs("indices", aliasTargets).Msg("Alias mode delete will roll forward to a new timestamped index")
 			} else {
 				warn(fmt.Sprintf("Alias %q has no indices. Nothing to delete.", *index))
 			}
 			exists = false
 		} else {
 			if exists {
-				log.Info().Str("index", *index).Msg("Deleting index before reloading data")
-				deleteAndCheck(es, *index)
+				loggerFrom(ctx).Info().Str("index", *index).Msg("Deleting index before reloading data")
+				deleteAndCheck(ctx, es, *index)
 				exists = false
 			} else {
 				warn(fmt.Sprintf("Index %q does not exist. Nothing to delete.", *index))
@@ -735,16 +734,16 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 		}
 
 		if *aliasMode {
-			log.Info().Str("alias", *index).Msg("Alias mode delete keeps existing managed resources (pipelines, policies, transforms); use -nuke for destructive managed-resource cleanup")
+			loggerFrom(ctx).Info().Str("alias", *index).Msg("Alias mode delete keeps existing managed resources (pipelines, policies, transforms); use -nuke for destructive managed-resource cleanup")
 		} else {
 			deleteManagedResources(ctx, es, pipelineNames, policyDeleteNames, transformNames, false)
 		}
 	case dataActionFlush:
 		if *aliasMode {
 			if len(aliasTargets) > 0 {
-				log.Info().Str("alias", *index).Strs("indices", aliasTargets).Msg("Flushing alias target indices before loading replacement data")
+				loggerFrom(ctx).Info().Str("alias", *index).Strs("indices", aliasTargets).Msg("Flushing alias target indices before loading replacement data")
 				for _, target := range aliasTargets {
-					flushAndCheck(es, target)
+					flushAndCheck(ctx, es, target)
 				}
 				exists = true
 			} else {
@@ -753,8 +752,8 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 			}
 		} else {
 			if exists {
-				log.Info().Str("index", *index).Msg("Flushing existing index before loading replacement data")
-				flushAndCheck(es, *index)
+				loggerFrom(ctx).Info().Str("index", *index).Msg("Flushing existing index before loading replacement data")
+				flushAndCheck(ctx, es, *index)
 			} else {
 				warn(fmt.Sprintf("Index %q does not exist. Nothing to flush.", *index))
 			}
@@ -762,17 +761,17 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 	case dataActionAdd:
 		if *aliasMode {
 			if len(aliasTargets) > 0 {
-				log.Info().Str("alias", *index).Strs("indices", aliasTargets).Msg("Appending documents to existing alias target index")
+				loggerFrom(ctx).Info().Str("alias", *index).Strs("indices", aliasTargets).Msg("Appending documents to existing alias target index")
 				exists = true
 			} else {
-				log.Info().Str("alias", *index).Msg("Creating first timestamped index for alias before appending documents")
+				loggerFrom(ctx).Info().Str("alias", *index).Msg("Creating first timestamped index for alias before appending documents")
 				exists = false
 			}
 		} else {
 			if exists {
-				log.Info().Str("index", *index).Msg("Appending documents to existing index")
+				loggerFrom(ctx).Info().Str("index", *index).Msg("Appending documents to existing index")
 			} else {
-				log.Info().Str("index", *index).Msg("Creating index to append documents")
+				loggerFrom(ctx).Info().Str("index", *index).Msg("Creating index to append documents")
 			}
 		}
 	}
@@ -783,7 +782,7 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 	if *aliasMode && shouldCreateIndex {
 		createdIndex = nextAvailableTimestampedIndexName(ctx, es, *index, time.Now().UTC())
 		writeIndex = createdIndex
-		log.Info().Str("alias", *index).Str("index", createdIndex).Msg("Preparing timestamped index for alias")
+		loggerFrom(ctx).Info().Str("alias", *index).Str("index", createdIndex).Msg("Preparing timestamped index for alias")
 	}
 	result.WriteIndex = writeIndex
 	result.CreatedIndex = createdIndex
@@ -796,17 +795,17 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 	}
 
 	if shouldCreateIndex {
-		body := buildCreateIndexBody(es, opts.Replicas, *settingsFile, *mappingsFile, defaultPipeline, variables)
+		body := buildCreateIndexBody(ctx, es, opts.Replicas, *settingsFile, *mappingsFile, defaultPipeline, variables)
 		createIndex := *index
 		if *aliasMode {
 			createIndex = createdIndex
 		}
 		res, err := es.Indices.Create(createIndex, es.Indices.Create.WithBody(strings.NewReader(body)))
-		checkErr("creating index", err)
+		checkErr(ctx, "creating index", err)
 		defer res.Body.Close()
 		if res.IsError() {
 			responseBody, _ := io.ReadAll(res.Body)
-			fatal().
+			fatal(ctx).
 				Str("index", createIndex).
 				Int("status_code", res.StatusCode).
 				Str("body", string(responseBody)).
@@ -815,9 +814,9 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 		waitForIndex(ctx, es, createIndex)
 		exists = true
 		if *aliasMode {
-			log.Info().Str("alias", *index).Str("index", createIndex).Msg("Index created for alias")
+			loggerFrom(ctx).Info().Str("alias", *index).Str("index", createIndex).Msg("Index created for alias")
 		} else {
-			log.Info().Str("index", *index).Msg("Index created")
+			loggerFrom(ctx).Info().Str("index", *index).Msg("Index created")
 		}
 	}
 
@@ -841,14 +840,14 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 		// file, so verify it now. The existing-index path was verified before
 		// the data action and is not checked twice.
 		if !preflightExistingIndex {
-			requireMappingPreflight(es, writeIndex, preflightPlan)
+			requireMappingPreflight(ctx, es, writeIndex, preflightPlan)
 		}
-		log.Info().Msg("Starting bulk insert")
+		loggerFrom(ctx).Info().Msg("Starting bulk insert")
 
 		// adr/0003-ndjson-data-file-support.md — format detected from first non-whitespace byte.
 		first, err := peekFirstByte(*dataFile)
 		if err != nil {
-			fatal().Err(err).Msg("Cannot read data file")
+			fatal(ctx).Err(err).Msg("Cannot read data file")
 		}
 
 		overallStart := time.Now()
@@ -888,11 +887,11 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 				&processed,
 			)
 		default:
-			fatal().Msgf("Data file first byte %q is neither '[' (JSON array) nor '{' (NDJSON)", first)
+			fatal(ctx).Msgf("Data file first byte %q is neither '[' (JSON array) nor '{' (NDJSON)", first)
 		}
 
 		overallDuration := time.Since(overallStart)
-		log.Info().
+		loggerFrom(ctx).Info().
 			Int("processed", processed).
 			Int("succeeded", succeededTotal).
 			Int("failed", failedTotal).
@@ -900,7 +899,7 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 			Msg("Bulk load completed")
 
 		if failedTotal > 0 {
-			log.Warn().
+			loggerFrom(ctx).Warn().
 				Int("failed", failedTotal).
 				Msg("Bulk load completed with failed items")
 		}
@@ -922,7 +921,7 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 	}
 
 	if enrich.enabled {
-		refreshIndex(es, writeIndex)
+		refreshIndex(ctx, es, writeIndex)
 		enrichResult := runEnrichPolicies(ctx, es, enrichSelection, policyNames)
 		result.EnrichSelected = enrichResult.Selected
 		result.EnrichMissing = enrichResult.Missing
@@ -932,7 +931,7 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 	if effectiveSyncManaged && len(transformSyncNames) > 0 {
 		// ADR: Keep transform readiness local to this stage; see
 		// adr/0002-refresh-write-index-before-starting-managed-transforms.md.
-		refreshIndex(es, writeIndex)
+		refreshIndex(ctx, es, writeIndex)
 		stopTransformsBestEffort(ctx, es, transformSyncNames)
 		createOrUpdateTransforms(ctx, es, transformDefinitions, transformSyncNames)
 		startTransforms(ctx, es, transformSyncNames)
@@ -974,8 +973,8 @@ func ExecuteEnrich(ctx context.Context, opts Options) (Result, error) {
 // ─── Managed Asset and Mapping Preflight Helpers ──────────────────────────────
 
 // logEffectiveManagedAssets centralizes this code path so package behavior stays consistent.
-func logEffectiveManagedAssets(index, settingsFile, mappingsFile, pipelinesFile, policiesFile, transformsFile string, pipelineNames, policyNames, logicalTransformNames, selectedTransformNames []string) {
-	log.Info().
+func logEffectiveManagedAssets(ctx context.Context, index, settingsFile, mappingsFile, pipelinesFile, policiesFile, transformsFile string, pipelineNames, policyNames, logicalTransformNames, selectedTransformNames []string) {
+	loggerFrom(ctx).Info().
 		Str("index", index).
 		Str("settings_file", displayManagedAsset(settingsFile)).
 		Str("mappings_file", displayManagedAsset(mappingsFile)).
@@ -1004,13 +1003,13 @@ func (p mappingPreflightPlan) hasExpectations() bool {
 }
 
 // buildMappingPreflightPlan centralizes this code path so package behavior stays consistent.
-func buildMappingPreflightPlan(mappingsFile string, variables templateVariables) (mappingPreflightPlan, error) {
+func buildMappingPreflightPlan(ctx context.Context, mappingsFile string, variables templateVariables) (mappingPreflightPlan, error) {
 	trimmed := strings.TrimSpace(mappingsFile)
 	if trimmed == "" {
 		return mappingPreflightPlan{}, nil
 	}
 
-	normalized := normalizeIndexSection(trimmed, "mappings", variables)
+	normalized := normalizeIndexSection(ctx, trimmed, "mappings", variables)
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(normalized), &parsed); err != nil {
 		return mappingPreflightPlan{}, fmt.Errorf("parsing mappings preflight source: %w", err)
@@ -1050,12 +1049,12 @@ func buildMappingPreflightPlan(mappingsFile string, variables templateVariables)
 // classifyRunErrorKind, which matches "bulk" first, so a preflight failure is
 // classified as ErrBulkFailure. TestRunExistingIndexMappingMismatchFailsBeforeMutation
 // pins that kind; changing it is a deliberate decision, not a rename.
-func requireMappingPreflight(es *elasticsearch.Client, index string, plan mappingPreflightPlan) {
+func requireMappingPreflight(ctx context.Context, es *elasticsearch.Client, index string, plan mappingPreflightPlan) {
 	if !plan.hasExpectations() {
 		return
 	}
-	if err := verifyMappingPreflight(es, index, plan); err != nil {
-		fatal().Err(err).Str("index", index).Msg("Mapping preflight failed before bulk insert")
+	if err := verifyMappingPreflight(ctx, es, index, plan); err != nil {
+		fatal(ctx).Err(err).Str("index", index).Msg("Mapping preflight failed before bulk insert")
 	}
 }
 
@@ -1073,7 +1072,7 @@ func requireMappingPreflight(es *elasticsearch.Client, index string, plan mappin
 // separators so the indices stay distinct from the "; " between fields. A
 // concrete-index request keeps the plain single-index message. A mapping fetch
 // failure is returned as-is, because it is not a mismatch.
-func verifyMappingPreflight(es *elasticsearch.Client, index string, plan mappingPreflightPlan) error {
+func verifyMappingPreflight(ctx context.Context, es *elasticsearch.Client, index string, plan mappingPreflightPlan) error {
 	byIndex, err := fetchIndexMappings(es, index)
 	if err != nil {
 		return err
@@ -1093,7 +1092,7 @@ func verifyMappingPreflight(es *elasticsearch.Client, index string, plan mapping
 			continue
 		}
 
-		event := log.Info().
+		event := loggerFrom(ctx).Info().
 			Str("index", target).
 			Int("root_field_type_checks", len(plan.RootFieldTypes))
 		if !concrete {
@@ -1265,15 +1264,15 @@ func buildTimestampedIndexName(alias string, now time.Time) string {
 
 // nextAvailableTimestampedIndexName centralizes this code path so package behavior stays consistent.
 func nextAvailableTimestampedIndexName(ctx context.Context, es *elasticsearch.Client, alias string, base time.Time) string {
-	name, err := nextAvailableTimestampedIndexNameWithCheck(alias, base, func(candidate string) (bool, error) {
+	name, err := nextAvailableTimestampedIndexNameWithCheck(ctx, alias, base, func(candidate string) (bool, error) {
 		return indexExists(ctx, es, candidate)
 	})
-	checkErr("finding available timestamped index name", err)
+	checkErr(ctx, "finding available timestamped index name", err)
 	return name
 }
 
 // nextAvailableTimestampedIndexNameWithCheck centralizes this code path so package behavior stays consistent.
-func nextAvailableTimestampedIndexNameWithCheck(alias string, base time.Time, existsFn func(candidate string) (bool, error)) (string, error) {
+func nextAvailableTimestampedIndexNameWithCheck(ctx context.Context, alias string, base time.Time, existsFn func(candidate string) (bool, error)) (string, error) {
 	candidateTime := base.UTC()
 	for attempt := 0; attempt < timestampedIndexCollisionLimit; attempt++ {
 		candidate := buildTimestampedIndexName(alias, candidateTime)
@@ -1285,7 +1284,7 @@ func nextAvailableTimestampedIndexNameWithCheck(alias string, base time.Time, ex
 			return candidate, nil
 		}
 
-		log.Warn().
+		loggerFrom(ctx).Warn().
 			Str("alias", alias).
 			Str("index", candidate).
 			Msg("Timestamped index name already exists; advancing by one second")
@@ -1298,7 +1297,7 @@ func nextAvailableTimestampedIndexNameWithCheck(alias string, base time.Time, ex
 // resolveAliasTargets centralizes this code path so package behavior stays consistent.
 func resolveAliasTargets(ctx context.Context, es *elasticsearch.Client, alias string) []string {
 	res, err := es.Indices.GetAlias(es.Indices.GetAlias.WithName(alias), es.Indices.GetAlias.WithContext(ctx))
-	checkErr("resolving alias targets", err)
+	checkErr(ctx, "resolving alias targets", err)
 	defer res.Body.Close()
 
 	if res.StatusCode == http.StatusNotFound {
@@ -1306,7 +1305,7 @@ func resolveAliasTargets(ctx context.Context, es *elasticsearch.Client, alias st
 	}
 	if res.IsError() {
 		body, _ := io.ReadAll(res.Body)
-		fatal().
+		fatal(ctx).
 			Str("alias", alias).
 			Int("status_code", res.StatusCode).
 			Str("body", string(body)).
@@ -1315,7 +1314,7 @@ func resolveAliasTargets(ctx context.Context, es *elasticsearch.Client, alias st
 
 	var parsed map[string]json.RawMessage
 	if err := json.NewDecoder(res.Body).Decode(&parsed); err != nil {
-		fatal().Err(err).Str("alias", alias).Msg("Unable to parse alias response")
+		fatal(ctx).Err(err).Str("alias", alias).Msg("Unable to parse alias response")
 	}
 
 	targets := make([]string, 0, len(parsed))
@@ -1348,14 +1347,14 @@ func updateAlias(ctx context.Context, es *elasticsearch.Client, alias, index str
 	})
 
 	payload, err := json.Marshal(map[string]any{"actions": actions})
-	checkErr("serializing alias actions", err)
+	checkErr(ctx, "serializing alias actions", err)
 	res, err := es.Indices.UpdateAliases(strings.NewReader(string(payload)), es.Indices.UpdateAliases.WithContext(ctx))
-	checkErr("updating alias", err)
+	checkErr(ctx, "updating alias", err)
 	defer res.Body.Close()
 
 	if res.IsError() {
 		body, _ := io.ReadAll(res.Body)
-		fatal().
+		fatal(ctx).
 			Str("alias", alias).
 			Str("index", index).
 			Int("status_code", res.StatusCode).
@@ -1363,14 +1362,14 @@ func updateAlias(ctx context.Context, es *elasticsearch.Client, alias, index str
 			Msg("Failed to update alias")
 	}
 
-	log.Info().Str("alias", alias).Str("index", index).Msg("Alias now points to index")
+	loggerFrom(ctx).Info().Str("alias", alias).Str("index", index).Msg("Alias now points to index")
 }
 
 // deleteIndices centralizes this code path so package behavior stays consistent.
-func deleteIndices(es *elasticsearch.Client, indices []string) {
+func deleteIndices(ctx context.Context, es *elasticsearch.Client, indices []string) {
 	for _, index := range indices {
-		deleteAndCheck(es, index)
-		log.Info().Str("index", index).Msg("Index deleted")
+		deleteAndCheck(ctx, es, index)
+		loggerFrom(ctx).Info().Str("index", index).Msg("Index deleted")
 	}
 }
 
@@ -1384,7 +1383,7 @@ type timestampedIndex struct {
 func listTimestampedIndices(ctx context.Context, es *elasticsearch.Client, alias string) []timestampedIndex {
 	pattern := alias + "-*"
 	res, err := es.Indices.Get([]string{pattern}, es.Indices.Get.WithContext(ctx))
-	checkErr("listing timestamped indices", err)
+	checkErr(ctx, "listing timestamped indices", err)
 	defer res.Body.Close()
 
 	if res.StatusCode == http.StatusNotFound {
@@ -1392,7 +1391,7 @@ func listTimestampedIndices(ctx context.Context, es *elasticsearch.Client, alias
 	}
 	if res.IsError() {
 		body, _ := io.ReadAll(res.Body)
-		fatal().
+		fatal(ctx).
 			Str("alias", alias).
 			Int("status_code", res.StatusCode).
 			Str("body", string(body)).
@@ -1401,7 +1400,7 @@ func listTimestampedIndices(ctx context.Context, es *elasticsearch.Client, alias
 
 	var parsed map[string]json.RawMessage
 	if err := json.NewDecoder(res.Body).Decode(&parsed); err != nil {
-		fatal().Err(err).Str("alias", alias).Msg("Unable to parse timestamped index response")
+		fatal(ctx).Err(err).Str("alias", alias).Msg("Unable to parse timestamped index response")
 	}
 
 	result := make([]timestampedIndex, 0, len(parsed))
@@ -1458,15 +1457,15 @@ func pruneTimestampedIndices(ctx context.Context, es *elasticsearch.Client, alia
 		toDelete = append(toDelete, entry.Name)
 	}
 
-	log.Info().Str("alias", alias).Int("keep_last", keepLast).Strs("indices", toDelete).Msg("Pruning old timestamped indices")
-	deleteIndices(es, toDelete)
+	loggerFrom(ctx).Info().Str("alias", alias).Int("keep_last", keepLast).Strs("indices", toDelete).Msg("Pruning old timestamped indices")
+	deleteIndices(ctx, es, toDelete)
 }
 
 // ─── Settings, Mappings, and Template Utilities ───────────────────────────────
 
 // checkErr centralizes this code path so package behavior stays consistent.
-func checkErr(op string, err error) {
-	log.Trace().Msg(op)
+func checkErr(ctx context.Context, op string, err error) {
+	loggerFrom(ctx).Trace().Msg(op)
 	if err != nil {
 		panic(&RunError{
 			Kind: classifyRunErrorKind(op),
@@ -1534,31 +1533,31 @@ func indexExists(ctx context.Context, es *elasticsearch.Client, index string) (b
 func waitForIndex(ctx context.Context, es *elasticsearch.Client, index string) {
 	for i := 0; i < indexVisibilityMaxAttempts; i++ {
 		exists, err := indexExists(ctx, es, index)
-		checkErr("waiting for index creation", err)
+		checkErr(ctx, "waiting for index creation", err)
 		if exists {
 			return
 		}
 		if err := sleepWithContext(ctx, indexVisibilityPollInterval); err != nil {
-			fatal().Err(err).Str("index", index).Msg("Context cancelled while waiting for index to become visible")
+			fatal(ctx).Err(err).Str("index", index).Msg("Context cancelled while waiting for index to become visible")
 		}
 	}
 
-	fatal().Str("index", index).Msg("Index create was acknowledged but the index did not become visible")
+	fatal(ctx).Str("index", index).Msg("Index create was acknowledged but the index did not become visible")
 }
 
 // deleteAndCheck centralizes this code path so package behavior stays consistent.
-func deleteAndCheck(es *elasticsearch.Client, index string) {
+func deleteAndCheck(ctx context.Context, es *elasticsearch.Client, index string) {
 	res, err := es.Indices.Delete([]string{index})
-	checkErr("deleting index", err)
+	checkErr(ctx, "deleting index", err)
 	defer res.Body.Close()
 
 	if res.IsError() {
-		fatal().Str("index", index).Msg("Failed to delete index")
+		fatal(ctx).Str("index", index).Msg("Failed to delete index")
 	}
 }
 
 // flushAndCheck centralizes this code path so package behavior stays consistent.
-func flushAndCheck(es *elasticsearch.Client, index string) {
+func flushAndCheck(ctx context.Context, es *elasticsearch.Client, index string) {
 	query := `{"query":{"match_all":{}}}`
 	res, err := es.DeleteByQuery(
 		[]string{index},
@@ -1566,15 +1565,15 @@ func flushAndCheck(es *elasticsearch.Client, index string) {
 		es.DeleteByQuery.WithConflicts("proceed"),
 		es.DeleteByQuery.WithRefresh(true),
 	)
-	checkErr("flushing index", err)
+	checkErr(ctx, "flushing index", err)
 	defer res.Body.Close()
 
 	body, err := io.ReadAll(res.Body)
 	if err != nil {
-		fatal().Err(err).Str("index", index).Msg("Unable to read index flush response body")
+		fatal(ctx).Err(err).Str("index", index).Msg("Unable to read index flush response body")
 	}
 	if res.IsError() {
-		fatal().
+		fatal(ctx).
 			Str("index", index).
 			Int("status_code", res.StatusCode).
 			Str("body", string(body)).
@@ -1585,10 +1584,10 @@ func flushAndCheck(es *elasticsearch.Client, index string) {
 		Failures []json.RawMessage `json:"failures"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
-		fatal().Err(err).Str("index", index).Msg("Unable to parse index flush response body")
+		fatal(ctx).Err(err).Str("index", index).Msg("Unable to parse index flush response body")
 	}
 	if len(result.Failures) > 0 {
-		fatal().
+		fatal(ctx).
 			Str("index", index).
 			Int("shard_failures", len(result.Failures)).
 			Str("first_failure", string(result.Failures[0])).
@@ -1599,18 +1598,18 @@ func flushAndCheck(es *elasticsearch.Client, index string) {
 // clusterReplicaCount queries the cluster node count and returns the appropriate
 // number_of_replicas value for the topology.
 // ADR: docs/decisions/0001-replica-count-from-node-count.md
-func clusterReplicaCount(es *elasticsearch.Client) int {
+func clusterReplicaCount(ctx context.Context, es *elasticsearch.Client) int {
 	if es == nil {
 		return 0
 	}
 	res, err := es.Nodes.Info()
 	if err != nil {
-		log.Warn().Err(err).Msg("Could not query cluster nodes; defaulting to 0 replicas")
+		loggerFrom(ctx).Warn().Err(err).Msg("Could not query cluster nodes; defaulting to 0 replicas")
 		return 0
 	}
 	defer res.Body.Close()
 	if res.IsError() {
-		log.Warn().Int("status_code", res.StatusCode).Msg("Cluster nodes query failed; defaulting to 0 replicas")
+		loggerFrom(ctx).Warn().Int("status_code", res.StatusCode).Msg("Cluster nodes query failed; defaulting to 0 replicas")
 		return 0
 	}
 
@@ -1618,7 +1617,7 @@ func clusterReplicaCount(es *elasticsearch.Client) int {
 		Nodes map[string]json.RawMessage `json:"nodes"`
 	}
 	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
-		log.Warn().Err(err).Msg("Could not parse cluster nodes response; defaulting to 0 replicas")
+		loggerFrom(ctx).Warn().Err(err).Msg("Could not parse cluster nodes response; defaulting to 0 replicas")
 		return 0
 	}
 
@@ -1633,7 +1632,7 @@ func clusterReplicaCount(es *elasticsearch.Client) int {
 // replicasOverride, when non-nil, wins over the cluster-topology rule and
 // clusterReplicaCount is not called (no pointless _nodes round trip). It is
 // read-only: the caller owns the pointee.
-func buildCreateIndexBody(es *elasticsearch.Client, replicasOverride *int, settingsFile, mappingsFile, defaultPipeline string, variables templateVariables) string {
+func buildCreateIndexBody(ctx context.Context, es *elasticsearch.Client, replicasOverride *int, settingsFile, mappingsFile, defaultPipeline string, variables templateVariables) string {
 	// ADR: docs/decisions/0001-replica-count-from-node-count.md
 	var replicas int
 	replicasSource := "cluster topology"
@@ -1641,33 +1640,33 @@ func buildCreateIndexBody(es *elasticsearch.Client, replicasOverride *int, setti
 		replicas = *replicasOverride
 		replicasSource = "explicit"
 	} else {
-		replicas = clusterReplicaCount(es)
+		replicas = clusterReplicaCount(ctx, es)
 	}
-	settings := normalizeIndexSettings(settingsFile, defaultPipeline, replicas, replicasSource, variables)
-	mappings := normalizeIndexSection(mappingsFile, "mappings", variables)
+	settings := normalizeIndexSettings(ctx, settingsFile, defaultPipeline, replicas, replicasSource, variables)
+	mappings := normalizeIndexSection(ctx, mappingsFile, "mappings", variables)
 
 	return fmt.Sprintf(`{"settings": %s, "mappings": %s}`, settings, mappings)
 }
 
 // normalizeIndexSettings centralizes this code path so package behavior stays consistent.
-func normalizeIndexSettings(path, defaultPipeline string, replicas int, replicasSource string, variables templateVariables) string {
+func normalizeIndexSettings(ctx context.Context, path, defaultPipeline string, replicas int, replicasSource string, variables templateVariables) string {
 	settings := make(map[string]json.RawMessage)
 	if path != "" {
 		content, err := readTemplatedFile(path, variables)
 		if err != nil {
-			fatal().Err(err).Str("path", path).Msg("Reading settings file")
+			fatal(ctx).Err(err).Str("path", path).Msg("Reading settings file")
 		}
 
 		var raw map[string]json.RawMessage
 		if err := json.Unmarshal(content, &raw); err != nil {
-			fatal().Err(err).Str("path", path).Msg("Parsing settings file")
+			fatal(ctx).Err(err).Str("path", path).Msg("Parsing settings file")
 		}
 
 		source := raw
 		if nested, ok := raw["settings"]; ok {
 			source = nil
 			if err := json.Unmarshal(nested, &source); err != nil {
-				fatal().Err(err).Str("path", path).Msg("Parsing nested settings file")
+				fatal(ctx).Err(err).Str("path", path).Msg("Parsing nested settings file")
 			}
 		}
 
@@ -1693,7 +1692,7 @@ func normalizeIndexSettings(path, defaultPipeline string, replicas int, replicas
 	if defaultPipeline != "" {
 		if _, ok := settings["default_pipeline"]; !ok {
 			settings["default_pipeline"] = json.RawMessage(strconv.Quote(defaultPipeline))
-			log.Info().Str("pipeline", defaultPipeline).Msg("Using first declared pipeline as index.default_pipeline")
+			loggerFrom(ctx).Info().Str("pipeline", defaultPipeline).Msg("Using first declared pipeline as index.default_pipeline")
 		}
 	}
 
@@ -1701,11 +1700,11 @@ func normalizeIndexSettings(path, defaultPipeline string, replicas int, replicas
 	// the settings file specifies; the caller chose the value (explicit override
 	// or cluster topology) and replicasSource names which rule applied.
 	settings["number_of_replicas"] = json.RawMessage(strconv.Itoa(replicas))
-	log.Info().Int("number_of_replicas", replicas).Str("source", replicasSource).Msg("Setting index replica count")
+	loggerFrom(ctx).Info().Int("number_of_replicas", replicas).Str("source", replicasSource).Msg("Setting index replica count")
 
 	normalized, err := json.Marshal(settings)
 	if err != nil {
-		fatal().Err(err).Str("path", path).Msg("Serializing settings")
+		fatal(ctx).Err(err).Str("path", path).Msg("Serializing settings")
 	}
 
 	return string(normalized)
@@ -1717,19 +1716,19 @@ func normalizeSettingKey(key string) string {
 }
 
 // normalizeIndexSection centralizes this code path so package behavior stays consistent.
-func normalizeIndexSection(path, section string, variables templateVariables) string {
+func normalizeIndexSection(ctx context.Context, path, section string, variables templateVariables) string {
 	if path == "" {
 		return "{}"
 	}
 
 	content, err := readTemplatedFile(path, variables)
 	if err != nil {
-		fatal().Err(err).Str("path", path).Msgf("Reading %s file", section)
+		fatal(ctx).Err(err).Str("path", path).Msgf("Reading %s file", section)
 	}
 
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(content, &raw); err != nil {
-		fatal().Err(err).Str("path", path).Msgf("Parsing %s file", section)
+		fatal(ctx).Err(err).Str("path", path).Msgf("Parsing %s file", section)
 	}
 
 	if nested, ok := raw[section]; ok {
@@ -1740,25 +1739,25 @@ func normalizeIndexSection(path, section string, variables templateVariables) st
 }
 
 // readNamedDefinitions centralizes this code path so package behavior stays consistent.
-func readNamedDefinitions(path, resourceType string, variables templateVariables) (namedDefinitions, []string) {
+func readNamedDefinitions(ctx context.Context, path, resourceType string, variables templateVariables) (namedDefinitions, []string) {
 	if path == "" {
 		return nil, nil
 	}
 
 	content, err := readTemplatedFile(path, variables)
 	if err != nil {
-		fatal().Err(err).Str("path", path).Msgf("Reading %s definitions file", resourceType)
+		fatal(ctx).Err(err).Str("path", path).Msgf("Reading %s definitions file", resourceType)
 	}
 
 	decoder := json.NewDecoder(strings.NewReader(string(content)))
 	token, err := decoder.Token()
 	if err != nil {
-		fatal().Err(err).Str("path", path).Msgf("Parsing %s definitions file", resourceType)
+		fatal(ctx).Err(err).Str("path", path).Msgf("Parsing %s definitions file", resourceType)
 	}
 
 	delim, ok := token.(json.Delim)
 	if !ok || delim != '{' {
-		fatal().Str("path", path).Msgf("%s definitions file must contain a JSON object", resourceType)
+		fatal(ctx).Str("path", path).Msgf("%s definitions file must contain a JSON object", resourceType)
 	}
 
 	definitions := make(namedDefinitions)
@@ -1766,17 +1765,17 @@ func readNamedDefinitions(path, resourceType string, variables templateVariables
 	for decoder.More() {
 		keyToken, err := decoder.Token()
 		if err != nil {
-			fatal().Err(err).Str("path", path).Msgf("Reading %s definition name", resourceType)
+			fatal(ctx).Err(err).Str("path", path).Msgf("Reading %s definition name", resourceType)
 		}
 
 		name, ok := keyToken.(string)
 		if !ok {
-			fatal().Str("path", path).Msgf("Invalid %s definition name", resourceType)
+			fatal(ctx).Str("path", path).Msgf("Invalid %s definition name", resourceType)
 		}
 
 		var definition json.RawMessage
 		if err := decoder.Decode(&definition); err != nil {
-			fatal().Err(err).Str("path", path).Msgf("Parsing %s definition body", resourceType)
+			fatal(ctx).Err(err).Str("path", path).Msgf("Parsing %s definition body", resourceType)
 		}
 
 		definitions[name] = definition
@@ -1784,14 +1783,14 @@ func readNamedDefinitions(path, resourceType string, variables templateVariables
 	}
 
 	if _, err := decoder.Token(); err != nil {
-		fatal().Err(err).Str("path", path).Msgf("Parsing %s definitions file", resourceType)
+		fatal(ctx).Err(err).Str("path", path).Msgf("Parsing %s definitions file", resourceType)
 	}
 
 	return definitions, names
 }
 
 // buildManagedPolicyPlan centralizes this code path so package behavior stays consistent.
-func buildManagedPolicyPlan(definitions namedDefinitions, logicalNames []string) managedPolicyPlan {
+func buildManagedPolicyPlan(ctx context.Context, definitions namedDefinitions, logicalNames []string) managedPolicyPlan {
 	plan := managedPolicyPlan{
 		LogicalNames:     append([]string(nil), logicalNames...),
 		DesiredNames:     make([]string, 0, len(logicalNames)),
@@ -1802,16 +1801,16 @@ func buildManagedPolicyPlan(definitions namedDefinitions, logicalNames []string)
 	for _, logicalName := range logicalNames {
 		definition, ok := definitions[logicalName]
 		if !ok {
-			fatal().Str("policy", logicalName).Msg("Policy definition missing from parsed policy file")
+			fatal(ctx).Str("policy", logicalName).Msg("Policy definition missing from parsed policy file")
 		}
 
-		desiredName := managedPolicyName(logicalName, definition)
+		desiredName := managedPolicyName(ctx, logicalName, definition)
 		plan.DesiredNames = append(plan.DesiredNames, desiredName)
 		plan.Definitions[desiredName] = definition
 		plan.LogicalToDesired[logicalName] = desiredName
 		plan.DesiredSet[desiredName] = struct{}{}
 
-		log.Debug().
+		loggerFrom(ctx).Debug().
 			Str("logical_policy", logicalName).
 			Str("policy", desiredName).
 			Msg("Resolved managed policy name from policy definition hash")
@@ -1820,10 +1819,10 @@ func buildManagedPolicyPlan(definitions namedDefinitions, logicalNames []string)
 }
 
 // managedPolicyName centralizes this code path so package behavior stays consistent.
-func managedPolicyName(logicalName string, definition json.RawMessage) string {
+func managedPolicyName(ctx context.Context, logicalName string, definition json.RawMessage) string {
 	canonical, err := canonicalizeRawJSON(definition)
 	if err != nil {
-		fatal().Err(err).Str("policy", logicalName).Msg("Failed to canonicalize policy definition for hashing")
+		fatal(ctx).Err(err).Str("policy", logicalName).Msg("Failed to canonicalize policy definition for hashing")
 	}
 
 	sum := sha256.Sum256(canonical)
@@ -1841,7 +1840,7 @@ func canonicalizeRawJSON(raw json.RawMessage) ([]byte, error) {
 }
 
 // rewritePipelinePolicyReferences centralizes this code path so package behavior stays consistent.
-func rewritePipelinePolicyReferences(definitions namedDefinitions, names []string, logicalToDesired map[string]string) namedDefinitions {
+func rewritePipelinePolicyReferences(ctx context.Context, definitions namedDefinitions, names []string, logicalToDesired map[string]string) namedDefinitions {
 	if len(definitions) == 0 || len(logicalToDesired) == 0 {
 		return definitions
 	}
@@ -1851,23 +1850,23 @@ func rewritePipelinePolicyReferences(definitions namedDefinitions, names []strin
 		definition := definitions[name]
 		var parsed any
 		if err := json.Unmarshal(definition, &parsed); err != nil {
-			fatal().Err(err).Str("pipeline", name).Msg("Unable to parse pipeline definition for policy rewrite")
+			fatal(ctx).Err(err).Str("pipeline", name).Msg("Unable to parse pipeline definition for policy rewrite")
 		}
 
 		replacements := rewriteEnrichPolicyNameReferences(parsed, logicalToDesired)
 		encoded, err := json.Marshal(parsed)
 		if err != nil {
-			fatal().Err(err).Str("pipeline", name).Msg("Unable to serialize rewritten pipeline definition")
+			fatal(ctx).Err(err).Str("pipeline", name).Msg("Unable to serialize rewritten pipeline definition")
 		}
 		rewritten[name] = encoded
 
 		if replacements > 0 {
-			log.Info().
+			loggerFrom(ctx).Info().
 				Str("pipeline", name).
 				Int("replacements", replacements).
 				Msg("Rewrote enrich policy references in pipeline to managed policy names")
 		} else {
-			log.Trace().Str("pipeline", name).Msg("No enrich policy reference rewrites needed for pipeline")
+			loggerFrom(ctx).Trace().Str("pipeline", name).Msg("No enrich policy reference rewrites needed for pipeline")
 		}
 	}
 
@@ -1889,7 +1888,7 @@ func rewritePipelinePolicyReferences(definitions namedDefinitions, names []strin
 // definition (moxfall: a field fed by it was populated on 0 of 109,373
 // documents, with no error). Never guess between generations.
 func resolvePipelinePolicyFallbacks(ctx context.Context, es *elasticsearch.Client, definitions namedDefinitions, names []string, policyNameMapping map[string]string) {
-	referenced := collectReferencedPolicyNamesFromPipelines(definitions, names)
+	referenced := collectReferencedPolicyNamesFromPipelines(ctx, definitions, names)
 	if len(referenced) == 0 {
 		return
 	}
@@ -1909,7 +1908,7 @@ func resolvePipelinePolicyFallbacks(ctx context.Context, es *elasticsearch.Clien
 		}
 		if _, exact := availableSet[policy]; exact {
 			policyNameMapping[policy] = policy
-			log.Debug().Str("policy", policy).Msg("Using existing exact enrich policy reference from pipeline definition")
+			loggerFrom(ctx).Debug().Str("policy", policy).Msg("Using existing exact enrich policy reference from pipeline definition")
 			continue
 		}
 
@@ -1920,7 +1919,7 @@ func resolvePipelinePolicyFallbacks(ctx context.Context, es *elasticsearch.Clien
 			}
 		}
 		if len(matches) == 0 {
-			log.Warn().Str("logical_policy", policy).Msg("Pipeline references enrich policy that does not exist as exact or managed policy name")
+			loggerFrom(ctx).Warn().Str("logical_policy", policy).Msg("Pipeline references enrich policy that does not exist as exact or managed policy name")
 			continue
 		}
 
@@ -1930,7 +1929,7 @@ func resolvePipelinePolicyFallbacks(ctx context.Context, es *elasticsearch.Clien
 			// classifyRunErrorKind reads the message, and a real policy name
 			// containing "enrich" or "bulk" would reclassify this error away
 			// from ErrManagedResource. Do not assign policyNameMapping here.
-			fatal().
+			fatal(ctx).
 				Err(fmt.Errorf("logical policy %q matches managed generations %s and this run supplied no definition for it; supply its definition or delete the stale generations",
 					policy, strings.Join(matches, ", "))).
 				Str("logical_policy", policy).Strs("candidates", matches).
@@ -1939,7 +1938,7 @@ func resolvePipelinePolicyFallbacks(ctx context.Context, es *elasticsearch.Clien
 
 		chosen := matches[0]
 		policyNameMapping[policy] = chosen
-		log.Info().Str("logical_policy", policy).Str("policy", chosen).Msg("Resolved logical enrich policy reference to managed policy name")
+		loggerFrom(ctx).Info().Str("logical_policy", policy).Str("policy", chosen).Msg("Resolved logical enrich policy reference to managed policy name")
 	}
 }
 
@@ -1968,12 +1967,12 @@ func rewriteEnrichPolicyNameReferences(value any, logicalToDesired map[string]st
 }
 
 // collectReferencedPolicyNamesFromPipelines centralizes this code path so package behavior stays consistent.
-func collectReferencedPolicyNamesFromPipelines(definitions namedDefinitions, names []string) []string {
+func collectReferencedPolicyNamesFromPipelines(ctx context.Context, definitions namedDefinitions, names []string) []string {
 	seen := make(map[string]struct{})
 	for _, name := range names {
 		var parsed any
 		if err := json.Unmarshal(definitions[name], &parsed); err != nil {
-			fatal().Err(err).Str("pipeline", name).Msg("Unable to parse pipeline definition while collecting policy references")
+			fatal(ctx).Err(err).Str("pipeline", name).Msg("Unable to parse pipeline definition while collecting policy references")
 		}
 		collectPolicyNamesInValue(parsed, seen)
 	}
@@ -2054,7 +2053,7 @@ func managedPolicyNameMatchesLogical(logicalName, policyName string) bool {
 }
 
 // remapEnrichSelection centralizes this code path so package behavior stays consistent.
-func remapEnrichSelection(enrich *enrichFlagValue, logicalToDesired map[string]string) *enrichFlagValue {
+func remapEnrichSelection(ctx context.Context, enrich *enrichFlagValue, logicalToDesired map[string]string) *enrichFlagValue {
 	if enrich == nil || !enrich.enabled || enrich.all || len(logicalToDesired) == 0 {
 		return enrich
 	}
@@ -2082,12 +2081,12 @@ func remapEnrichSelection(enrich *enrichFlagValue, logicalToDesired map[string]s
 	cloned.raw = strings.Join(remapped, ",")
 	cloned.all = false
 	cloned.enabled = true
-	log.Debug().Str("requested", enrich.raw).Str("resolved", cloned.raw).Msg("Mapped explicit enrich policy names to managed policy names")
+	loggerFrom(ctx).Debug().Str("requested", enrich.raw).Str("resolved", cloned.raw).Msg("Mapped explicit enrich policy names to managed policy names")
 	return &cloned
 }
 
 // resolveTransformsForSource centralizes this code path so package behavior stays consistent.
-func resolveTransformsForSource(definitions namedDefinitions, names []string, sourceIndex string) (namedDefinitions, []string, error) {
+func resolveTransformsForSource(ctx context.Context, definitions namedDefinitions, names []string, sourceIndex string) (namedDefinitions, []string, error) {
 	if len(names) == 0 {
 		return nil, nil, nil
 	}
@@ -2119,7 +2118,7 @@ func resolveTransformsForSource(definitions namedDefinitions, names []string, so
 		}
 
 		if strings.TrimSpace(parsed.SourceIndex) != trimmedSourceIndex {
-			log.Trace().
+			loggerFrom(ctx).Trace().
 				Str("transform", name).
 				Str("source_index", parsed.SourceIndex).
 				Str("index", trimmedSourceIndex).
@@ -2163,7 +2162,7 @@ func garbageCollectManagedPolicies(ctx context.Context, es *elasticsearch.Client
 
 		referencing := findPipelinesReferencingPolicy(ctx, es, policy)
 		if len(referencing) > 0 {
-			log.Debug().
+			loggerFrom(ctx).Debug().
 				Str("policy", policy).
 				Strs("pipelines", referencing).
 				Msg("Skipping managed policy GC because policy is still referenced by pipelines")
@@ -2184,18 +2183,18 @@ func deletePolicyBestEffort(ctx context.Context, es *elasticsearch.Client, polic
 		}),
 	)
 	if err != nil {
-		log.Warn().Err(err).Str("policy", policy).Msg("Managed policy GC failed while deleting policy")
+		loggerFrom(ctx).Warn().Err(err).Str("policy", policy).Msg("Managed policy GC failed while deleting policy")
 		return
 	}
 	defer res.Body.Close()
 
 	body, _ := io.ReadAll(res.Body)
 	if res.StatusCode == http.StatusNotFound {
-		log.Trace().Str("policy", policy).Msg("Managed policy GC found policy already deleted")
+		loggerFrom(ctx).Trace().Str("policy", policy).Msg("Managed policy GC found policy already deleted")
 		return
 	}
 	if res.IsError() {
-		log.Warn().
+		loggerFrom(ctx).Warn().
 			Str("policy", policy).
 			Int("status_code", res.StatusCode).
 			Str("body", string(body)).
@@ -2203,7 +2202,7 @@ func deletePolicyBestEffort(ctx context.Context, es *elasticsearch.Client, polic
 		return
 	}
 
-	log.Info().Str("policy", policy).Msg("Managed policy GC deleted unreferenced policy")
+	loggerFrom(ctx).Info().Str("policy", policy).Msg("Managed policy GC deleted unreferenced policy")
 }
 
 // buildTemplateVariables centralizes this code path so package behavior stays consistent.
@@ -2231,12 +2230,12 @@ func createPipelines(ctx context.Context, es *elasticsearch.Client, definitions 
 			strings.NewReader(string(definitions[name])),
 			es.Ingest.PutPipeline.WithContext(ctx),
 		)
-		checkErr("creating pipeline", err)
+		checkErr(ctx, "creating pipeline", err)
 
 		if res.IsError() {
 			body, _ := io.ReadAll(res.Body)
 			res.Body.Close()
-			fatal().
+			fatal(ctx).
 				Str("pipeline", name).
 				Int("status_code", res.StatusCode).
 				Str("body", string(body)).
@@ -2244,7 +2243,7 @@ func createPipelines(ctx context.Context, es *elasticsearch.Client, definitions 
 		}
 		res.Body.Close()
 
-		log.Info().Str("pipeline", name).Msg("Pipeline created or updated")
+		loggerFrom(ctx).Info().Str("pipeline", name).Msg("Pipeline created or updated")
 	}
 }
 
@@ -2255,17 +2254,17 @@ func deletePipelines(ctx context.Context, es *elasticsearch.Client, names []stri
 			name,
 			es.Ingest.DeletePipeline.WithContext(ctx),
 		)
-		checkErr("deleting pipeline", err)
+		checkErr(ctx, "deleting pipeline", err)
 
 		if res.StatusCode == http.StatusNotFound {
 			res.Body.Close()
-			log.Info().Str("pipeline", name).Msg("Pipeline does not exist. Nothing to delete.")
+			loggerFrom(ctx).Info().Str("pipeline", name).Msg("Pipeline does not exist. Nothing to delete.")
 			continue
 		}
 		if res.IsError() {
 			body, _ := io.ReadAll(res.Body)
 			res.Body.Close()
-			fatal().
+			fatal(ctx).
 				Str("pipeline", name).
 				Int("status_code", res.StatusCode).
 				Str("body", string(body)).
@@ -2273,7 +2272,7 @@ func deletePipelines(ctx context.Context, es *elasticsearch.Client, names []stri
 		}
 		res.Body.Close()
 
-		log.Info().Str("pipeline", name).Msg("Pipeline deleted")
+		loggerFrom(ctx).Info().Str("pipeline", name).Msg("Pipeline deleted")
 	}
 }
 
@@ -2282,11 +2281,11 @@ func createPolicies(ctx context.Context, es *elasticsearch.Client, definitions n
 	for _, name := range names {
 		for attempt := 1; attempt <= 5; attempt++ {
 			res, err := putPolicy(ctx, es, name, definitions[name])
-			checkErr("creating enrich policy", err)
+			checkErr(ctx, "creating enrich policy", err)
 
 			if !res.IsError() {
 				res.Body.Close()
-				log.Info().Str("policy", name).Msg("Created enrich policy")
+				loggerFrom(ctx).Info().Str("policy", name).Msg("Created enrich policy")
 				break
 			}
 
@@ -2294,32 +2293,32 @@ func createPolicies(ctx context.Context, es *elasticsearch.Client, definitions n
 			res.Body.Close()
 
 			if isUnsupportedEnrichAPI(res.StatusCode, body) {
-				log.Warn().
+				loggerFrom(ctx).Warn().
 					Int("status_code", res.StatusCode).
 					Str("body", string(body)).
 					Msg("Enrich policy endpoint returned a generic 404; check proxy or routing for /_enrich/policy and confirm this URL matches the backend used by Dev Tools")
 				return
 			}
 			if hasElasticsearchErrorType(body, "index_not_found_exception") && attempt < 5 {
-				log.Warn().
+				loggerFrom(ctx).Warn().
 					Str("policy", name).
 					Int("attempt", attempt).
 					Int("status_code", res.StatusCode).
 					Str("body", string(body)).
 					Msg("Source index for enrich policy is not visible yet; retrying enrich policy creation")
 				if err := sleepWithContext(ctx, 500*time.Millisecond); err != nil {
-					fatal().Err(err).Str("policy", name).Msg("Context cancelled during enrich policy retry")
+					fatal(ctx).Err(err).Str("policy", name).Msg("Context cancelled during enrich policy retry")
 				}
 				continue
 			}
 			if hasElasticsearchErrorType(body, "resource_already_exists_exception") {
-				log.Info().
+				loggerFrom(ctx).Info().
 					Str("policy", name).
 					Msg("Managed enrich policy already exists for this definition hash")
 				break
 			}
 
-			fatal().
+			fatal(ctx).
 				Str("policy", name).
 				Int("status_code", res.StatusCode).
 				Str("body", string(body)).
@@ -2352,19 +2351,19 @@ func deletePolicies(ctx context.Context, es *elasticsearch.Client, names []strin
 					"Accept": "application/json",
 				}),
 			)
-			checkErr("deleting enrich policy", err)
+			checkErr(ctx, "deleting enrich policy", err)
 
 			if res.StatusCode == http.StatusNotFound {
 				body, _ := io.ReadAll(res.Body)
 				res.Body.Close()
 				if isUnsupportedEnrichAPI(res.StatusCode, body) {
-					log.Warn().
+					loggerFrom(ctx).Warn().
 						Int("status_code", res.StatusCode).
 						Str("body", string(body)).
 						Msg("Enrich policy endpoint returned a generic 404; check proxy or routing for /_enrich/policy and confirm this URL matches the backend used by Dev Tools")
 					return
 				}
-				log.Debug().Str("policy", name).Msg("Enrich policy does not exist. Nothing to delete.")
+				loggerFrom(ctx).Debug().Str("policy", name).Msg("Enrich policy does not exist. Nothing to delete.")
 				break
 			}
 			if res.IsError() {
@@ -2373,14 +2372,14 @@ func deletePolicies(ctx context.Context, es *elasticsearch.Client, names []strin
 				if res.StatusCode == http.StatusConflict && nuke && policyDeleteBlockedByPipelineReference(body) && attempt == 1 {
 					referencing := findPipelinesReferencingPolicy(ctx, es, name)
 					if len(referencing) == 0 {
-						fatal().
+						fatal(ctx).
 							Str("policy", name).
 							Int("status_code", res.StatusCode).
 							Str("body", string(body)).
 							Msg("Failed to delete enrich policy; nuke mode could not find referencing pipelines")
 					}
 
-					log.Warn().
+					loggerFrom(ctx).Warn().
 						Str("policy", name).
 						Strs("pipelines", referencing).
 						Msg("Nuke mode deleting pipelines that reference this enrich policy before retrying policy deletion")
@@ -2388,7 +2387,7 @@ func deletePolicies(ctx context.Context, es *elasticsearch.Client, names []strin
 					continue
 				}
 
-				fatal().
+				fatal(ctx).
 					Str("policy", name).
 					Int("status_code", res.StatusCode).
 					Str("body", string(body)).
@@ -2396,7 +2395,7 @@ func deletePolicies(ctx context.Context, es *elasticsearch.Client, names []strin
 			}
 			res.Body.Close()
 
-			log.Info().Str("policy", name).Msg("Deleted enrich policy")
+			loggerFrom(ctx).Info().Str("policy", name).Msg("Deleted enrich policy")
 			break
 		}
 	}
@@ -2424,7 +2423,7 @@ func createOrUpdateTransforms(ctx context.Context, es *elasticsearch.Client, def
 	for _, name := range names {
 		definition, ok := definitions[name]
 		if !ok {
-			fatal().Str("transform", name).Msg("Transform definition missing from parsed transform file")
+			fatal(ctx).Str("transform", name).Msg("Transform definition missing from parsed transform file")
 		}
 
 		// ES 9.x does not allow updating immutable transform properties
@@ -2445,17 +2444,17 @@ func createOrUpdateTransforms(ctx context.Context, es *elasticsearch.Client, def
 				"Accept":       "application/json",
 			}),
 		)
-		checkErr("creating transform", err)
+		checkErr(ctx, "creating transform", err)
 		body, _ := io.ReadAll(res.Body)
 		res.Body.Close()
 		if res.IsError() {
-			fatal().
+			fatal(ctx).
 				Str("transform", name).
 				Int("status_code", res.StatusCode).
 				Str("body", string(body)).
 				Msg("Failed to create transform")
 		}
-		log.Info().Str("transform", name).Msg("Transform created")
+		loggerFrom(ctx).Info().Str("transform", name).Msg("Transform created")
 	}
 }
 
@@ -2466,7 +2465,7 @@ func transformExists(ctx context.Context, es *elasticsearch.Client, name string)
 		es.TransformGetTransform.WithTransformID(name),
 		es.TransformGetTransform.WithAllowNoMatch(true),
 	)
-	checkErr("checking if transform exists", err)
+	checkErr(ctx, "checking if transform exists", err)
 	body, _ := io.ReadAll(res.Body)
 	res.Body.Close()
 
@@ -2474,7 +2473,7 @@ func transformExists(ctx context.Context, es *elasticsearch.Client, name string)
 		return false
 	}
 	if res.IsError() {
-		fatal().
+		fatal(ctx).
 			Str("transform", name).
 			Int("status_code", res.StatusCode).
 			Str("body", string(body)).
@@ -2503,22 +2502,22 @@ func stopTransformsBestEffort(ctx context.Context, es *elasticsearch.Client, nam
 				"Accept": "application/json",
 			}),
 		)
-		checkErr("stopping transform", err)
+		checkErr(ctx, "stopping transform", err)
 		body, _ := io.ReadAll(res.Body)
 		res.Body.Close()
 
 		if res.StatusCode == http.StatusNotFound || transformStopAlreadyStopped(res.StatusCode, body) {
-			log.Debug().Str("transform", name).Msg("Transform is not running. Nothing to stop.")
+			loggerFrom(ctx).Debug().Str("transform", name).Msg("Transform is not running. Nothing to stop.")
 			continue
 		}
 		if res.IsError() {
-			fatal().
+			fatal(ctx).
 				Str("transform", name).
 				Int("status_code", res.StatusCode).
 				Str("body", string(body)).
 				Msg("Failed to stop transform")
 		}
-		log.Debug().Str("transform", name).Msg("Transform stopped")
+		loggerFrom(ctx).Debug().Str("transform", name).Msg("Transform stopped")
 	}
 }
 
@@ -2534,22 +2533,22 @@ func deleteTransforms(ctx context.Context, es *elasticsearch.Client, names []str
 				"Accept": "application/json",
 			}),
 		)
-		checkErr("deleting transform", err)
+		checkErr(ctx, "deleting transform", err)
 		body, _ := io.ReadAll(res.Body)
 		res.Body.Close()
 
 		if res.StatusCode == http.StatusNotFound {
-			log.Debug().Str("transform", name).Msg("Transform does not exist. Nothing to delete.")
+			loggerFrom(ctx).Debug().Str("transform", name).Msg("Transform does not exist. Nothing to delete.")
 			continue
 		}
 		if res.IsError() {
-			fatal().
+			fatal(ctx).
 				Str("transform", name).
 				Int("status_code", res.StatusCode).
 				Str("body", string(body)).
 				Msg("Failed to delete transform")
 		}
-		log.Info().Str("transform", name).Msg("Transform deleted")
+		loggerFrom(ctx).Info().Str("transform", name).Msg("Transform deleted")
 	}
 }
 
@@ -2564,23 +2563,23 @@ func startTransforms(ctx context.Context, es *elasticsearch.Client, names []stri
 				"Accept": "application/json",
 			}),
 		)
-		checkErr("starting transform", err)
+		checkErr(ctx, "starting transform", err)
 		body, _ := io.ReadAll(res.Body)
 		res.Body.Close()
 
 		if transformStartAlreadyStarted(res.StatusCode, body) {
-			log.Info().Str("transform", name).Msg("Transform already running")
+			loggerFrom(ctx).Info().Str("transform", name).Msg("Transform already running")
 			continue
 		}
 		if res.IsError() {
-			fatal().
+			fatal(ctx).
 				Str("transform", name).
 				Int("status_code", res.StatusCode).
 				Str("body", string(body)).
 				Msg("Failed to start transform")
 		}
 
-		log.Info().Str("transform", name).Msg("Transform started")
+		loggerFrom(ctx).Info().Str("transform", name).Msg("Transform started")
 	}
 }
 
@@ -2591,11 +2590,11 @@ func deletePipelinesForNuke(ctx context.Context, es *elasticsearch.Client, names
 			name,
 			es.Ingest.DeletePipeline.WithContext(ctx),
 		)
-		checkErr("deleting pipeline", err)
+		checkErr(ctx, "deleting pipeline", err)
 
 		if res.StatusCode == http.StatusNotFound {
 			res.Body.Close()
-			log.Info().Str("pipeline", name).Msg("Pipeline does not exist. Nothing to delete.")
+			loggerFrom(ctx).Info().Str("pipeline", name).Msg("Pipeline does not exist. Nothing to delete.")
 			continue
 		}
 		if res.IsError() {
@@ -2604,14 +2603,14 @@ func deletePipelinesForNuke(ctx context.Context, es *elasticsearch.Client, names
 			if res.StatusCode == http.StatusBadRequest && pipelineDeleteBlockedByDefaultIndex(body) {
 				indices := findIndicesUsingDefaultPipeline(ctx, es, name)
 				if len(indices) == 0 {
-					fatal().
+					fatal(ctx).
 						Str("pipeline", name).
 						Int("status_code", res.StatusCode).
 						Str("body", string(body)).
 						Msg("Failed to delete pipeline; nuke mode could not find indices using it as default pipeline")
 				}
 
-				log.Warn().
+				loggerFrom(ctx).Warn().
 					Str("pipeline", name).
 					Strs("indices", indices).
 					Msg("Nuke mode clearing index.default_pipeline on indices that use this pipeline before retrying pipeline deletion")
@@ -2619,7 +2618,7 @@ func deletePipelinesForNuke(ctx context.Context, es *elasticsearch.Client, names
 				deletePipelines(ctx, es, []string{name})
 				continue
 			}
-			fatal().
+			fatal(ctx).
 				Str("pipeline", name).
 				Int("status_code", res.StatusCode).
 				Str("body", string(body)).
@@ -2627,7 +2626,7 @@ func deletePipelinesForNuke(ctx context.Context, es *elasticsearch.Client, names
 		}
 		res.Body.Close()
 
-		log.Info().Str("pipeline", name).Msg("Pipeline deleted")
+		loggerFrom(ctx).Info().Str("pipeline", name).Msg("Pipeline deleted")
 	}
 }
 
@@ -2636,7 +2635,7 @@ func findPipelinesReferencingPolicy(ctx context.Context, es *elasticsearch.Clien
 	res, err := es.Ingest.GetPipeline(
 		es.Ingest.GetPipeline.WithContext(ctx),
 	)
-	checkErr("getting ingest pipelines", err)
+	checkErr(ctx, "getting ingest pipelines", err)
 	defer res.Body.Close()
 
 	if res.StatusCode == http.StatusNotFound {
@@ -2644,7 +2643,7 @@ func findPipelinesReferencingPolicy(ctx context.Context, es *elasticsearch.Clien
 	}
 	if res.IsError() {
 		body, _ := io.ReadAll(res.Body)
-		fatal().
+		fatal(ctx).
 			Int("status_code", res.StatusCode).
 			Str("body", string(body)).
 			Msg("Failed to get ingest pipelines")
@@ -2652,7 +2651,7 @@ func findPipelinesReferencingPolicy(ctx context.Context, es *elasticsearch.Clien
 
 	var definitions namedDefinitions
 	if err := json.NewDecoder(res.Body).Decode(&definitions); err != nil {
-		fatal().Err(err).Msg("Unable to parse ingest pipeline response")
+		fatal(ctx).Err(err).Msg("Unable to parse ingest pipeline response")
 	}
 
 	return pipelineNamesReferencingPolicy(definitions, policy)
@@ -2661,7 +2660,7 @@ func findPipelinesReferencingPolicy(ctx context.Context, es *elasticsearch.Clien
 // findIndicesUsingDefaultPipeline centralizes this code path so package behavior stays consistent.
 func findIndicesUsingDefaultPipeline(ctx context.Context, es *elasticsearch.Client, pipeline string) []string {
 	res, err := es.Indices.GetSettings(es.Indices.GetSettings.WithName("*"), es.Indices.GetSettings.WithContext(ctx))
-	checkErr("getting index settings", err)
+	checkErr(ctx, "getting index settings", err)
 	defer res.Body.Close()
 
 	if res.StatusCode == http.StatusNotFound {
@@ -2669,7 +2668,7 @@ func findIndicesUsingDefaultPipeline(ctx context.Context, es *elasticsearch.Clie
 	}
 	if res.IsError() {
 		body, _ := io.ReadAll(res.Body)
-		fatal().
+		fatal(ctx).
 			Int("status_code", res.StatusCode).
 			Str("body", string(body)).
 			Msg("Failed to get index settings")
@@ -2683,7 +2682,7 @@ func findIndicesUsingDefaultPipeline(ctx context.Context, es *elasticsearch.Clie
 		} `json:"settings"`
 	}
 	if err := json.NewDecoder(res.Body).Decode(&parsed); err != nil {
-		fatal().Err(err).Msg("Unable to parse index settings response")
+		fatal(ctx).Err(err).Msg("Unable to parse index settings response")
 	}
 
 	indices := make([]string, 0)
@@ -2704,12 +2703,12 @@ func clearDefaultPipelineForIndices(ctx context.Context, es *elasticsearch.Clien
 			es.Indices.PutSettings.WithIndex(index),
 			es.Indices.PutSettings.WithContext(ctx),
 		)
-		checkErr("clearing index.default_pipeline", err)
+		checkErr(ctx, "clearing index.default_pipeline", err)
 
 		if res.IsError() {
 			body, _ := io.ReadAll(res.Body)
 			res.Body.Close()
-			fatal().
+			fatal(ctx).
 				Str("index", index).
 				Int("status_code", res.StatusCode).
 				Str("body", string(body)).
@@ -2717,7 +2716,7 @@ func clearDefaultPipelineForIndices(ctx context.Context, es *elasticsearch.Clien
 		}
 		res.Body.Close()
 
-		log.Warn().Str("index", index).Msg("Cleared index.default_pipeline to allow nuke cleanup")
+		loggerFrom(ctx).Warn().Str("index", index).Msg("Cleared index.default_pipeline to allow nuke cleanup")
 	}
 }
 
@@ -2771,21 +2770,21 @@ func valueReferencesPolicy(value any, policy string) bool {
 // refreshIndex forces an immediate index refresh so subsequent reads see all
 // recently written documents. Called before enrich policy execution and before
 // batch transform start to eliminate the ES refresh-window race.
-func refreshIndex(es *elasticsearch.Client, index string) {
+func refreshIndex(ctx context.Context, es *elasticsearch.Client, index string) {
 	res, err := es.Indices.Refresh(es.Indices.Refresh.WithIndex(index))
-	checkErr("refreshing index", err)
+	checkErr(ctx, "refreshing index", err)
 	defer res.Body.Close()
 
 	if res.IsError() {
 		body, _ := io.ReadAll(res.Body)
-		fatal().
+		fatal(ctx).
 			Str("index", index).
 			Int("status_code", res.StatusCode).
 			Str("body", string(body)).
 			Msg("Failed to refresh index")
 	}
 
-	log.Info().Str("index", index).Msg("Refreshed index")
+	loggerFrom(ctx).Info().Str("index", index).Msg("Refreshed index")
 }
 
 // runEnrichPolicies centralizes this code path so package behavior stays consistent.
@@ -2797,7 +2796,7 @@ func runEnrichPolicies(ctx context.Context, es *elasticsearch.Client, enrich *en
 		return summary
 	}
 	if len(availablePolicies) == 0 {
-		log.Warn().Msg("No enrich policies found; skipping enrich execution")
+		loggerFrom(ctx).Warn().Msg("No enrich policies found; skipping enrich execution")
 		return summary
 	}
 
@@ -2805,15 +2804,15 @@ func runEnrichPolicies(ctx context.Context, es *elasticsearch.Client, enrich *en
 	summary.Selected = append(summary.Selected, targets...)
 	summary.Missing = append(summary.Missing, missing...)
 	for _, policy := range missing {
-		log.Warn().Str("policy", policy).Msg("Enrich policy not found; skipping")
+		loggerFrom(ctx).Warn().Str("policy", policy).Msg("Enrich policy not found; skipping")
 	}
 
 	if len(targets) == 0 {
-		log.Warn().Msg("No enrich policies matched the request")
+		loggerFrom(ctx).Warn().Msg("No enrich policies matched the request")
 		return summary
 	}
 
-	log.Info().
+	loggerFrom(ctx).Info().
 		Int("available", len(availablePolicies)).
 		Int("requested", len(targets)+len(missing)).
 		Int("selected", len(targets)).
@@ -2829,9 +2828,9 @@ func runEnrichPolicies(ctx context.Context, es *elasticsearch.Client, enrich *en
 		}
 	}
 
-	event := log.Info()
+	event := loggerFrom(ctx).Info()
 	if failed > 0 {
-		event = log.Error()
+		event = loggerFrom(ctx).Error()
 	}
 	event.
 		Int("selected", len(targets)).
@@ -2853,19 +2852,19 @@ func getEnrichPolicies(ctx context.Context, es *elasticsearch.Client) ([]string,
 			"Accept": "application/json",
 		}),
 	)
-	checkErr("getting enrich policies", err)
+	checkErr(ctx, "getting enrich policies", err)
 	defer res.Body.Close()
 
 	if res.IsError() {
 		body, _ := io.ReadAll(res.Body)
 		if isUnsupportedEnrichAPI(res.StatusCode, body) {
-			log.Warn().
+			loggerFrom(ctx).Warn().
 				Int("status_code", res.StatusCode).
 				Str("body", string(body)).
 				Msg("Enrich policy endpoint returned a generic 404; check proxy or routing for /_enrich/policy and confirm this URL matches the backend used by Dev Tools")
 			return nil, false
 		}
-		fatal().
+		fatal(ctx).
 			Int("status_code", res.StatusCode).
 			Str("body", string(body)).
 			Msg("Failed to get enrich policies")
@@ -2873,7 +2872,7 @@ func getEnrichPolicies(ctx context.Context, es *elasticsearch.Client) ([]string,
 
 	var parsed enrichPoliciesResponse
 	if err := json.NewDecoder(res.Body).Decode(&parsed); err != nil {
-		fatal().Err(err).Msg("Unable to parse enrich policy response")
+		fatal(ctx).Err(err).Msg("Unable to parse enrich policy response")
 	}
 
 	policies := make([]string, 0, len(parsed.Policies))
@@ -2932,15 +2931,15 @@ func resolveEnrichTargets(enrich *enrichFlagValue, available []string, declared 
 }
 
 // logEnrichResult emits the final success/failure log for an enrich policy execution.
-func logEnrichResult(policy string, status *enrichPhaseStatus, startTime time.Time) bool {
+func logEnrichResult(ctx context.Context, policy string, status *enrichPhaseStatus, startTime time.Time) bool {
 	phase, isFailure := "", false
 	if status != nil {
 		phase = status.Phase
 		isFailure = strings.EqualFold(phase, "FAILED") || strings.EqualFold(phase, "CANCELLED")
 	}
-	event := log.Debug()
+	event := loggerFrom(ctx).Debug()
 	if isFailure {
-		event = log.Error()
+		event = loggerFrom(ctx).Error()
 	}
 	entry := event.Str("policy", policy).Float64("time_taken", time.Since(startTime).Seconds())
 	if phase != "" {
@@ -2974,7 +2973,7 @@ func executeEnrichPolicy(ctx context.Context, es *elasticsearch.Client, policy s
 		}),
 	)
 	if err != nil {
-		log.Error().Err(err).Str("policy", policy).Msg("Failed to execute enrich policy")
+		loggerFrom(ctx).Error().Err(err).Str("policy", policy).Msg("Failed to execute enrich policy")
 		return false
 	}
 	defer res.Body.Close()
@@ -2982,14 +2981,14 @@ func executeEnrichPolicy(ctx context.Context, es *elasticsearch.Client, policy s
 	if res.IsError() {
 		body, _ := io.ReadAll(res.Body)
 		if isUnsupportedEnrichAPI(res.StatusCode, body) {
-			log.Warn().
+			loggerFrom(ctx).Warn().
 				Str("policy", policy).
 				Int("status_code", res.StatusCode).
 				Str("body", string(body)).
 				Msg("Enrich execute endpoint returned a generic 404; check proxy or routing for /_enrich/policy/<name>/_execute and confirm this URL matches the backend used by Dev Tools")
 			return false
 		}
-		log.Error().
+		loggerFrom(ctx).Error().
 			Str("policy", policy).
 			Int("status_code", res.StatusCode).
 			Str("body", string(body)).
@@ -3000,39 +2999,39 @@ func executeEnrichPolicy(ctx context.Context, es *elasticsearch.Client, policy s
 
 	var kickoff enrichExecuteResponse
 	if err := json.NewDecoder(res.Body).Decode(&kickoff); err != nil {
-		log.Error().Err(err).Str("policy", policy).Msg("Unable to parse enrich policy execution response")
+		loggerFrom(ctx).Error().Err(err).Str("policy", policy).Msg("Unable to parse enrich policy execution response")
 		return false
 	}
 
 	// Synchronous completion — small policy or ES returned immediately.
 	if kickoff.Task == nil || *kickoff.Task == "" {
-		return logEnrichResult(policy, kickoff.Status, startTime)
+		return logEnrichResult(ctx, policy, kickoff.Status, startTime)
 	}
 
 	taskID := *kickoff.Task
 	for pollCount := 1; ; pollCount++ {
 		if err := sleepWithContext(ctx, enrichPollInterval(pollCount)); err != nil {
-			log.Warn().Err(err).Str("policy", policy).Msg("Context cancelled while polling enrich task")
+			loggerFrom(ctx).Warn().Err(err).Str("policy", policy).Msg("Context cancelled while polling enrich task")
 			return false
 		}
 
 		taskRes, err := es.Tasks.Get(taskID, es.Tasks.Get.WithContext(ctx))
 		if err != nil {
-			log.Error().Err(err).Str("policy", policy).Str("task", taskID).Msg("Failed to poll enrich policy task")
+			loggerFrom(ctx).Error().Err(err).Str("policy", policy).Str("task", taskID).Msg("Failed to poll enrich policy task")
 			return false
 		}
 
 		// 404 means ES has already removed the completed task record.
 		if taskRes.StatusCode == http.StatusNotFound {
 			taskRes.Body.Close()
-			return logEnrichResult(policy, nil, startTime)
+			return logEnrichResult(ctx, policy, nil, startTime)
 		}
 
 		var task taskGetResponse
 		decodeErr := json.NewDecoder(taskRes.Body).Decode(&task)
 		taskRes.Body.Close()
 		if decodeErr != nil {
-			log.Error().Err(decodeErr).Str("policy", policy).Str("task", taskID).Msg("Unable to parse enrich policy task response")
+			loggerFrom(ctx).Error().Err(decodeErr).Str("policy", policy).Str("task", taskID).Msg("Unable to parse enrich policy task response")
 			return false
 		}
 
@@ -3047,10 +3046,10 @@ func executeEnrichPolicy(ctx context.Context, es *elasticsearch.Client, policy s
 			if task.Response != nil && task.Response.Status != nil {
 				status = task.Response.Status
 			}
-			return logEnrichResult(policy, status, startTime)
+			return logEnrichResult(ctx, policy, status, startTime)
 		}
 
-		log.Debug().
+		loggerFrom(ctx).Debug().
 			Str("policy", policy).
 			Str("phase", phase).
 			Float64("elapsed_s", time.Since(startTime).Seconds()).
@@ -3173,40 +3172,40 @@ func loadJSONArray(
 	succeededTotal, failedTotal, processed *int,
 ) {
 	f, err := os.Open(dataFile)
-	checkErr("opening data file", err)
+	checkErr(ctx, "opening data file", err)
 	defer f.Close()
 
 	dec := json.NewDecoder(f)
 	tok, err := dec.Token()
 	if err != nil || tok != json.Delim('[') {
-		fatal().Msg("Data file must be a JSON array")
+		fatal(ctx).Msg("Data file must be a JSON array")
 	}
 
-	log.Debug().Str("data_file", dataFile).Msg("Counting documents in data file")
+	loggerFrom(ctx).Debug().Str("data_file", dataFile).Msg("Counting documents in data file")
 	total := 0
 	for dec.More() {
 		var tmp map[string]interface{}
 		if err := dec.Decode(&tmp); err != nil {
-			fatal().Err(err).Msg("Error counting objects in data file")
+			fatal(ctx).Err(err).Msg("Error counting objects in data file")
 		}
 		total++
 	}
-	log.Debug().Str("data_file", dataFile).Int("total", total).Msg("Document count complete")
+	loggerFrom(ctx).Debug().Str("data_file", dataFile).Int("total", total).Msg("Document count complete")
 
 	if _, err := f.Seek(0, 0); err != nil {
-		fatal().Err(err).Msg("Error rewinding data file")
+		fatal(ctx).Err(err).Msg("Error rewinding data file")
 	}
 	dec = json.NewDecoder(f)
 	_, err = dec.Token()
 	if err != nil {
-		fatal().Err(err).Msg("Error re-reading data file")
+		fatal(ctx).Err(err).Msg("Error re-reading data file")
 	}
 
 	batch := make([]map[string]interface{}, 0, batchSize)
 	for dec.More() {
 		var doc map[string]interface{}
 		if err := dec.Decode(&doc); err != nil {
-			fatal().Err(err).Msg("Error decoding object in data file")
+			fatal(ctx).Err(err).Msg("Error decoding object in data file")
 		}
 		batch = append(batch, doc)
 		if len(batch) == batchSize {
@@ -3264,13 +3263,13 @@ func loadNDJSON(
 ) {
 	total, err := countNDJSONLines(dataFile)
 	if err != nil {
-		fatal().Err(err).Msg("Error counting NDJSON lines")
+		fatal(ctx).Err(err).Msg("Error counting NDJSON lines")
 	}
-	log.Debug().Str("data_file", dataFile).Int("total", total).Msg("NDJSON line count complete")
+	loggerFrom(ctx).Debug().Str("data_file", dataFile).Int("total", total).Msg("NDJSON line count complete")
 
 	f, err := os.Open(dataFile)
 	if err != nil {
-		fatal().Err(err).Msg("Error opening NDJSON data file")
+		fatal(ctx).Err(err).Msg("Error opening NDJSON data file")
 	}
 	defer f.Close()
 
@@ -3280,7 +3279,7 @@ func loadNDJSON(
 	for dec.More() {
 		var doc map[string]interface{}
 		if err := dec.Decode(&doc); err != nil {
-			fatal().Err(err).Msg("Error decoding NDJSON document")
+			fatal(ctx).Err(err).Msg("Error decoding NDJSON document")
 		}
 		batch = append(batch, doc)
 		if len(batch) == batchSize {
@@ -3351,11 +3350,11 @@ func bulkInsert(
 		documentNumber := inserted - len(batch) + batchOffset + 1
 		metaLine, err := json.Marshal(meta)
 		if err != nil {
-			fatal().Err(err).Int("document", documentNumber).Msg("Unable to serialize bulk action metadata")
+			fatal(ctx).Err(err).Int("document", documentNumber).Msg("Unable to serialize bulk action metadata")
 		}
 		docLine, err := json.Marshal(doc)
 		if err != nil {
-			fatal().Err(err).Int("document", documentNumber).Msg("Unable to serialize document for bulk insert")
+			fatal(ctx).Err(err).Int("document", documentNumber).Msg("Unable to serialize document for bulk insert")
 		}
 		buf.Write(metaLine)
 		buf.WriteByte('\n')
@@ -3388,22 +3387,22 @@ func bulkInsert(
 
 		if err != nil {
 			if ctx.Err() != nil {
-				fatal().Err(ctx.Err()).Msg("Bulk API request failed")
+				fatal(ctx).Err(ctx.Err()).Msg("Bulk API request failed")
 			}
 			if shouldRetryBulkRequest(0, err) && attempt < retryAttempts {
 				nextBackoff := computeExponentialBackoff(attempt, retryBackoffBase, retryBackoffMax)
-				log.Warn().
+				loggerFrom(ctx).Warn().
 					Err(err).
 					Int("attempt", attempt).
 					Int("max_attempts", retryAttempts).
 					Str("next_backoff", nextBackoff.String()).
 					Msg("Bulk API request failed; retrying")
 				if sleepErr := sleepWithContext(ctx, nextBackoff); sleepErr != nil {
-					fatal().Err(sleepErr).Msg("Bulk API request failed")
+					fatal(ctx).Err(sleepErr).Msg("Bulk API request failed")
 				}
 				continue
 			}
-			fatal().Err(err).Msg("Bulk API request failed")
+			fatal(ctx).Err(err).Msg("Bulk API request failed")
 		}
 
 		if res.IsError() {
@@ -3411,7 +3410,7 @@ func bulkInsert(
 			_ = res.Body.Close()
 			if shouldRetryBulkRequest(res.StatusCode, nil) && attempt < retryAttempts {
 				nextBackoff := computeExponentialBackoff(attempt, retryBackoffBase, retryBackoffMax)
-				log.Warn().
+				loggerFrom(ctx).Warn().
 					Int("status_code", res.StatusCode).
 					Str("body", string(body)).
 					Int("attempt", attempt).
@@ -3419,18 +3418,18 @@ func bulkInsert(
 					Str("next_backoff", nextBackoff.String()).
 					Msg("Bulk API request failed; retrying")
 				if sleepErr := sleepWithContext(ctx, nextBackoff); sleepErr != nil {
-					fatal().Err(sleepErr).Msg("Bulk API request failed")
+					fatal(ctx).Err(sleepErr).Msg("Bulk API request failed")
 				}
 				continue
 			}
-			fatal().
+			fatal(ctx).
 				Int("status_code", res.StatusCode).
 				Str("body", string(body)).
 				Msg("Bulk API request failed")
 		}
 
 		if attempt > 1 {
-			log.Info().
+			loggerFrom(ctx).Info().
 				Int("attempt", attempt).
 				Int("max_attempts", retryAttempts).
 				Float64("time_taken", duration.Seconds()).
@@ -3442,7 +3441,7 @@ func bulkInsert(
 
 	var parsed bulkResponse
 	if err := json.NewDecoder(res.Body).Decode(&parsed); err != nil {
-		fatal().Err(err).Msg("Unable to parse bulk response body")
+		fatal(ctx).Err(err).Msg("Unable to parse bulk response body")
 	}
 
 	failed := 0
@@ -3458,7 +3457,7 @@ func bulkInsert(
 						errorType = result.Error.Type
 						errorReason = result.Error.Reason
 					}
-					log.Error().
+					loggerFrom(ctx).Error().
 						Int("item", itemIdx).
 						Str("action", action).
 						Str("_index", result.Index).
@@ -3474,14 +3473,14 @@ func bulkInsert(
 	}
 
 	if failed > 0 && failed > logged {
-		log.Error().
+		loggerFrom(ctx).Error().
 			Int("failed_items", failed).
 			Int("logged_failures", logged).
 			Msg("Additional bulk item failures omitted from logs")
 	}
 
 	succeeded := len(batch) - failed
-	log.Debug().
+	loggerFrom(ctx).Debug().
 		Int("inserted", inserted).
 		Int("total", total).
 		Int("batch_size", len(batch)).

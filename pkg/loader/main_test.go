@@ -22,7 +22,6 @@ import (
 
 	"github.com/elastic/go-elasticsearch/v9"
 	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 )
 
 // TestDeleteManagedResourcesUsesNukePipelineRecovery verifies that declared
@@ -318,6 +317,7 @@ func TestDeletePipelinesUsesCallerContext(t *testing.T) {
 // caller's context during the Tasks API poll wait stops the loop immediately
 // instead of continuing to poll until the task completes.
 func TestExecuteEnrichPolicyCancellationStopsPolling(t *testing.T) {
+	// Not parallel: swaps sleepWithContext.
 	ctx, cancel := context.WithCancel(context.Background())
 
 	previousSleep := sleepWithContext
@@ -381,7 +381,7 @@ func TestExecuteEnrichPolicyCancellationStopsPolling(t *testing.T) {
 // across runs; a pointer receiver or in-place map/slice edit would leak
 // defaults (URL, BatchSize, INDEX template variable) back to them.
 func TestRunDoesNotMutateCallerOptions(t *testing.T) {
-	// Not parallel: Run swaps the package-global zerolog logger.
+	t.Parallel()
 	replicas := 3
 	tests := []struct {
 		name string
@@ -423,6 +423,7 @@ func TestRunDoesNotMutateCallerOptions(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			want := tt.opts
 			want.TemplateVariables = maps.Clone(tt.opts.TemplateVariables)
 			want.Enrich.Policies = slices.Clone(tt.opts.Enrich.Policies)
@@ -563,18 +564,15 @@ func TestEnrichPollInterval(t *testing.T) {
 
 // TestRunWarningLogIncludesTimestamp verifies behavior for the related scenario.
 func TestRunWarningLogIncludesTimestamp(t *testing.T) {
-	previousLogger := log.Logger
-	previousLevel := zerolog.GlobalLevel()
-	t.Cleanup(func() {
-		log.Logger = previousLogger
-		zerolog.SetGlobalLevel(previousLevel)
-	})
+	t.Parallel()
 
+	// Run decorates injected loggers with a timestamp too; a missing one would
+	// render as "<nil>" in console output.
 	var output bytes.Buffer
-	log.Logger = zerolog.New(zerolog.ConsoleWriter{Out: &output})
-	zerolog.SetGlobalLevel(zerolog.TraceLevel)
+	capture := zerolog.New(zerolog.ConsoleWriter{Out: &output}).Level(zerolog.TraceLevel)
 
 	_, err := Run(context.Background(), Options{
+		Logger:   &capture,
 		URL:      "http://127.0.0.1:1",
 		Index:    "cards",
 		KeepLast: 1,
@@ -609,7 +607,7 @@ func TestReadNamedDefinitionsPreservesFileOrderWithReverseInput(t *testing.T) {
 		t.Fatalf("Close returned error: %v", err)
 	}
 
-	definitions, names := readNamedDefinitions(tmp.Name(), "pipeline", nil)
+	definitions, names := readNamedDefinitions(t.Context(), tmp.Name(), "pipeline", nil)
 
 	if want := []string{"pipeline-b", "pipeline-a"}; !reflect.DeepEqual(names, want) {
 		t.Fatalf("names mismatch: got %v want %v", names, want)
@@ -631,7 +629,7 @@ func TestBuildCreateIndexBodySupportsWrappedAndRawSections(t *testing.T) {
 	wrappedSettings := writeTempJSON(t, tempDir, `{"settings":{"index.default_pipeline":"wrapped-pipeline"}}`)
 	rawMappings := writeTempJSON(t, tempDir, `{"properties":{"lookup_id":{"type":"keyword"}}}`)
 
-	body := buildCreateIndexBody(nil, nil, wrappedSettings, rawMappings, "ignored-default", buildTemplateVariables("runtime-index", nil))
+	body := buildCreateIndexBody(t.Context(), nil, nil, wrappedSettings, rawMappings, "ignored-default", buildTemplateVariables("runtime-index", nil))
 
 	var parsed map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
@@ -684,7 +682,7 @@ func TestReadNamedDefinitionsExpandsIndexVariable(t *testing.T) {
 	tempDir := t.TempDir()
 	path := writeTempJSON(t, tempDir, `{"policy-a":{"match":{"indices":"${INDEX}"}}}`)
 
-	definitions, names := readNamedDefinitions(path, "policy", buildTemplateVariables("runtime-index", nil))
+	definitions, names := readNamedDefinitions(t.Context(), path, "policy", buildTemplateVariables("runtime-index", nil))
 
 	if want := []string{"policy-a"}; !reflect.DeepEqual(names, want) {
 		t.Fatalf("names mismatch: got %v want %v", names, want)
@@ -816,8 +814,9 @@ func templateRunRecorder(t *testing.T) (*httptest.Server, func() []string) {
 // TestUnresolvedTemplateVariableFailsRunBeforeClusterChanges guards the
 // fail-before-delete decision: settings and mappings are otherwise templated
 // only at index-create time, after -delete, so without the preflight a typo
-// would leave the cluster half-reset. Not parallel: Run swaps the global logger.
+// would leave the cluster half-reset.
 func TestUnresolvedTemplateVariableFailsRunBeforeClusterChanges(t *testing.T) {
+	t.Parallel()
 	const typoJSON = `{"v":"${TYPO_%s}"}`
 
 	tests := []struct {
@@ -838,6 +837,7 @@ func TestUnresolvedTemplateVariableFailsRunBeforeClusterChanges(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			server, requests := templateRunRecorder(t)
 			dir := t.TempDir()
 			opts := Options{
@@ -893,6 +893,8 @@ func TestUnresolvedTemplateVariableFailsRunBeforeClusterChanges(t *testing.T) {
 // variable from Options.TemplateVariables passes validation and the resolved
 // name reaches Elasticsearch.
 func TestSuppliedTemplateVariablesResolveThroughRun(t *testing.T) {
+	t.Parallel()
+
 	server, requests := templateRunRecorder(t)
 	dir := t.TempDir()
 	pipelines := writeTempJSON(t, dir, `{"${PIPE_NAME}":{"processors":[]}}`)
@@ -915,6 +917,8 @@ func TestSuppliedTemplateVariablesResolveThroughRun(t *testing.T) {
 // TestMissingTemplateFileKeepsReadSiteClassification pins that the preflight
 // leaves a missing file to the existing read site and its error kind.
 func TestMissingTemplateFileKeepsReadSiteClassification(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name string
 		set  func(opts *Options, missing string)
@@ -928,6 +932,7 @@ func TestMissingTemplateFileKeepsReadSiteClassification(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			server, _ := templateRunRecorder(t)
 			dir := t.TempDir()
 			missing := filepath.Join(dir, "missing-"+tt.name+".json")
@@ -1022,7 +1027,7 @@ func TestResolveTransformsForSourceFiltersBySourceIndex(t *testing.T) {
 	}
 	names := []string{"collection-to-binder", "cards-to-something"}
 
-	selectedDefinitions, selectedNames, err := resolveTransformsForSource(definitions, names, "collection")
+	selectedDefinitions, selectedNames, err := resolveTransformsForSource(t.Context(), definitions, names, "collection")
 	if err != nil {
 		t.Fatalf("resolveTransformsForSource returned error: %v", err)
 	}
@@ -1047,7 +1052,7 @@ func TestResolveTransformsForSourceRejectsMissingSourceIndex(t *testing.T) {
 			"body": {"source":{"index":"collection"},"dest":{"index":"binder"}}
 		}`),
 	}
-	_, _, err := resolveTransformsForSource(definitions, []string{"bad-transform"}, "collection")
+	_, _, err := resolveTransformsForSource(t.Context(), definitions, []string{"bad-transform"}, "collection")
 	if err == nil {
 		t.Fatal("expected missing source_index error")
 	}
@@ -1062,7 +1067,7 @@ func TestResolveTransformsForSourceRejectsMissingBody(t *testing.T) {
 			"source_index": "collection"
 		}`),
 	}
-	_, _, err := resolveTransformsForSource(definitions, []string{"bad-transform"}, "collection")
+	_, _, err := resolveTransformsForSource(t.Context(), definitions, []string{"bad-transform"}, "collection")
 	if err == nil {
 		t.Fatal("expected missing body error")
 	}
@@ -1083,7 +1088,7 @@ func TestBuildMappingPreflightPlan(t *testing.T) {
 		}
 	}`)
 
-	plan, err := buildMappingPreflightPlan(path, nil)
+	plan, err := buildMappingPreflightPlan(t.Context(), path, nil)
 	if err != nil {
 		t.Fatalf("buildMappingPreflightPlan returned error: %v", err)
 	}
@@ -1133,7 +1138,7 @@ func TestVerifyMappingPreflight(t *testing.T) {
 			t.Fatalf("new elasticsearch client: %v", err)
 		}
 
-		if err := verifyMappingPreflight(es, "target-index", plan); err != nil {
+		if err := verifyMappingPreflight(t.Context(), es, "target-index", plan); err != nil {
 			t.Fatalf("verifyMappingPreflight returned error: %v", err)
 		}
 	})
@@ -1156,7 +1161,7 @@ func TestVerifyMappingPreflight(t *testing.T) {
 			t.Fatalf("new elasticsearch client: %v", err)
 		}
 
-		err = verifyMappingPreflight(es, "target-index", plan)
+		err = verifyMappingPreflight(t.Context(), es, "target-index", plan)
 		if err == nil {
 			t.Fatal("expected mapping preflight error")
 		}
@@ -1183,7 +1188,7 @@ func TestVerifyMappingPreflight(t *testing.T) {
 			t.Fatalf("new elasticsearch client: %v", err)
 		}
 
-		err = verifyMappingPreflight(es, "target-index", plan)
+		err = verifyMappingPreflight(t.Context(), es, "target-index", plan)
 		if err == nil {
 			t.Fatal("expected date_detection preflight error")
 		}
@@ -1229,7 +1234,7 @@ func TestVerifyMappingPreflightReportsEveryMismatchInFieldOrder(t *testing.T) {
 		`required mapping for field "gamma" is missing`
 
 	for attempt := 0; attempt < 20; attempt++ {
-		err := verifyMappingPreflight(es, "target-index", plan)
+		err := verifyMappingPreflight(t.Context(), es, "target-index", plan)
 		if err == nil {
 			t.Fatalf("attempt %d: expected mapping preflight error", attempt)
 		}
@@ -1326,7 +1331,7 @@ func TestVerifyMappingPreflightChecksEveryAliasTarget(t *testing.T) {
 
 			es := newMappingResponseClient(t, tt.requested, http.StatusOK, tt.body)
 			for attempt := 0; attempt < 20; attempt++ {
-				err := verifyMappingPreflight(es, tt.requested, plan)
+				err := verifyMappingPreflight(t.Context(), es, tt.requested, plan)
 				if tt.want == "" {
 					if err != nil {
 						t.Fatalf("attempt %d: unexpected error: %v", attempt, err)
@@ -1353,7 +1358,7 @@ func TestVerifyMappingPreflightChecksDateDetectionOnEveryAliasTarget(t *testing.
 	body := `{"cards-a":{"mappings":{"date_detection":false}},"cards-b":{"mappings":{"date_detection":true}}}`
 	es := newMappingResponseClient(t, "cards", http.StatusOK, body)
 
-	err := verifyMappingPreflight(es, "cards", plan)
+	err := verifyMappingPreflight(t.Context(), es, "cards", plan)
 	want := `alias "cards": index "cards-b" mappings do not match the mappings file: mappings.date_detection is true, expected false`
 	if err == nil || err.Error() != want {
 		t.Fatalf("got %v, want %s", err, want)
@@ -1393,7 +1398,7 @@ func TestFetchIndexMappingsRejectsMalformedResponses(t *testing.T) {
 				if err == nil || !strings.Contains(err.Error(), tt.want) {
 					t.Fatalf("attempt %d: fetchIndexMappings error = %v, want containing %q", attempt, err, tt.want)
 				}
-				err = verifyMappingPreflight(es, "cards", plan)
+				err = verifyMappingPreflight(t.Context(), es, "cards", plan)
 				if err == nil || !strings.Contains(err.Error(), tt.want) || strings.Contains(err.Error(), "do not match the mappings file") {
 					t.Fatalf("attempt %d: verifyMappingPreflight error = %v, want fetch failure containing %q", attempt, err, tt.want)
 				}
@@ -1432,7 +1437,7 @@ func TestFetchIndexMappingsRejectsMalformedResponses(t *testing.T) {
 			t.Fatalf("new elasticsearch client: %v", err)
 		}
 
-		err = verifyMappingPreflight(es, "cards", plan)
+		err = verifyMappingPreflight(t.Context(), es, "cards", plan)
 		if err == nil || !strings.Contains(err.Error(), `reading mappings response for index "cards"`) {
 			t.Fatalf("expected body read error, got %v", err)
 		}
@@ -1443,23 +1448,16 @@ func TestFetchIndexMappingsRejectsMalformedResponses(t *testing.T) {
 // noun rule for the passing-target log: an alias request logs both fields, a
 // concrete request logs only index.
 func TestVerifyMappingPreflightLogsAliasAndIndexFields(t *testing.T) {
-	// Not parallel: swaps the package-global zerolog logger.
-	previousLogger := log.Logger
-	previousLevel := zerolog.GlobalLevel()
-	t.Cleanup(func() {
-		log.Logger = previousLogger
-		zerolog.SetGlobalLevel(previousLevel)
-	})
-	zerolog.SetGlobalLevel(zerolog.TraceLevel)
+	t.Parallel()
 
 	plan := mappingPreflightPlan{RootFieldTypes: map[string]string{"lookup_id": "keyword"}}
 	const good = `{"mappings":{"properties":{"lookup_id":{"type":"keyword"}}}}`
 
 	capture := func(requested, body string) []map[string]any {
 		var output bytes.Buffer
-		log.Logger = zerolog.New(&output)
+		logger := zerolog.New(&output).Level(zerolog.TraceLevel)
 		es := newMappingResponseClient(t, requested, http.StatusOK, body)
-		if err := verifyMappingPreflight(es, requested, plan); err != nil {
+		if err := verifyMappingPreflight(withRunLogger(t.Context(), &logger), es, requested, plan); err != nil {
 			t.Fatalf("verifyMappingPreflight returned error: %v", err)
 		}
 		var entries []map[string]any
@@ -1550,7 +1548,7 @@ func assertOperationOrder(t *testing.T, ops []string, ordered ...string) {
 // managed resources) behind a failed run. A mapping fetch failure must stop
 // the run at the same point.
 func TestRunExistingIndexMappingMismatchFailsBeforeMutation(t *testing.T) {
-	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
+	t.Parallel()
 
 	fixtures := writePreflightRunFixtures(t)
 	divergentFields := []string{"pipeline_version", "new_mapping_only_field"}
@@ -1620,6 +1618,7 @@ func TestRunExistingIndexMappingMismatchFailsBeforeMutation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			stub := newPreflightRunStub(t, tt.stub)
 			opts := tt.opts
 			opts.URL = stub.url
@@ -1664,7 +1663,7 @@ func TestRunExistingIndexMappingMismatchFailsBeforeMutation(t *testing.T) {
 // empties every target, so verifying only one would let a stale sibling be
 // emptied (FIX-ALIASPRE-01, spec AC 7, 8 and 10).
 func TestRunAliasFlushFailsWhenAnyTargetMappingMismatches(t *testing.T) {
-	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
+	t.Parallel()
 
 	fixtures := writePreflightRunFixtures(t)
 	stub := newPreflightRunStub(t, preflightStubConfig{
@@ -1708,7 +1707,7 @@ func TestRunAliasFlushFailsWhenAnyTargetMappingMismatches(t *testing.T) {
 // any of those paths fails the single-check count. A run with no -mappings file
 // has no expectations and must not fetch mappings at all.
 func TestRunExistingIndexVerifiesMappingsBeforeFlush(t *testing.T) {
-	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
+	t.Parallel()
 
 	fixtures := writePreflightRunFixtures(t)
 
@@ -1729,6 +1728,7 @@ func TestRunExistingIndexVerifiesMappingsBeforeFlush(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			stub := newPreflightRunStub(t, tt.stub)
 			opts := tt.opts
 			opts.URL = stub.url
@@ -1767,7 +1767,7 @@ func TestRunExistingIndexVerifiesMappingsBeforeFlush(t *testing.T) {
 // the create and before bulk, against the concrete index that was created. In
 // alias mode that is the new timestamped index, not the alias name.
 func TestRunCreatedIndexVerifiesMappingsOnceAfterCreate(t *testing.T) {
-	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
+	t.Parallel()
 
 	fixtures := writePreflightRunFixtures(t)
 
@@ -1786,6 +1786,7 @@ func TestRunCreatedIndexVerifiesMappingsOnceAfterCreate(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			cfg := tt.stub
 			cfg.liveMappings = preflightLiveMappings
 			stub := newPreflightRunStub(t, cfg)
@@ -1829,7 +1830,7 @@ func TestRunCreatedIndexVerifiesMappingsOnceAfterCreate(t *testing.T) {
 // parsed before -nuke and the data action, so a malformed file fails the run
 // before any index is deleted.
 func TestRunMalformedMappingsFailsBeforeDelete(t *testing.T) {
-	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
+	t.Parallel()
 
 	fixtures := writePreflightRunFixtures(t)
 
@@ -1843,6 +1844,7 @@ func TestRunMalformedMappingsFailsBeforeDelete(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			stub := newPreflightRunStub(t, preflightStubConfig{indexExists: true, liveMappings: preflightLiveMappings})
 			opts := tt.opts
 			opts.URL = stub.url
@@ -1870,7 +1872,7 @@ func TestRunMalformedMappingsFailsBeforeDelete(t *testing.T) {
 
 // TestRunStartsTransformsAfterEnrichExecution verifies behavior for the related scenario.
 func TestRunStartsTransformsAfterEnrichExecution(t *testing.T) {
-	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
+	t.Parallel()
 
 	var (
 		mu         sync.Mutex
@@ -1995,7 +1997,7 @@ func TestRunStartsTransformsAfterEnrichExecution(t *testing.T) {
 
 // TestRunAliasFirstCreateUpsertsTransformsAfterAliasUpdate verifies behavior for the related scenario.
 func TestRunAliasFirstCreateUpsertsTransformsAfterAliasUpdate(t *testing.T) {
-	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
+	t.Parallel()
 
 	var (
 		mu           sync.Mutex
@@ -2129,7 +2131,7 @@ func TestRunAliasFirstCreateUpsertsTransformsAfterAliasUpdate(t *testing.T) {
 
 // TestRunNDJSONAliasFirstCreateUpsertsTransformsAfterAliasUpdate verifies behavior for the related scenario.
 func TestRunNDJSONAliasFirstCreateUpsertsTransformsAfterAliasUpdate(t *testing.T) {
-	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
+	t.Parallel()
 
 	var (
 		mu           sync.Mutex
@@ -2263,7 +2265,7 @@ func TestRunNDJSONAliasFirstCreateUpsertsTransformsAfterAliasUpdate(t *testing.T
 
 // TestRunNonAliasCreateUpsertsTransformsAfterBulkLoad verifies behavior for the related scenario.
 func TestRunNonAliasCreateUpsertsTransformsAfterBulkLoad(t *testing.T) {
-	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
+	t.Parallel()
 
 	var (
 		mu         sync.Mutex
@@ -2377,7 +2379,7 @@ func TestRunNonAliasCreateUpsertsTransformsAfterBulkLoad(t *testing.T) {
 
 // TestRunNDJSONNonAliasCreateUpsertsTransformsAfterBulkLoad verifies behavior for the related scenario.
 func TestRunNDJSONNonAliasCreateUpsertsTransformsAfterBulkLoad(t *testing.T) {
-	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
+	t.Parallel()
 
 	var (
 		mu         sync.Mutex
@@ -2493,7 +2495,7 @@ func TestRunNDJSONNonAliasCreateUpsertsTransformsAfterBulkLoad(t *testing.T) {
 // against the write index before any batch transform is started, preventing the
 // ES refresh-window race where a transform reads 0 docs from an unrefreshed index.
 func TestRunRefreshesIndexBeforeStartingTransforms(t *testing.T) {
-	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
+	t.Parallel()
 
 	var (
 		mu         sync.Mutex
@@ -2609,7 +2611,7 @@ func TestRunRefreshesIndexBeforeStartingTransforms(t *testing.T) {
 
 // TestRunCreatesPipelinesBeforeIndexWhenDefaultPipelineIsConfigured verifies behavior for the related scenario.
 func TestRunCreatesPipelinesBeforeIndexWhenDefaultPipelineIsConfigured(t *testing.T) {
-	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
+	t.Parallel()
 
 	var (
 		mu         sync.Mutex
@@ -2762,12 +2764,12 @@ func TestFlushAndCheckValidatesDeleteByQueryResponse(t *testing.T) {
 			}
 
 			if !tt.wantErr {
-				flushAndCheck(es, "cards")
+				flushAndCheck(t.Context(), es, "cards")
 				return
 			}
 
 			runErr := recoverRunError(t, func() {
-				flushAndCheck(es, "cards")
+				flushAndCheck(t.Context(), es, "cards")
 			})
 			if runErr.Kind != ErrIndexOperation {
 				t.Fatalf("error kind mismatch: got %v want %v", runErr.Kind, ErrIndexOperation)
@@ -2820,7 +2822,7 @@ func TestBulkInsertRejectsUnsupportedDocumentBeforeRequest(t *testing.T) {
 
 // TestRunRetriesBulkOnRetryableStatus verifies behavior for the related scenario.
 func TestRunRetriesBulkOnRetryableStatus(t *testing.T) {
-	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
+	t.Parallel()
 
 	var bulkAttempts int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2862,7 +2864,7 @@ func TestRunRetriesBulkOnRetryableStatus(t *testing.T) {
 
 // TestRunNDJSONRetriesBulkOnRetryableStatus verifies behavior for the related scenario.
 func TestRunNDJSONRetriesBulkOnRetryableStatus(t *testing.T) {
-	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
+	t.Parallel()
 
 	var bulkAttempts int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2904,7 +2906,7 @@ func TestRunNDJSONRetriesBulkOnRetryableStatus(t *testing.T) {
 
 // TestRunRetriesBulkOnTransportFailure verifies behavior for the related scenario.
 func TestRunRetriesBulkOnTransportFailure(t *testing.T) {
-	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
+	t.Parallel()
 
 	var bulkAttempts int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2953,7 +2955,7 @@ func TestRunRetriesBulkOnTransportFailure(t *testing.T) {
 
 // TestRunNDJSONRetriesBulkOnTransportFailure verifies behavior for the related scenario.
 func TestRunNDJSONRetriesBulkOnTransportFailure(t *testing.T) {
-	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
+	t.Parallel()
 
 	var bulkAttempts int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3002,7 +3004,7 @@ func TestRunNDJSONRetriesBulkOnTransportFailure(t *testing.T) {
 
 // TestRunDoesNotRetryBulkOnBadRequest verifies behavior for the related scenario.
 func TestRunDoesNotRetryBulkOnBadRequest(t *testing.T) {
-	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
+	t.Parallel()
 
 	var bulkAttempts int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3039,7 +3041,7 @@ func TestRunDoesNotRetryBulkOnBadRequest(t *testing.T) {
 
 // TestRunNDJSONDoesNotRetryBulkOnBadRequest verifies behavior for the related scenario.
 func TestRunNDJSONDoesNotRetryBulkOnBadRequest(t *testing.T) {
-	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
+	t.Parallel()
 
 	var bulkAttempts int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3076,7 +3078,7 @@ func TestRunNDJSONDoesNotRetryBulkOnBadRequest(t *testing.T) {
 
 // TestRunExhaustsRetriesOnRetryableStatus verifies behavior for the related scenario.
 func TestRunExhaustsRetriesOnRetryableStatus(t *testing.T) {
-	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
+	t.Parallel()
 
 	var bulkAttempts int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3114,7 +3116,7 @@ func TestRunExhaustsRetriesOnRetryableStatus(t *testing.T) {
 
 // TestRunNDJSONExhaustsRetriesOnRetryableStatus verifies behavior for the related scenario.
 func TestRunNDJSONExhaustsRetriesOnRetryableStatus(t *testing.T) {
-	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
+	t.Parallel()
 
 	var bulkAttempts int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3152,6 +3154,7 @@ func TestRunNDJSONExhaustsRetriesOnRetryableStatus(t *testing.T) {
 
 // TestRunRetryBackoffCapsAtConfiguredMax verifies behavior for the related scenario.
 func TestRunRetryBackoffCapsAtConfiguredMax(t *testing.T) {
+	// Not parallel: swaps sleepWithContext.
 	previousSleep := sleepWithContext
 	sleeps := make([]time.Duration, 0, 3)
 	sleepWithContext = func(_ context.Context, d time.Duration) error {
@@ -3204,6 +3207,7 @@ func TestRunRetryBackoffCapsAtConfiguredMax(t *testing.T) {
 
 // TestRunNDJSONRetryBackoffCapsAtConfiguredMax verifies behavior for the related scenario.
 func TestRunNDJSONRetryBackoffCapsAtConfiguredMax(t *testing.T) {
+	// Not parallel: swaps sleepWithContext.
 	previousSleep := sleepWithContext
 	sleeps := make([]time.Duration, 0, 3)
 	sleepWithContext = func(_ context.Context, d time.Duration) error {
@@ -3381,7 +3385,7 @@ func TestCountNDJSONLines(t *testing.T) {
 
 // TestLoadNDJSONProducesCorrectDocuments verifies behavior for the related scenario.
 func TestLoadNDJSONProducesCorrectDocuments(t *testing.T) {
-	// Not parallel: Run swaps the package-global zerolog logger, so concurrent Runs race.
+	t.Parallel()
 
 	type bulkLine struct {
 		Index map[string]string `json:"index"`
@@ -3807,7 +3811,7 @@ func TestNextAvailableTimestampedIndexNameWithCheck(t *testing.T) {
 		"cards-20260319130500": {},
 	}
 
-	got, err := nextAvailableTimestampedIndexNameWithCheck("cards", base, func(candidate string) (bool, error) {
+	got, err := nextAvailableTimestampedIndexNameWithCheck(t.Context(), "cards", base, func(candidate string) (bool, error) {
 		_, exists := collisions[candidate]
 		return exists, nil
 	})
@@ -3824,7 +3828,7 @@ func TestNextAvailableTimestampedIndexNameWithCheck(t *testing.T) {
 func TestNextAvailableTimestampedIndexNameWithCheckPropagatesErrors(t *testing.T) {
 	t.Parallel()
 
-	_, err := nextAvailableTimestampedIndexNameWithCheck("cards", time.Date(2026, time.March, 19, 13, 4, 59, 0, time.UTC), func(candidate string) (bool, error) {
+	_, err := nextAvailableTimestampedIndexNameWithCheck(t.Context(), "cards", time.Date(2026, time.March, 19, 13, 4, 59, 0, time.UTC), func(candidate string) (bool, error) {
 		return false, os.ErrPermission
 	})
 	if err == nil {
@@ -3835,14 +3839,13 @@ func TestNextAvailableTimestampedIndexNameWithCheckPropagatesErrors(t *testing.T
 // TestNextAvailableTimestampedIndexNameWithCheckStopsAtCollisionLimit verifies
 // that the collision search performs no more than the documented number of checks.
 func TestNextAvailableTimestampedIndexNameWithCheckStopsAtCollisionLimit(t *testing.T) {
-	previousLogger := log.Logger
-	log.Logger = zerolog.Nop()
-	t.Cleanup(func() {
-		log.Logger = previousLogger
-	})
+	t.Parallel()
+
+	nop := zerolog.Nop()
+	ctx := withRunLogger(t.Context(), &nop)
 
 	checks := 0
-	_, err := nextAvailableTimestampedIndexNameWithCheck("cards", time.Date(2026, time.March, 19, 13, 4, 59, 0, time.UTC), func(candidate string) (bool, error) {
+	_, err := nextAvailableTimestampedIndexNameWithCheck(ctx, "cards", time.Date(2026, time.March, 19, 13, 4, 59, 0, time.UTC), func(candidate string) (bool, error) {
 		checks++
 		return true, nil
 	})
@@ -3859,7 +3862,7 @@ func TestManagedPolicyNameIsStableAndShortHashed(t *testing.T) {
 	t.Parallel()
 
 	definition := json.RawMessage(`{"match":{"indices":"cards","match_field":"lookup_id","enrich_fields":["name"]}}`)
-	got := managedPolicyName("cards-by-id", definition)
+	got := managedPolicyName(t.Context(), "cards-by-id", definition)
 	if !managedPolicyNameMatchesLogical("cards-by-id", got) {
 		t.Fatalf("expected managed policy name format logical-<6hex>, got %q", got)
 	}
@@ -3879,7 +3882,7 @@ func TestRewritePipelinePolicyReferences(t *testing.T) {
 			]
 		}`),
 	}
-	rewritten := rewritePipelinePolicyReferences(definitions, []string{"pipeline-a"}, map[string]string{
+	rewritten := rewritePipelinePolicyReferences(t.Context(), definitions, []string{"pipeline-a"}, map[string]string{
 		"cards-by-id": "cards-by-id-a1b2c3",
 	})
 
@@ -3909,7 +3912,7 @@ func TestRemapEnrichSelectionMapsLogicalNames(t *testing.T) {
 	t.Parallel()
 
 	enrich := &enrichFlagValue{enabled: true, raw: "cards-by-id,missing"}
-	remapped := remapEnrichSelection(enrich, map[string]string{
+	remapped := remapEnrichSelection(t.Context(), enrich, map[string]string{
 		"cards-by-id": "cards-by-id-a1b2c3",
 	})
 	if remapped == nil {
