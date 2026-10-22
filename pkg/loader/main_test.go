@@ -682,20 +682,259 @@ func TestReadNamedDefinitionsExpandsIndexVariable(t *testing.T) {
 	}
 }
 
-// TestReadTemplatedFileLeavesUnknownVariablesUntouched verifies behavior for the related scenario.
-func TestReadTemplatedFileLeavesUnknownVariablesUntouched(t *testing.T) {
+// TestReadTemplatedFileRejectsUnresolvedVariables replaces the old passthrough
+// contract: an unresolved ${NAME} must fail instead of reaching Elasticsearch
+// as a literal that the cluster would accept as valid configuration.
+func TestReadTemplatedFileRejectsUnresolvedVariables(t *testing.T) {
 	t.Parallel()
 
-	tempDir := t.TempDir()
-	path := writeTempJSON(t, tempDir, `{"value":"${UNKNOWN_VAR}"}`)
+	path := writeTempJSON(t, t.TempDir(), `{"value":"${UNKNOWN_VAR}"}`)
 
 	content, err := readTemplatedFile(path, buildTemplateVariables("runtime-index", nil))
-	if err != nil {
-		t.Fatalf("readTemplatedFile returned error: %v", err)
+	if content != nil {
+		t.Fatalf("content = %q, want nil on unresolved variable", content)
+	}
+	var unresolved *unresolvedTemplateError
+	if !errors.As(err, &unresolved) {
+		t.Fatalf("err = %v, want *unresolvedTemplateError", err)
+	}
+	if unresolved.Path != path || !slices.Equal(unresolved.Names, []string{"UNKNOWN_VAR"}) {
+		t.Fatalf("error mismatch: path=%q names=%v", unresolved.Path, unresolved.Names)
+	}
+}
+
+// TestExpandTemplate pins resolution order and one-pass expansion.
+// Not parallel: t.Setenv forbids t.Parallel.
+func TestExpandTemplate(t *testing.T) {
+	t.Setenv("TMPL_ENV_ONLY", "from-env")
+	t.Setenv("TMPL_BOTH", "env-value")
+	t.Setenv("TMPL_ENV_EMPTY", "")
+	t.Setenv("TMPL_MAP_EMPTY", "env-value")
+	t.Setenv("HOME", "/should-not-appear")
+
+	tests := []struct {
+		name      string
+		input     string
+		variables templateVariables
+		want      string
+		wantNames []string
+	}{
+		{"map hit", `${A}`, templateVariables{"A": "1"}, "1", nil},
+		{"env hit", `${TMPL_ENV_ONLY}`, nil, "from-env", nil},
+		{"unresolved", `x${TMPL_NOPE_1}y`, nil, `x${TMPL_NOPE_1}y`, []string{"TMPL_NOPE_1"}},
+		{"several unresolved sorted and deduplicated", `${TMPL_NOPE_B}${TMPL_NOPE_A}${TMPL_NOPE_B}`, nil,
+			`${TMPL_NOPE_B}${TMPL_NOPE_A}${TMPL_NOPE_B}`, []string{"TMPL_NOPE_A", "TMPL_NOPE_B"}},
+		{"no variables", `plain text`, nil, "plain text", nil},
+		{"map beats env", `${TMPL_BOTH}`, templateVariables{"TMPL_BOTH": "map-value"}, "map-value", nil},
+		{"empty map value beats env", `${TMPL_MAP_EMPTY}`, templateVariables{"TMPL_MAP_EMPTY": ""}, "", nil},
+		{"empty env value resolves", `a${TMPL_ENV_EMPTY}b`, nil, "ab", nil},
+		{"replacement is not rescanned", `${A}`, templateVariables{"A": "${B}", "B": "no"}, "${B}", nil},
+		{"bare dollar and CRLF survive", "$HOME\r\n$5.00\r\n", nil, "$HOME\r\n$5.00\r\n", nil},
 	}
 
-	if got := string(content); got != `{"value":"${UNKNOWN_VAR}"}` {
-		t.Fatalf("content mismatch: got %q want %q", got, `{"value":"${UNKNOWN_VAR}"}`)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, names := expandTemplate(tt.input, tt.variables)
+			if got != tt.want {
+				t.Fatalf("expanded = %q, want %q", got, tt.want)
+			}
+			if !slices.Equal(names, tt.wantNames) {
+				t.Fatalf("unresolved = %v, want %v", names, tt.wantNames)
+			}
+		})
+	}
+}
+
+// TestPreflightTemplateFilesSkipsUnreadablePaths guards that an empty or
+// missing path neither errors here (the read sites own that classification)
+// nor hides unresolved names in the paths after it.
+func TestPreflightTemplateFilesSkipsUnreadablePaths(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "missing.json")
+	bad := writeTempJSON(t, dir, `{"v":"${PREFLIGHT_TYPO}"}`)
+	good := writeTempJSON(t, dir, `{"v":"${INDEX}"}`)
+	variables := buildTemplateVariables("idx", nil)
+
+	if err := preflightTemplateFiles(variables, "", missing, good); err != nil {
+		t.Fatalf("preflight with only missing/resolved paths returned %v", err)
+	}
+
+	err := preflightTemplateFiles(variables, missing, bad)
+	if !errors.Is(err, ErrInvalidOptions) {
+		t.Fatalf("err = %v, want ErrInvalidOptions", err)
+	}
+	if !strings.Contains(err.Error(), "${PREFLIGHT_TYPO}") || !strings.Contains(err.Error(), bad) {
+		t.Fatalf("error does not name variable and file: %v", err)
+	}
+}
+
+// templateRunRecorder is a catch-all Elasticsearch stub that records every
+// request, so tests can prove nothing reached the cluster.
+func templateRunRecorder(t *testing.T) (*httptest.Server, func() []string) {
+	t.Helper()
+
+	var (
+		mu       sync.Mutex
+		requests []string
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		mu.Unlock()
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(server.Close)
+
+	return server, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(requests)
+	}
+}
+
+// TestUnresolvedTemplateVariableFailsRunBeforeClusterChanges guards the
+// fail-before-delete decision: settings and mappings are otherwise templated
+// only at index-create time, after -delete, so without the preflight a typo
+// would leave the cluster half-reset. Not parallel: Run swaps the global logger.
+func TestUnresolvedTemplateVariableFailsRunBeforeClusterChanges(t *testing.T) {
+	const typoJSON = `{"v":"${TYPO_%s}"}`
+
+	tests := []struct {
+		name  string
+		files map[string]string // Options field -> file content
+		names []string
+	}{
+		{"settings", map[string]string{"settings": fmt.Sprintf(typoJSON, "S")}, []string{"${TYPO_S}"}},
+		{"mappings", map[string]string{"mappings": fmt.Sprintf(typoJSON, "M")}, []string{"${TYPO_M}"}},
+		{"pipelines", map[string]string{"pipelines": fmt.Sprintf(typoJSON, "P")}, []string{"${TYPO_P}"}},
+		{"policies", map[string]string{"policies": fmt.Sprintf(typoJSON, "L")}, []string{"${TYPO_L}"}},
+		{"transforms", map[string]string{"transforms": fmt.Sprintf(typoJSON, "T")}, []string{"${TYPO_T}"}},
+		{"settings and pipelines together", map[string]string{
+			"settings":  fmt.Sprintf(typoJSON, "A"),
+			"pipelines": fmt.Sprintf(typoJSON, "B"),
+		}, []string{"${TYPO_A}", "${TYPO_B}"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server, requests := templateRunRecorder(t)
+			dir := t.TempDir()
+			opts := Options{
+				URL:         server.URL,
+				Index:       "products",
+				DeleteIndex: true,
+				SyncManaged: true,
+				DataFile:    writeTempJSON(t, dir, `{"id":"1"}`),
+			}
+			wantPaths := []string{}
+			for field, content := range tt.files {
+				path := filepath.Join(dir, field+".json")
+				if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+					t.Fatalf("WriteFile returned error: %v", err)
+				}
+				wantPaths = append(wantPaths, path)
+				switch field {
+				case "settings":
+					opts.SettingsFile = path
+				case "mappings":
+					opts.MappingsFile = path
+				case "pipelines":
+					opts.PipelinesFile = path
+				case "policies":
+					opts.PoliciesFile = path
+				case "transforms":
+					opts.TransformsFile = path
+				}
+			}
+
+			_, err := Run(t.Context(), opts)
+			if !errors.Is(err, ErrInvalidOptions) {
+				t.Fatalf("err = %v, want ErrInvalidOptions", err)
+			}
+			for _, want := range append(tt.names, wantPaths...) {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %q does not contain %q", err.Error(), want)
+				}
+			}
+			// Files are reported in argument order (settings before pipelines),
+			// not map or filesystem order.
+			if len(tt.names) > 1 && strings.Index(err.Error(), tt.names[0]) > strings.Index(err.Error(), tt.names[1]) {
+				t.Fatalf("error %q lists %q after %q, want argument order", err.Error(), tt.names[0], tt.names[1])
+			}
+			if got := requests(); len(got) != 0 {
+				t.Fatalf("requests reached the cluster before the error: %v", got)
+			}
+		})
+	}
+}
+
+// TestSuppliedTemplateVariablesResolveThroughRun is the positive twin: a
+// variable from Options.TemplateVariables passes validation and the resolved
+// name reaches Elasticsearch.
+func TestSuppliedTemplateVariablesResolveThroughRun(t *testing.T) {
+	server, requests := templateRunRecorder(t)
+	dir := t.TempDir()
+	pipelines := writeTempJSON(t, dir, `{"${PIPE_NAME}":{"processors":[]}}`)
+
+	_, err := Run(t.Context(), Options{
+		URL:               server.URL,
+		Index:             "products",
+		SyncManaged:       true,
+		PipelinesFile:     pipelines,
+		TemplateVariables: map[string]string{"PIPE_NAME": "p1"},
+	})
+	if errors.Is(err, ErrInvalidOptions) {
+		t.Fatalf("supplied variable failed validation: %v", err)
+	}
+	if !slices.Contains(requests(), "PUT /_ingest/pipeline/p1") {
+		t.Fatalf("PUT /_ingest/pipeline/p1 not seen; requests = %v (err = %v)", requests(), err)
+	}
+}
+
+// TestMissingTemplateFileKeepsReadSiteClassification pins that the preflight
+// leaves a missing file to the existing read site and its error kind.
+func TestMissingTemplateFileKeepsReadSiteClassification(t *testing.T) {
+	tests := []struct {
+		name string
+		set  func(opts *Options, missing string)
+	}{
+		{"settings", func(o *Options, p string) { o.SettingsFile = p }},
+		{"mappings", func(o *Options, p string) { o.MappingsFile = p }},
+		{"pipelines", func(o *Options, p string) { o.PipelinesFile = p }},
+		{"policies", func(o *Options, p string) { o.PoliciesFile = p }},
+		{"transforms", func(o *Options, p string) { o.TransformsFile = p }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server, _ := templateRunRecorder(t)
+			dir := t.TempDir()
+			missing := filepath.Join(dir, "missing-"+tt.name+".json")
+
+			opts := Options{
+				URL:         server.URL,
+				Index:       "products",
+				DeleteIndex: true,
+				SyncManaged: true,
+				DataFile:    writeTempJSON(t, dir, `{"id":"1"}`),
+			}
+			tt.set(&opts, missing)
+
+			_, err := Run(t.Context(), opts)
+			if err == nil {
+				t.Fatalf("expected an error for a missing %s file", tt.name)
+			}
+			if errors.Is(err, ErrInvalidOptions) {
+				t.Fatalf("err = %v: a missing file must not be reclassified as ErrInvalidOptions by the template preflight", err)
+			}
+			if !strings.Contains(err.Error(), missing) && tt.name != "settings" && tt.name != "mappings" {
+				t.Fatalf("err = %v, want it to name %s", err, missing)
+			}
+		})
 	}
 }
 

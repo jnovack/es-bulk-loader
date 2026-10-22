@@ -463,6 +463,13 @@ enabled), and other `${NAME}` placeholders fall back to environment variables
 when present. Only the braced `${NAME}` form is expanded; a bare `$NAME` (for
 example `$HOME`) is left verbatim.
 
+A `${NAME}` found in neither `Options.TemplateVariables` nor the environment is
+invalid input: the run fails with `loader.ErrInvalidOptions` before any cluster
+change, and the error lists every unresolved name per file. This applies to
+every supplied template file (settings, mappings, pipelines, policies and
+transforms), including one this run would not otherwise read, so a typo in an
+unused `-settings` file still fails a `-sync-managed`-only run.
+
 ## JSON Formats
 
 ### `data.json`

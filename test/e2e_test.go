@@ -184,6 +184,13 @@ func TestEndToEndScenarios(t *testing.T) {
 			checks: "fails before flush and managed upserts; names every divergent field; documents and managed resources untouched",
 			run:    scenarioFlushSyncManagedDivergentMappingsFails,
 		},
+		{
+			// Appended last: the slice index sets each scenario's e2e-NN prefix.
+			name:   "unresolved_template_variable_fails_safely",
+			flags:  "-delete",
+			checks: "unresolved ${VAR} in settings fails before -delete; names the variable; index and documents untouched",
+			run:    scenarioUnresolvedTemplateVariableFailsSafely,
+		},
 	}
 
 	for i, sc := range scenarios {
@@ -459,6 +466,39 @@ func scenarioFlushSyncManagedDivergentMappingsFails(t *testing.T, ctx *scenarioC
 	assertPolicyMissing(t, ctx, ctx.altSourcePolicy)
 	assertPipelineExists(t, ctx, ctx.sourcePipelinePrimary)
 	assertEqual(t, pipelineDefinition(t, ctx, ctx.sourcePipelinePrimary), sourcePipelineBefore)
+}
+
+// scenarioUnresolvedTemplateVariableFailsSafely guards that a typo in a config
+// file fails the run before -delete removes the index, rather than leaving the
+// cluster half-reset.
+func scenarioUnresolvedTemplateVariableFailsSafely(t *testing.T, ctx *scenarioContext) {
+	// The negative case must not depend on the host shell: t.Setenv restores
+	// the original value on cleanup, then the variable is removed for the child.
+	t.Setenv("NOT_SET_ANYWHERE", "")
+	if err := os.Unsetenv("NOT_SET_ANYWHERE"); err != nil {
+		t.Fatalf("unset NOT_SET_ANYWHERE: %v", err)
+	}
+
+	mustSucceed(t, runLoader(t, ctx, nil, sourceArgs(ctx, ctx.sourceBaseDir, "-delete", true, false, "")))
+	assertDocCount(t, ctx, ctx.sourceIndex, 2)
+
+	unresolvedDir := filepath.Join(filepath.Dir(ctx.sourceBaseDir), "source-unresolved")
+	files := map[string]string{}
+	for _, name := range []string{"mappings.json", "pipelines.json", "policies.json", "data.json"} {
+		content, err := os.ReadFile(filepath.Join(ctx.sourceBaseDir, name))
+		if err != nil {
+			t.Fatalf("read base fixture %s: %v", name, err)
+		}
+		files[name] = strings.TrimSpace(string(content))
+	}
+	files["settings.json"] = `{"settings":{"index":{"refresh_interval":"${NOT_SET_ANYWHERE}"}}}`
+	writeFixtureDir(t, unresolvedDir, files)
+
+	result := runLoader(t, ctx, nil, sourceArgs(ctx, unresolvedDir, "-delete", true, false, ""))
+	mustFailWith(t, result, "${NOT_SET_ANYWHERE}")
+
+	assertIndexExists(t, ctx, ctx.sourceIndex)
+	assertDocCount(t, ctx, ctx.sourceIndex, 2)
 }
 
 // ─── Environment and Fixture Setup ─────────────────────────────────────────────

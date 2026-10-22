@@ -14,7 +14,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -588,6 +587,15 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 	checkErr("creating Elasticsearch client", err)
 
 	variables := buildTemplateVariables(*index, *templateVariables)
+
+	// Validate every supplied template file before any create, delete, flush or
+	// put. Settings are otherwise templated only at index-create time, after
+	// -delete has already removed the index (mappings are templated at create
+	// time too, apart from the earlier preflight-plan read), so a typo there
+	// would leave the cluster half-reset. Fail closed here instead.
+	if err := preflightTemplateFiles(variables, *settingsFile, *mappingsFile, *pipelinesFile, *policiesFile, *transformsFile); err != nil {
+		return result, err
+	}
 	pipelineDefinitions, pipelineNames := readNamedDefinitions(*pipelinesFile, "pipeline", variables)
 	logicalPolicyDefinitions, logicalPolicyNames := readNamedDefinitions(*policiesFile, "policy", variables)
 	logicalTransformDefinitions, logicalTransformNames := readNamedDefinitions(*transformsFile, "transform", variables)
@@ -2135,34 +2143,6 @@ func buildTemplateVariables(index string, additional map[string]string) template
 		variables[trimmedKey] = value
 	}
 	return variables
-}
-
-// templateVariablePattern recognizes only the braced ${NAME} form. A brace-less
-// $NAME must stay verbatim: matching it let any literal "$word" in a config
-// asset (e.g. $HOME) be silently rewritten from the environment, corrupting
-// cluster configuration. Do not re-add it without a default-off opt-in.
-var templateVariablePattern = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
-
-// readTemplatedFile centralizes this code path so package behavior stays consistent.
-func readTemplatedFile(path string, variables templateVariables) ([]byte, error) {
-	content, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-
-	expanded := templateVariablePattern.ReplaceAllStringFunc(string(content), func(match string) string {
-		name := templateVariablePattern.FindStringSubmatch(match)[1]
-
-		if value, ok := variables[name]; ok {
-			return value
-		}
-		if value, ok := os.LookupEnv(name); ok {
-			return value
-		}
-		return match
-	})
-
-	return []byte(expanded), nil
 }
 
 // ─── Managed Resource Lifecycle ────────────────────────────────────────────────
