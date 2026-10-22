@@ -206,6 +206,13 @@ func TestEndToEndScenarios(t *testing.T) {
 			checks: "created generation has number_of_replicas 2; a later add run (env override) does not change the existing index",
 			run:    scenarioAliasReplicasOverrideIsCreationOnly,
 		},
+		{
+			// Appended last: the slice index sets each scenario's e2e-NN prefix.
+			name:   "delete_sync-managed_wait_transforms",
+			flags:  "-delete -sync-managed -transforms <file> -wait-transforms",
+			checks: "loader returns only after the batch transform completes; destination index holds its documents at exit with no retry",
+			run:    scenarioDeleteSyncManagedWaitTransforms,
+		},
 	}
 
 	for i, sc := range scenarios {
@@ -230,6 +237,11 @@ func TestEndToEndScenarios(t *testing.T) {
 func scenarioDeleteSyncManagedEnrich(t *testing.T, ctx *scenarioContext) {
 	result := runLoader(t, ctx, nil, sourceArgs(ctx, ctx.sourceBaseDir, "-delete", true, true, ""))
 	mustSucceed(t, result)
+
+	// The CLI runs at the default Info level: a long enrich execution must be
+	// visible without -level debug, not silent until the end.
+	mustContain(t, result.output, "Executing enrich policy")
+	mustContain(t, result.output, "Enrich policy execution succeeded")
 
 	assertIndexExists(t, ctx, ctx.sourceIndex)
 	assertDocCount(t, ctx, ctx.sourceIndex, 2)
@@ -432,6 +444,41 @@ func assertReplicaSetting(t *testing.T, ctx *scenarioContext, index, want string
 	if got != want {
 		t.Fatalf("number_of_replicas for %s = %q, want %q", index, got, want)
 	}
+}
+
+// scenarioDeleteSyncManagedWaitTransforms proves -wait-transforms through the
+// real binary: when the loader exits, the transform's destination index
+// already holds the pivot output. There is deliberately no retry loop here;
+// without the wait the destination is empty or missing at this point.
+func scenarioDeleteSyncManagedWaitTransforms(t *testing.T, ctx *scenarioContext) {
+	transformName := ctx.sourceIndex + "-transform"
+	destIndex := transformName
+
+	// Registered before anything is created so a failing loader run leaks
+	// nothing; it runs before the scenario-wide cleanup (LIFO).
+	cleanup := func() {
+		deleteTransformIfExists(t, ctx, transformName)
+		deleteIndexIfExists(t, ctx, destIndex)
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
+	dir := filepath.Join(ctx.fixturesRoot, "source-transforms")
+	writeFixtureDir(t, dir, map[string]string{
+		"transforms.json": fmt.Sprintf(sourceTransformsJSON, transformName, ctx.sourceIndex, destIndex),
+	})
+
+	args := append(sourceArgs(ctx, ctx.sourceBaseDir, "-delete", true, false, ""),
+		"-transforms", filepath.Join(dir, "transforms.json"),
+		"-wait-transforms",
+	)
+	result := runLoader(t, ctx, nil, args)
+	mustSucceed(t, result)
+	mustContain(t, result.output, "Waiting for transform")
+	mustContain(t, result.output, "Transform completed")
+
+	// Two source documents with distinct lookup_id values: two pivot rows.
+	assertDocCount(t, ctx, destIndex, 2)
 }
 
 // scenarioAliasKeepLastPrunesOldestAfterThirdRun centralizes this code path so package behavior stays consistent.
@@ -1346,6 +1393,17 @@ func deleteIndexIfExists(t *testing.T, ctx *scenarioContext, index string) {
 	}
 }
 
+// deleteTransformIfExists force-deletes a transform; a missing one is fine.
+func deleteTransformIfExists(t *testing.T, ctx *scenarioContext, name string) {
+	t.Helper()
+	resp := doRequest(t, ctx, http.MethodDelete, "/_transform/"+name+"?force=true", nil)
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("delete transform %s failed: status=%d body=%s", name, resp.StatusCode, string(body))
+	}
+}
+
 // deletePipelineIfExists centralizes this code path so package behavior stays consistent.
 func deletePipelineIfExists(t *testing.T, ctx *scenarioContext, name string) {
 	t.Helper()
@@ -1490,6 +1548,24 @@ func managedPolicyNameForLogicalAndIndex(logical, index string) string {
 }
 
 // ─── Embedded JSON Fixtures ────────────────────────────────────────────────────
+
+// sourceTransformsJSON is a keyed transforms file: the pivot reads the source
+// index and writes its own destination index, which keeps the source/target
+// fixture split intact. Arguments: transform name, source index, destination
+// index. It has no "$": transforms files go through template expansion.
+const sourceTransformsJSON = `{
+  %[1]q: {
+    "source_index": %[2]q,
+    "body": {
+      "source": { "index": %[2]q },
+      "dest": { "index": %[3]q },
+      "pivot": {
+        "group_by": { "lookup_id": { "terms": { "field": "lookup_id" } } },
+        "aggregations": { "base_total": { "sum": { "field": "base_value" } } }
+      }
+    }
+  }
+}`
 
 // sourceSettingsJSON defines package-level values shared by related execution paths.
 const sourceSettingsJSON = `{"settings":{}}`

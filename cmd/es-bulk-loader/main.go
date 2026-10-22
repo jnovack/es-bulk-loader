@@ -176,6 +176,8 @@ func main() {
 	pipelinesFile := flag.String("pipelines", "", "Path to JSON file containing one or more ingest pipeline definitions (optional)")
 	policiesFile := flag.String("policies", "", "Path to JSON file containing one or more enrich policy definitions (optional)")
 	transformsFile := flag.String("transforms", "", "Path to JSON file containing one or more transform definitions (optional)")
+	waitTransforms := flag.Bool("wait-transforms", false, "After starting managed transforms, wait for each to complete its first checkpoint (requires -sync-managed)")
+	waitTransformsTimeout := flag.Duration("wait-transforms-timeout", loader.DefaultTransformWaitTimeout, "Maximum time to wait for each transform when -wait-transforms is set")
 	dataFile := flag.String("data", "", "Path to bulk JSON data file (array of objects)")
 	batchSize := flag.Int("batch", 1000, "Batch size for bulk inserts")
 	bulkRetryAttempts := flag.Int("bulk-retry-attempts", 4, "Total bulk request attempts, including first try")
@@ -226,6 +228,16 @@ func main() {
 		Str("revision", revision).
 		Msg("jnovack/es-bulk-loader starting...")
 
+	// Reject here rather than let Run rewrite it: Run treats a timeout <= 0 as
+	// "use the 30m default", so an operator passing 0 to mean "no limit" would
+	// silently get 30 minutes. The CLI has no unbounded mode (it has no signal
+	// handling, so the timeout is the only bound on the wait).
+	if *waitTransforms && *waitTransformsTimeout <= 0 {
+		fmt.Fprintf(os.Stderr, "invalid -wait-transforms-timeout value %s (WAIT_TRANSFORMS_TIMEOUT): must be greater than 0\n", *waitTransformsTimeout)
+		flag.Usage()
+		os.Exit(1)
+	}
+
 	opts := loader.Options{
 		URL:                  *url,
 		InsecureSkipVerify:   *insecure,
@@ -257,6 +269,10 @@ func main() {
 			All:      enrich.all,
 			Raw:      enrich.raw,
 			Policies: enrich.explicitPolicies(),
+		},
+		Transforms: loader.TransformOptions{
+			Wait:        *waitTransforms,
+			WaitTimeout: *waitTransformsTimeout,
 		},
 	}
 

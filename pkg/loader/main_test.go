@@ -355,7 +355,7 @@ func TestExecuteEnrichPolicyCancellationStopsPolling(t *testing.T) {
 
 	result := make(chan bool, 1)
 	go func() {
-		result <- executeEnrichPolicy(ctx, es, "policy-a")
+		result <- executeEnrichPolicy(ctx, es, "policy-a", nil)
 	}()
 
 	select {
@@ -533,32 +533,6 @@ func TestResolveEnrichTargetsWarnsForMissingPolicies(t *testing.T) {
 	}
 	if want := []string{"policy-missing"}; !reflect.DeepEqual(missing, want) {
 		t.Fatalf("missing mismatch: got %v want %v", missing, want)
-	}
-}
-
-// TestEnrichPollInterval verifies the polling cadence transitions after five checks.
-func TestEnrichPollInterval(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name      string
-		pollCount int
-		want      time.Duration
-	}{
-		{name: "first poll", pollCount: 1, want: initialEnrichPollInterval},
-		{name: "fifth poll", pollCount: 5, want: initialEnrichPollInterval},
-		{name: "sixth poll", pollCount: 6, want: subsequentEnrichPollInterval},
-	}
-
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			if got := enrichPollInterval(tt.pollCount); got != tt.want {
-				t.Fatalf("enrichPollInterval(%d) = %s, want %s", tt.pollCount, got, tt.want)
-			}
-		})
 	}
 }
 

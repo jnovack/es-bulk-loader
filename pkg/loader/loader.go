@@ -136,6 +136,11 @@ type Options struct {
 	APIKey              string
 	TemplateVariables   map[string]string
 	Enrich              EnrichOptions
+	// Transforms controls waiting on managed transforms after they start.
+	Transforms TransformOptions
+	// Progress, when non-nil, receives ProgressEvents; see ProgressEvent for
+	// the delivery contract. nil creates no events.
+	Progress func(ProgressEvent)
 	// Logger, when non-nil, receives all of Run's log output — including a
 	// Disabled logger such as zerolog.Nop(), which silences Run. nil uses the
 	// zerolog global (log.Logger), read but never modified, so concurrent
@@ -228,15 +233,6 @@ const (
 // consecutive one-second timestamp suffixes.
 const timestampedIndexCollisionLimit = 300
 
-const (
-	// initialEnrichPollInterval keeps the first few task checks responsive.
-	initialEnrichPollInterval = 2 * time.Second
-	// subsequentEnrichPollInterval reduces load for longer-running tasks.
-	subsequentEnrichPollInterval = 5 * time.Second
-	// enrichPollIntervalEscalationCount is the first poll to use the longer interval.
-	enrichPollIntervalEscalationCount = 6
-)
-
 // enrichPolicySummary groups state used to coordinate related package behavior.
 type enrichPolicySummary struct {
 	Config map[string]struct {
@@ -249,9 +245,13 @@ type enrichPoliciesResponse struct {
 	Policies []enrichPolicySummary `json:"policies"`
 }
 
-// enrichPhaseStatus holds the phase field returned by enrich policy execution.
+// enrichPhaseStatus holds the phase and, while the policy runs, the step
+// fields returned by enrich policy execution.
 type enrichPhaseStatus struct {
 	Phase string `json:"phase"`
+	// Step is the request class the enrich runner is executing (for example
+	// "ReindexRequest"); ES omits it when the policy is not running.
+	Step string `json:"step,omitempty"`
 }
 
 // enrichExecuteResponse groups state used to coordinate related package behavior.
@@ -267,6 +267,9 @@ type taskGetResponse struct {
 		Status *enrichPhaseStatus `json:"status,omitempty"`
 	} `json:"task"`
 	Response *enrichExecuteResponse `json:"response,omitempty"`
+	// Error is the task's failure object; ES sets it next to completed:true
+	// when the task ended with an exception.
+	Error json.RawMessage `json:"error,omitempty"`
 }
 
 // managedPolicyPlan groups state used to coordinate related package behavior.
@@ -300,6 +303,10 @@ type enrichRunSummary struct {
 
 // sleepWithContext centralizes retry sleeps so the code path can be reused by tests.
 var sleepWithContext = sleepForDuration
+
+// progressNow is the clock for progress timing (elapsed values, heartbeats).
+// It exists so tests can drive heartbeats without sleeping.
+var progressNow = time.Now
 
 // sleepForDuration centralizes this code path so package behavior stays consistent.
 func sleepForDuration(ctx context.Context, d time.Duration) error {
@@ -511,6 +518,10 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 	if *bulkRetryBackoffMax < *bulkRetryBackoffBase {
 		*bulkRetryBackoffMax = *bulkRetryBackoffBase
 	}
+	if opts.Transforms.WaitTimeout <= 0 {
+		opts.Transforms.WaitTimeout = DefaultTransformWaitTimeout
+	}
+	emit := progressEmitter(opts.Progress)
 
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -850,7 +861,7 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 			fatal(ctx).Err(err).Msg("Cannot read data file")
 		}
 
-		overallStart := time.Now()
+		overallStart := progressNow()
 		succeededTotal := 0
 		failedTotal := 0
 		processed := 0
@@ -870,6 +881,7 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 				&succeededTotal,
 				&failedTotal,
 				&processed,
+				emit,
 			)
 		case '{':
 			loadNDJSON(
@@ -885,18 +897,27 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 				&succeededTotal,
 				&failedTotal,
 				&processed,
+				emit,
 			)
 		default:
 			fatal(ctx).Msgf("Data file first byte %q is neither '[' (JSON array) nor '{' (NDJSON)", first)
 		}
 
-		overallDuration := time.Since(overallStart)
+		overallDuration := progressNow().Sub(overallStart)
 		loggerFrom(ctx).Info().
 			Int("processed", processed).
 			Int("succeeded", succeededTotal).
 			Int("failed", failedTotal).
 			Float64("total_time", overallDuration.Seconds()).
 			Msg("Bulk load completed")
+		emit.emit(ProgressEvent{
+			Stage:    ProgressStageBulk,
+			Resource: writeIndex,
+			Done:     int64(processed),
+			Total:    int64(processed),
+			Elapsed:  overallDuration,
+			Final:    true,
+		})
 
 		if failedTotal > 0 {
 			loggerFrom(ctx).Warn().
@@ -922,7 +943,7 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 
 	if enrich.enabled {
 		refreshIndex(ctx, es, writeIndex)
-		enrichResult := runEnrichPolicies(ctx, es, enrichSelection, policyNames)
+		enrichResult := runEnrichPolicies(ctx, es, enrichSelection, policyNames, emit)
 		result.EnrichSelected = enrichResult.Selected
 		result.EnrichMissing = enrichResult.Missing
 		result.EnrichSucceeded = enrichResult.Succeeded
@@ -935,6 +956,13 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 		stopTransformsBestEffort(ctx, es, transformSyncNames)
 		createOrUpdateTransforms(ctx, es, transformDefinitions, transformSyncNames)
 		startTransforms(ctx, es, transformSyncNames)
+		if opts.Transforms.Wait {
+			waitForTransforms(ctx, es, transformDefinitions, transformSyncNames, opts.Transforms.WaitTimeout, emit)
+		} else {
+			emitTransformsStarted(emit, transformSyncNames)
+		}
+	} else if opts.Transforms.Wait {
+		warn("Ignoring transform wait because no transforms were synced for this run")
 	}
 
 	return result, nil
@@ -2787,63 +2815,6 @@ func refreshIndex(ctx context.Context, es *elasticsearch.Client, index string) {
 	loggerFrom(ctx).Info().Str("index", index).Msg("Refreshed index")
 }
 
-// runEnrichPolicies centralizes this code path so package behavior stays consistent.
-func runEnrichPolicies(ctx context.Context, es *elasticsearch.Client, enrich *enrichFlagValue, declared []string) enrichRunSummary {
-	summary := enrichRunSummary{}
-
-	availablePolicies, supported := getEnrichPolicies(ctx, es)
-	if !supported {
-		return summary
-	}
-	if len(availablePolicies) == 0 {
-		loggerFrom(ctx).Warn().Msg("No enrich policies found; skipping enrich execution")
-		return summary
-	}
-
-	targets, missing := resolveEnrichTargets(enrich, availablePolicies, declared)
-	summary.Selected = append(summary.Selected, targets...)
-	summary.Missing = append(summary.Missing, missing...)
-	for _, policy := range missing {
-		loggerFrom(ctx).Warn().Str("policy", policy).Msg("Enrich policy not found; skipping")
-	}
-
-	if len(targets) == 0 {
-		loggerFrom(ctx).Warn().Msg("No enrich policies matched the request")
-		return summary
-	}
-
-	loggerFrom(ctx).Info().
-		Int("available", len(availablePolicies)).
-		Int("requested", len(targets)+len(missing)).
-		Int("selected", len(targets)).
-		Msg("Starting enrich policy execution")
-
-	succeeded := 0
-	failed := 0
-	for _, policy := range targets {
-		if executeEnrichPolicy(ctx, es, policy) {
-			succeeded++
-		} else {
-			failed++
-		}
-	}
-
-	event := loggerFrom(ctx).Info()
-	if failed > 0 {
-		event = loggerFrom(ctx).Error()
-	}
-	event.
-		Int("selected", len(targets)).
-		Int("succeeded", succeeded).
-		Int("failed", failed).
-		Int("missing", len(missing)).
-		Msg("Completed enrich policy execution")
-
-	summary.Succeeded = succeeded
-	summary.Failed = failed
-	return summary
-}
-
 // getEnrichPolicies centralizes this code path so package behavior stays consistent.
 func getEnrichPolicies(ctx context.Context, es *elasticsearch.Client) ([]string, bool) {
 	res, err := es.EnrichGetPolicy(
@@ -2928,134 +2899,6 @@ func resolveEnrichTargets(enrich *enrichFlagValue, available []string, declared 
 		missing = append(missing, policy)
 	}
 	return targets, missing
-}
-
-// logEnrichResult emits the final success/failure log for an enrich policy execution.
-func logEnrichResult(ctx context.Context, policy string, status *enrichPhaseStatus, startTime time.Time) bool {
-	phase, isFailure := "", false
-	if status != nil {
-		phase = status.Phase
-		isFailure = strings.EqualFold(phase, "FAILED") || strings.EqualFold(phase, "CANCELLED")
-	}
-	event := loggerFrom(ctx).Debug()
-	if isFailure {
-		event = loggerFrom(ctx).Error()
-	}
-	entry := event.Str("policy", policy).Float64("time_taken", time.Since(startTime).Seconds())
-	if phase != "" {
-		entry = entry.Str("phase", phase)
-	}
-	msg := "Enrich policy execution succeeded"
-	if isFailure {
-		msg = "Enrich policy execution failed"
-	}
-	entry.Msg(msg)
-	return !isFailure
-}
-
-// enrichPollInterval returns the task polling cadence for pollCount.
-func enrichPollInterval(pollCount int) time.Duration {
-	if pollCount >= enrichPollIntervalEscalationCount {
-		return subsequentEnrichPollInterval
-	}
-	return initialEnrichPollInterval
-}
-
-// executeEnrichPolicy centralizes this code path so package behavior stays consistent.
-func executeEnrichPolicy(ctx context.Context, es *elasticsearch.Client, policy string) bool {
-	startTime := time.Now()
-	res, err := es.EnrichExecutePolicy(
-		policy,
-		es.EnrichExecutePolicy.WithContext(ctx),
-		es.EnrichExecutePolicy.WithWaitForCompletion(false),
-		es.EnrichExecutePolicy.WithHeader(map[string]string{
-			"Accept": "application/json",
-		}),
-	)
-	if err != nil {
-		loggerFrom(ctx).Error().Err(err).Str("policy", policy).Msg("Failed to execute enrich policy")
-		return false
-	}
-	defer res.Body.Close()
-
-	if res.IsError() {
-		body, _ := io.ReadAll(res.Body)
-		if isUnsupportedEnrichAPI(res.StatusCode, body) {
-			loggerFrom(ctx).Warn().
-				Str("policy", policy).
-				Int("status_code", res.StatusCode).
-				Str("body", string(body)).
-				Msg("Enrich execute endpoint returned a generic 404; check proxy or routing for /_enrich/policy/<name>/_execute and confirm this URL matches the backend used by Dev Tools")
-			return false
-		}
-		loggerFrom(ctx).Error().
-			Str("policy", policy).
-			Int("status_code", res.StatusCode).
-			Str("body", string(body)).
-			Float64("time_taken", time.Since(startTime).Seconds()).
-			Msg("Enrich policy execution failed")
-		return false
-	}
-
-	var kickoff enrichExecuteResponse
-	if err := json.NewDecoder(res.Body).Decode(&kickoff); err != nil {
-		loggerFrom(ctx).Error().Err(err).Str("policy", policy).Msg("Unable to parse enrich policy execution response")
-		return false
-	}
-
-	// Synchronous completion — small policy or ES returned immediately.
-	if kickoff.Task == nil || *kickoff.Task == "" {
-		return logEnrichResult(ctx, policy, kickoff.Status, startTime)
-	}
-
-	taskID := *kickoff.Task
-	for pollCount := 1; ; pollCount++ {
-		if err := sleepWithContext(ctx, enrichPollInterval(pollCount)); err != nil {
-			loggerFrom(ctx).Warn().Err(err).Str("policy", policy).Msg("Context cancelled while polling enrich task")
-			return false
-		}
-
-		taskRes, err := es.Tasks.Get(taskID, es.Tasks.Get.WithContext(ctx))
-		if err != nil {
-			loggerFrom(ctx).Error().Err(err).Str("policy", policy).Str("task", taskID).Msg("Failed to poll enrich policy task")
-			return false
-		}
-
-		// 404 means ES has already removed the completed task record.
-		if taskRes.StatusCode == http.StatusNotFound {
-			taskRes.Body.Close()
-			return logEnrichResult(ctx, policy, nil, startTime)
-		}
-
-		var task taskGetResponse
-		decodeErr := json.NewDecoder(taskRes.Body).Decode(&task)
-		taskRes.Body.Close()
-		if decodeErr != nil {
-			loggerFrom(ctx).Error().Err(decodeErr).Str("policy", policy).Str("task", taskID).Msg("Unable to parse enrich policy task response")
-			return false
-		}
-
-		phase := ""
-		if task.Task.Status != nil {
-			phase = task.Task.Status.Phase
-		}
-
-		// completed=true or a response object present both signal the task is done.
-		if task.Completed || task.Response != nil {
-			status := task.Task.Status
-			if task.Response != nil && task.Response.Status != nil {
-				status = task.Response.Status
-			}
-			return logEnrichResult(ctx, policy, status, startTime)
-		}
-
-		loggerFrom(ctx).Debug().
-			Str("policy", policy).
-			Str("phase", phase).
-			Float64("elapsed_s", time.Since(startTime).Seconds()).
-			Msg("Enrich policy execution in progress")
-
-	}
 }
 
 // isUnsupportedEnrichAPI centralizes this code path so package behavior stays consistent.
@@ -3170,7 +3013,9 @@ func loadJSONArray(
 	retryBackoffBase, retryBackoffMax time.Duration,
 	idField string,
 	succeededTotal, failedTotal, processed *int,
+	emit progressEmitter,
 ) {
+	start := progressNow()
 	f, err := os.Open(dataFile)
 	checkErr(ctx, "opening data file", err)
 	defer f.Close()
@@ -3222,6 +3067,7 @@ func loadJSONArray(
 				idField,
 			)
 			*processed += len(batch)
+			emitBulkBatch(emit, index, *processed, total, start)
 			*succeededTotal += batchResult.Succeeded
 			*failedTotal += batchResult.Failed
 			batch = batch[:0]
@@ -3241,6 +3087,7 @@ func loadJSONArray(
 			idField,
 		)
 		*processed += len(batch)
+		emitBulkBatch(emit, index, *processed, total, start)
 		*succeededTotal += batchResult.Succeeded
 		*failedTotal += batchResult.Failed
 	}
@@ -3260,7 +3107,9 @@ func loadNDJSON(
 	retryBackoffBase, retryBackoffMax time.Duration,
 	idField string,
 	succeededTotal, failedTotal, processed *int,
+	emit progressEmitter,
 ) {
+	start := progressNow()
 	total, err := countNDJSONLines(dataFile)
 	if err != nil {
 		fatal(ctx).Err(err).Msg("Error counting NDJSON lines")
@@ -3296,6 +3145,7 @@ func loadNDJSON(
 				idField,
 			)
 			*processed += len(batch)
+			emitBulkBatch(emit, index, *processed, total, start)
 			*succeededTotal += batchResult.Succeeded
 			*failedTotal += batchResult.Failed
 			batch = batch[:0]
@@ -3316,6 +3166,7 @@ func loadNDJSON(
 			idField,
 		)
 		*processed += len(batch)
+		emitBulkBatch(emit, index, *processed, total, start)
 		*succeededTotal += batchResult.Succeeded
 		*failedTotal += batchResult.Failed
 	}

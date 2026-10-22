@@ -21,6 +21,14 @@
 //     WithContext, which silently drops a Disabled logger and would turn an
 //     injected zerolog.Nop() back into global output. Run never writes the
 //     global logger, so concurrent Runs need no consumer-side mutex.
+//   - Options.Progress is a plain function field, called synchronously on Run's
+//     goroutine and never concurrently. A resource that causes a run-ending
+//     error gets no Final event: Run's error is the only failure signal, since
+//     those errors are raised by panics deep in the call graph (see
+//     ProgressEvent and docs/decisions/0004).
+//   - waiting on managed transforms is opt-in (Options.Transforms.Wait): the
+//     zero value starts transforms and returns, as it always has. The wait
+//     polls _stats per transform under a timeout that bounds HTTP and sleeps.
 //
 // Failure modes:
 //   - option validation and managed resource failures return typed sentinel errors,

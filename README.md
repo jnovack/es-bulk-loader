@@ -167,6 +167,61 @@ Sentinel error classes are exposed for classification:
 - `loader.ErrEnrichExecution`
 - `loader.ErrLoaderExecution`
 
+### Progress and waiting for transforms
+
+`Options.Transforms` and `Options.Progress` report and bound long waits:
+
+```go
+result, err := loaderpkg.Run(ctx, loaderpkg.Options{
+    URL:         "http://localhost:9200",
+    Index:       "slugs",
+    SyncManaged: true,
+    Transforms: loaderpkg.TransformOptions{
+        Wait:        true,             // block until each transform's first checkpoint
+        WaitTimeout: 10 * time.Minute, // per transform; <= 0 means 30m
+    },
+    Progress: func(e loaderpkg.ProgressEvent) {
+        log.Printf("%s %s phase=%q done=%d total=%d final=%v",
+            e.Stage, e.Resource, e.Phase, e.Done, e.Total, e.Final)
+    },
+})
+```
+
+`Progress` is nil by default and then creates no events. Each event is a
+`ProgressEvent`:
+
+| Field | Meaning |
+| --- | --- |
+| `Stage` | `ProgressStageBulk`, `ProgressStageEnrich` or `ProgressStageTransform` |
+| `Resource` | Write index (bulk), policy name (enrich), transform ID (transform) |
+| `Phase` | Phase or state as Elasticsearch reports it; enrich uses the step label (`reindex`, `force-merge`, `refresh`, `promote`; other values pass through) |
+| `Done`, `Total` | `bulk`: documents processed and in the file. `enrich`: documents done and total from the child reindex task during the `reindex` step, otherwise -1. `transform`: `Done` is cumulative `documents_processed`, `Total` is the current checkpoint's `total_docs`. -1 always means unknown, never an estimate |
+| `Elapsed` | Time since the loader began tracking the resource |
+| `Final` | Last event for this `(Stage, Resource)` in this Run |
+| `Err` | Set only on a Final event for a resource that failed while the Run continued (an enrich policy). An enrich task Elasticsearch has already discarded (HTTP 404) counts as succeeded, because 9.3.1 stores no result for it |
+
+Delivery contract:
+
+- Events arrive synchronously on the goroutine that called `Run`, never
+  concurrently. The callback must return promptly and must not panic; a panic
+  with an `error` value fails `Run` through its existing recover.
+- Build and compare events with keyed fields. Fields may be added in minor
+  releases.
+- A transform started without `Wait` gets one Final event with Phase
+  `"started"`. Bulk item failures never set `Err`; see
+  `Result.DocumentsFailed`.
+- When `Run` returns an error, the resource that caused it gets no Final event
+  and no events follow. Treat "`Run` returned" as the end of the stream and do
+  not count Final events.
+
+### Logging levels
+
+For every long wait the loader logs stage start and stage end at Info, each
+poll or batch at Debug, and an Info heartbeat at most once every 30 seconds
+while an enrich policy or transform wait is still running. At the default
+`-level info` an enrich policy therefore logs its start and task ID, each step
+change, document progress during `reindex`, and its completion.
+
 ## Testing
 
 Unit tests stay in the default Go test path:
@@ -283,6 +338,8 @@ Settings can be loaded from a configuration file (e.g.
 | `-pipelines` | Optional path to JSON file with one or more ingest pipeline definitions |
 | `-policies` | Optional path to JSON file with one or more enrich policy definitions |
 | `-transforms` | Optional path to JSON file with one or more transform definitions |
+| `-wait-transforms` | After starting managed transforms, wait for each to complete its first checkpoint; env `WAIT_TRANSFORMS` (requires `-sync-managed`) |
+| `-wait-transforms-timeout` | Maximum time to wait for each transform when `-wait-transforms` is set; env `WAIT_TRANSFORMS_TIMEOUT` (default: 30m; 0 or less is rejected when `-wait-transforms` is set) |
 | `-batch` | Number of documents per bulk insert (default: 1000) |
 | `-bulk-retry-attempts` | Total bulk API request attempts for retryable failures, including the first attempt (default: 4) |
 | `-bulk-retry-backoff-base` | Base backoff duration for retryable bulk failures (default: 500ms) |
@@ -478,6 +535,38 @@ During `-sync-managed`, selected transforms are stopped, upserted after data
 load and alias updates, and then started after enrich execution (or immediately
 after upsert when enrich is disabled).
 During `-nuke`, selected transforms are force-deleted.
+
+### Waiting for transforms
+
+By default the loader starts transforms and returns at once. With
+`-wait-transforms` it then polls `GET _transform/<id>/_stats` for each synced
+transform, in order, until the first checkpoint completes:
+
+- A batch transform (body has no top-level `sync`) is done when its state is
+  `stopped` and `checkpointing.last.checkpoint` is 1 or higher.
+- A continuous transform (body has a top-level `sync`) is done when
+  `checkpointing.last.checkpoint` is 1 or higher and no later checkpoint is in
+  progress.
+- A transform in state `failed` fails the run. The error names the transform
+  and quotes the reason Elasticsearch reports.
+- `-wait-transforms-timeout` (default `30m`) is per transform and bounds both
+  the HTTP calls and the sleeps. When it is reached, or the context is
+  cancelled, the run fails with an error naming the transform, its last state
+  and its last known progress.
+
+A failure or timeout returns a `loader.ErrManagedResource` error. If no
+transforms are synced (no `-sync-managed`, or none match `-index`), the loader
+warns and makes no `_stats` request.
+
+```bash
+go run cmd/es-bulk-loader/main.go \
+  -url http://localhost:9200 \
+  -index my-index \
+  -delete -sync-managed \
+  -data data.json \
+  -transforms transforms.json \
+  -wait-transforms -wait-transforms-timeout 10m
+```
 
 Definition file formats are documented in [docs/PIPELINES.md](docs/PIPELINES.md)
 and [docs/POLICIES.md](docs/POLICIES.md).
