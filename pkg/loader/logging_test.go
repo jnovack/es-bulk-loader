@@ -4,9 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -17,6 +15,8 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+
+	"github.com/jnovack/es-bulk-loader/internal/testutil/esstub"
 )
 
 // loggerRunStubConfig selects how a loggerRunStub behaves.
@@ -47,60 +47,45 @@ func newLoggerRunStub(t *testing.T, index string, cfg loggerRunStubConfig) *logg
 		arrived: make(chan struct{}, 1),
 		release: make(chan struct{}),
 	}
-	var mu sync.Mutex
-	present := cfg.indexExists
-	write := func(w http.ResponseWriter, status int, body string) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(status)
-		_, _ = w.Write([]byte(body))
-	}
+	var (
+		mu      sync.Mutex
+		present = cfg.indexExists
+	)
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		switch {
-		case r.Method == http.MethodHead && r.URL.Path == "/"+index:
-			mu.Lock()
-			exists := present
-			mu.Unlock()
-			if exists {
-				w.WriteHeader(http.StatusOK)
-			} else {
-				w.WriteHeader(http.StatusNotFound)
-			}
-		case r.Method == http.MethodGet && r.URL.Path == "/_nodes":
-			write(w, http.StatusOK, `{"nodes":{"node1":{}}}`)
-		case r.Method == http.MethodPut && r.URL.Path == "/"+index:
-			if cfg.hold {
-				stub.arrived <- struct{}{}
-				select {
-				case <-stub.release:
-				case <-r.Context().Done():
-					return
-				case <-time.After(15 * time.Second):
-					t.Errorf("stub for %s was never released", index)
-				}
-			}
-			if cfg.failCreate {
-				write(w, http.StatusInternalServerError, `{"error":{"type":"stub_create_failure"},"status":500}`)
+	es := esstub.New(t)
+	es.Handle("HEAD /"+index, func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		exists := present
+		mu.Unlock()
+		existsReply(w, exists)
+	})
+	es.Handle("GET /_nodes", esstub.JSON(http.StatusOK, nodesBody))
+	es.Handle("PUT /"+index, func(w http.ResponseWriter, r *http.Request) {
+		if cfg.hold {
+			stub.arrived <- struct{}{}
+			select {
+			case <-stub.release:
+			case <-r.Context().Done():
 				return
+			case <-time.After(15 * time.Second):
+				t.Errorf("stub for %s was never released", index)
 			}
-			mu.Lock()
-			present = true
-			mu.Unlock()
-			write(w, http.StatusOK, `{"acknowledged":true}`)
-		case r.Method == http.MethodPost && r.URL.Path == "/_bulk":
-			write(w, http.StatusOK, fmt.Sprintf(`{"errors":false,"items":[{"index":{"_index":%q,"_id":"1","status":201}}]}`, index))
-		case r.Method == http.MethodPost && r.URL.Path == "/"+index+"/_refresh":
-			write(w, http.StatusOK, `{"_shards":{"failed":0}}`)
-		case r.Method == http.MethodGet && (r.URL.Path == "/_enrich/policy" || r.URL.Path == "/_enrich/policy/"):
-			write(w, http.StatusOK, `{"policies":[]}`)
-		default:
-			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
-			w.WriteHeader(http.StatusInternalServerError)
 		}
-	}))
-	t.Cleanup(server.Close)
-	stub.url = server.URL
+		if cfg.failCreate {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":{"type":"stub_create_failure"},"status":500}`))
+			return
+		}
+		mu.Lock()
+		present = true
+		mu.Unlock()
+		_, _ = w.Write([]byte(ackBody))
+	})
+	es.Handle("POST /_bulk", esstub.JSON(http.StatusOK, bulkOKBody(index)))
+	es.Handle("POST /"+index+"/_refresh", esstub.JSON(http.StatusOK, `{"_shards":{"failed":0}}`))
+	es.Handle("GET /_enrich/policy", esstub.JSON(http.StatusOK, `{"policies":[]}`))
+	es.Handle("GET /_enrich/policy/{$}", esstub.JSON(http.StatusOK, `{"policies":[]}`))
+	stub.url = es.URL()
 	return stub
 }
 

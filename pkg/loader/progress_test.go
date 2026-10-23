@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -18,6 +17,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+
+	"github.com/jnovack/es-bulk-loader/internal/testutil/esstub"
 )
 
 // Every test in this file is serial: they replace the package variables
@@ -82,8 +83,10 @@ func withBulk(status, failItems int) progressStubOption {
 // routes of progressTransform. statsSequence is answered to
 // GET _transform/tx1/_stats in order (the last entry repeats); a _stats
 // request with an empty sequence is a test failure. The returned function
-// yields a copy of the recorded operation names, in arrival order.
-func newProgressStub(t *testing.T, statsSequence []string, opts ...progressStubOption) (*httptest.Server, func() []string) {
+// yields a copy of the recorded operation names, in arrival order. It is built
+// from the shared scenario helpers (opRecorder, registerTransformRoutes); only
+// the progress-specific replies are defined here.
+func newProgressStub(t *testing.T, statsSequence []string, opts ...progressStubOption) (*esstub.Stub, func() []string) {
 	t.Helper()
 
 	cfg := progressStubConfig{policies: []string{"policy-a"}, executeBody: `{"status":{"phase":"COMPLETE"}}`}
@@ -92,16 +95,11 @@ func newProgressStub(t *testing.T, statsSequence []string, opts ...progressStubO
 	}
 
 	var (
+		rec                             opRecorder
 		mu                              sync.Mutex
-		operations                      []string
 		present                         bool
 		taskCalls, childCalls, statCall int
 	)
-	record := func(op string) {
-		mu.Lock()
-		defer mu.Unlock()
-		operations = append(operations, op)
-	}
 	next := func(seq []stubReply, calls *int) stubReply {
 		mu.Lock()
 		defer mu.Unlock()
@@ -113,124 +111,104 @@ func newProgressStub(t *testing.T, statsSequence []string, opts ...progressStubO
 		return seq[i]
 	}
 	write := func(w http.ResponseWriter, status int, body string) {
-		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		_, _ = w.Write([]byte(body))
 	}
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		method, path := r.Method, r.URL.Path
-		switch {
-		case method == http.MethodHead && path == "/"+progressIndex:
-			mu.Lock()
-			exists := present
-			mu.Unlock()
-			if exists {
-				w.WriteHeader(http.StatusOK)
-			} else {
-				w.WriteHeader(http.StatusNotFound)
-			}
-		case method == http.MethodGet && path == "/_nodes":
-			write(w, http.StatusOK, `{"nodes":{"node1":{}}}`)
-		case method == http.MethodPut && path == "/"+progressIndex:
-			record("index.create")
-			mu.Lock()
-			present = true
-			mu.Unlock()
-			write(w, http.StatusOK, `{"acknowledged":true}`)
-		case method == http.MethodPost && path == "/_bulk":
-			record("bulk")
-			if cfg.bulkStatus != 0 && cfg.bulkStatus != http.StatusOK {
-				write(w, cfg.bulkStatus, `{"error":{"type":"stub_bulk_failure"}}`)
-				return
-			}
-			payload, _ := io.ReadAll(r.Body)
-			docs := bytes.Count(bytes.TrimSpace(payload), []byte("\n")) / 2
-			docs++
-			items := make([]string, 0, docs)
-			for i := 0; i < docs; i++ {
-				if i < cfg.bulkFailItems {
-					items = append(items, fmt.Sprintf(`{"index":{"_index":%q,"_id":"%d","status":400,"error":{"type":"mapper_parsing_exception","reason":"boom"}}}`, progressIndex, i))
-				} else {
-					items = append(items, fmt.Sprintf(`{"index":{"_index":%q,"_id":"%d","status":201}}`, progressIndex, i))
-				}
-			}
-			write(w, http.StatusOK, fmt.Sprintf(`{"errors":%t,"items":[%s]}`, cfg.bulkFailItems > 0, strings.Join(items, ",")))
-		case method == http.MethodPost && path == "/"+progressIndex+"/_refresh":
-			record("index.refresh")
-			write(w, http.StatusOK, `{"_shards":{"total":1,"successful":1,"failed":0}}`)
-		case method == http.MethodGet && (path == "/_enrich/policy" || path == "/_enrich/policy/"):
-			record("enrich.list")
-			configs := make([]string, 0, len(cfg.policies))
-			for _, name := range cfg.policies {
-				configs = append(configs, fmt.Sprintf(`{"config":{"match":{"name":%q}}}`, name))
-			}
-			write(w, http.StatusOK, fmt.Sprintf(`{"policies":[%s]}`, strings.Join(configs, ",")))
-		case (method == http.MethodPost || method == http.MethodPut) && strings.HasPrefix(path, "/_enrich/policy/") && strings.HasSuffix(path, "/_execute"):
-			record("enrich.execute")
-			write(w, http.StatusOK, cfg.executeBody)
-		case method == http.MethodGet && path == "/_tasks/"+progressTaskID:
-			record("enrich.task")
-			if len(cfg.tasks) == 0 {
-				t.Errorf("unexpected task poll with no task replies configured")
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-			reply := next(cfg.tasks, &taskCalls)
-			write(w, reply.status, reply.body)
-		case method == http.MethodGet && path == "/_tasks":
-			record("enrich.children")
-			if r.URL.Query().Get("parent_task_id") != progressTaskID {
-				t.Errorf("child task list for parent %q, want %q", r.URL.Query().Get("parent_task_id"), progressTaskID)
-			}
-			if len(cfg.children) == 0 {
-				write(w, http.StatusOK, `{"tasks":[]}`)
-				return
-			}
-			reply := next(cfg.children, &childCalls)
-			write(w, reply.status, reply.body)
-		case method == http.MethodGet && path == "/_transform/"+progressTransform:
-			record("transform.get")
-			write(w, http.StatusOK, `{"count":0,"transforms":[]}`)
-		case method == http.MethodPost && path == "/_transform/"+progressTransform+"/_stop":
-			record("transform.stop")
-			write(w, http.StatusNotFound, `{"error":{"type":"resource_not_found_exception"}}`)
-		case method == http.MethodPut && path == "/_transform/"+progressTransform:
-			record("transform.put")
-			write(w, http.StatusOK, `{"acknowledged":true}`)
-		case method == http.MethodPost && path == "/_transform/"+progressTransform+"/_start":
-			record("transform.start")
-			write(w, http.StatusOK, `{"acknowledged":true}`)
-		case method == http.MethodGet && path == "/_transform/"+progressTransform+"/_stats":
-			record("transform.stats")
-			if len(statsSequence) == 0 {
-				t.Errorf("unexpected _stats request with no stats configured")
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-			replies := make([]stubReply, 0, len(statsSequence))
-			status := cfg.statsStatus
-			if status == 0 {
-				status = http.StatusOK
-			}
-			for _, body := range statsSequence {
-				replies = append(replies, stubReply{status: status, body: body})
-			}
-			reply := next(replies, &statCall)
-			write(w, reply.status, reply.body)
-		default:
-			t.Errorf("unexpected request: %s %s", method, r.URL.RequestURI())
-			w.WriteHeader(http.StatusInternalServerError)
-		}
-	}))
-	t.Cleanup(server.Close)
-
-	return server, func() []string {
+	stub := esstub.New(t)
+	stub.Handle("HEAD /"+progressIndex, func(w http.ResponseWriter, _ *http.Request) {
 		mu.Lock()
-		defer mu.Unlock()
-		return append([]string(nil), operations...)
-	}
+		exists := present
+		mu.Unlock()
+		existsReply(w, exists)
+	})
+	stub.Handle("GET /_nodes", esstub.JSON(http.StatusOK, nodesBody))
+	stub.Handle("PUT /"+progressIndex, rec.recorded("index.create", func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		present = true
+		mu.Unlock()
+		write(w, http.StatusOK, ackBody)
+	}))
+	stub.Handle("POST /_bulk", rec.recorded("bulk", func(w http.ResponseWriter, r *http.Request) {
+		if cfg.bulkStatus != 0 && cfg.bulkStatus != http.StatusOK {
+			write(w, cfg.bulkStatus, `{"error":{"type":"stub_bulk_failure"}}`)
+			return
+		}
+		payload, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read bulk body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		docs := bytes.Count(bytes.TrimSpace(payload), []byte("\n")) / 2
+		docs++
+		items := make([]string, 0, docs)
+		for i := 0; i < docs; i++ {
+			if i < cfg.bulkFailItems {
+				items = append(items, fmt.Sprintf(`{"index":{"_index":%q,"_id":"%d","status":400,"error":{"type":"mapper_parsing_exception","reason":"boom"}}}`, progressIndex, i))
+			} else {
+				items = append(items, fmt.Sprintf(`{"index":{"_index":%q,"_id":"%d","status":201}}`, progressIndex, i))
+			}
+		}
+		write(w, http.StatusOK, fmt.Sprintf(`{"errors":%t,"items":[%s]}`, cfg.bulkFailItems > 0, strings.Join(items, ",")))
+	}))
+	stub.Handle("POST /"+progressIndex+"/_refresh", rec.recorded("index.refresh", esstub.JSON(http.StatusOK, refreshBody)))
+
+	listPolicies := rec.recorded("enrich.list", func(w http.ResponseWriter, _ *http.Request) {
+		configs := make([]string, 0, len(cfg.policies))
+		for _, name := range cfg.policies {
+			configs = append(configs, fmt.Sprintf(`{"config":{"match":{"name":%q}}}`, name))
+		}
+		write(w, http.StatusOK, fmt.Sprintf(`{"policies":[%s]}`, strings.Join(configs, ",")))
+	})
+	stub.Handle("GET /_enrich/policy", listPolicies)
+	stub.Handle("GET /_enrich/policy/{$}", listPolicies)
+	executePolicy := rec.recorded("enrich.execute", func(w http.ResponseWriter, _ *http.Request) {
+		write(w, http.StatusOK, cfg.executeBody)
+	})
+	stub.Handle("POST /_enrich/policy/{name}/_execute", executePolicy)
+	stub.Handle("PUT /_enrich/policy/{name}/_execute", executePolicy)
+	stub.Handle("GET /_tasks/"+progressTaskID, rec.recorded("enrich.task", func(w http.ResponseWriter, _ *http.Request) {
+		if len(cfg.tasks) == 0 {
+			t.Errorf("unexpected task poll with no task replies configured")
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		reply := next(cfg.tasks, &taskCalls)
+		write(w, reply.status, reply.body)
+	}))
+	stub.Handle("GET /_tasks", rec.recorded("enrich.children", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("parent_task_id") != progressTaskID {
+			t.Errorf("child task list for parent %q, want %q", r.URL.Query().Get("parent_task_id"), progressTaskID)
+		}
+		if len(cfg.children) == 0 {
+			write(w, http.StatusOK, `{"tasks":[]}`)
+			return
+		}
+		reply := next(cfg.children, &childCalls)
+		write(w, reply.status, reply.body)
+	}))
+
+	registerTransformRoutes(stub, &rec, progressTransform, nil)
+	stub.Handle("GET /_transform/"+progressTransform+"/_stats", rec.recorded("transform.stats", func(w http.ResponseWriter, _ *http.Request) {
+		if len(statsSequence) == 0 {
+			t.Errorf("unexpected _stats request with no stats configured")
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		replies := make([]stubReply, 0, len(statsSequence))
+		status := cfg.statsStatus
+		if status == 0 {
+			status = http.StatusOK
+		}
+		for _, body := range statsSequence {
+			replies = append(replies, stubReply{status: status, body: body})
+		}
+		reply := next(replies, &statCall)
+		write(w, reply.status, reply.body)
+	}))
+
+	return stub, rec.operations
 }
 
 // fakeClock drives progressNow and sleepWithContext without real time: each
@@ -368,13 +346,13 @@ func withEnrich(o *Options) { o.Enrich = EnrichOptions{Enabled: true, All: true}
 // runProgress runs the loader against server with a capturing logger at level
 // and a Progress collector, applying mutations to the base options (an -add run
 // of progressDefaultDoc into progressIndex).
-func runProgress(t *testing.T, server *httptest.Server, ops func() []string, level zerolog.Level, mutations ...func(*Options)) progressRun {
+func runProgress(t *testing.T, server *esstub.Stub, ops func() []string, level zerolog.Level, mutations ...func(*Options)) progressRun {
 	t.Helper()
 	return runProgressContext(t, t.Context(), server, ops, level, mutations...)
 }
 
 // runProgressContext is runProgress with a caller-supplied context.
-func runProgressContext(t *testing.T, ctx context.Context, server *httptest.Server, ops func() []string, level zerolog.Level, mutations ...func(*Options)) progressRun {
+func runProgressContext(t *testing.T, ctx context.Context, server *esstub.Stub, ops func() []string, level zerolog.Level, mutations ...func(*Options)) progressRun {
 	t.Helper()
 
 	dataFile := filepath.Join(t.TempDir(), "data.json")
@@ -385,7 +363,7 @@ func runProgressContext(t *testing.T, ctx context.Context, server *httptest.Serv
 	logger := zerolog.New(&buf).Level(level)
 	run := progressRun{}
 	options := Options{
-		URL:        server.URL,
+		URL:        server.URL(),
 		Index:      progressIndex,
 		DataFile:   dataFile,
 		AddToIndex: true,

@@ -9,75 +9,60 @@ import (
 	"io"
 	"maps"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/elastic/go-elasticsearch/v9"
 	"github.com/rs/zerolog"
+
+	"github.com/jnovack/es-bulk-loader/internal/testutil/esstub"
 )
 
 // TestDeleteManagedResourcesUsesNukePipelineRecovery verifies that declared
 // pipelines receive nuke's default-pipeline recovery behavior.
 func TestDeleteManagedResourcesUsesNukePipelineRecovery(t *testing.T) {
 	var (
-		deleteAttempts int
-		clearedDefault bool
+		deleteAttempts atomic.Int32
+		clearedDefault atomic.Bool
 	)
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		switch {
-		case r.Method == http.MethodDelete && r.URL.Path == "/_ingest/pipeline/declared-pipeline":
-			deleteAttempts++
-			if deleteAttempts == 1 {
-				w.WriteHeader(http.StatusBadRequest)
-				_, _ = w.Write([]byte(`{"error":{"reason":"pipeline [declared-pipeline] cannot be deleted because it is the default pipeline for 1 index(es) including [other-index]"}}`))
-				return
-			}
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"acknowledged":true}`))
-		case r.Method == http.MethodGet && r.URL.Path == "/_settings/*":
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"other-index":{"settings":{"index":{"default_pipeline":"declared-pipeline"}}}}`))
-		case r.Method == http.MethodPut && r.URL.Path == "/other-index/_settings":
-			body, err := io.ReadAll(r.Body)
-			if err != nil {
-				t.Errorf("read settings request: %v", err)
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-			if !strings.Contains(string(body), `"index.default_pipeline":null`) {
-				t.Errorf("unexpected settings request body: %s", body)
-			}
-			clearedDefault = true
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"acknowledged":true}`))
-		default:
-			t.Errorf("unexpected request: %s %s", r.Method, r.URL.RequestURI())
-			w.WriteHeader(http.StatusNotFound)
+	stub := esstub.New(t)
+	stub.Handle("DELETE /_ingest/pipeline/declared-pipeline", func(w http.ResponseWriter, r *http.Request) {
+		if deleteAttempts.Add(1) == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"reason":"pipeline [declared-pipeline] cannot be deleted because it is the default pipeline for 1 index(es) including [other-index]"}}`))
+			return
 		}
-	}))
-	t.Cleanup(server.Close)
+		_, _ = w.Write([]byte(`{"acknowledged":true}`))
+	})
+	stub.Handle("GET /_settings/*", esstub.JSON(http.StatusOK, `{"other-index":{"settings":{"index":{"default_pipeline":"declared-pipeline"}}}}`))
+	stub.Handle("PUT /other-index/_settings", func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read settings request: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if !strings.Contains(string(body), `"index.default_pipeline":null`) {
+			t.Errorf("unexpected settings request body: %s", body)
+		}
+		clearedDefault.Store(true)
+		_, _ = w.Write([]byte(`{"acknowledged":true}`))
+	})
 
-	es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
-	if err != nil {
-		t.Fatalf("new elasticsearch client: %v", err)
-	}
+	es := newStubClient(t, stub)
 
 	deleteManagedResources(context.Background(), es, []string{"declared-pipeline"}, nil, nil, true)
 
-	if deleteAttempts != 2 {
-		t.Fatalf("delete attempts = %d, want 2", deleteAttempts)
+	if got := deleteAttempts.Load(); got != 2 {
+		t.Fatalf("delete attempts = %d, want 2", got)
 	}
-	if !clearedDefault {
+	if !clearedDefault.Load() {
 		t.Fatal("expected nuke recovery to clear index.default_pipeline")
 	}
 }
@@ -85,28 +70,21 @@ func TestDeleteManagedResourcesUsesNukePipelineRecovery(t *testing.T) {
 // TestDeleteManagedResourcesNonNukeUsesOrdinaryPipelineDeletion verifies that
 // normal cleanup does not invoke nuke's cross-index recovery requests.
 func TestDeleteManagedResourcesNonNukeUsesOrdinaryPipelineDeletion(t *testing.T) {
-	deleteAttempts := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		if r.Method != http.MethodDelete || r.URL.Path != "/_ingest/pipeline/declared-pipeline" {
-			t.Errorf("unexpected request: %s %s", r.Method, r.URL.RequestURI())
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		deleteAttempts++
+	var deleteAttempts atomic.Int32
+	stub := esstub.New(t)
+	// Only the pipeline DELETE is registered: any recovery request is an
+	// unexpected route and fails the test.
+	stub.Handle("DELETE /_ingest/pipeline/declared-pipeline", func(w http.ResponseWriter, _ *http.Request) {
+		deleteAttempts.Add(1)
 		_, _ = w.Write([]byte(`{"acknowledged":true}`))
-	}))
-	t.Cleanup(server.Close)
+	})
 
-	es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
-	if err != nil {
-		t.Fatalf("new elasticsearch client: %v", err)
-	}
+	es := newStubClient(t, stub)
 
 	deleteManagedResources(context.Background(), es, []string{"declared-pipeline"}, nil, nil, false)
 
-	if deleteAttempts != 1 {
-		t.Fatalf("delete attempts = %d, want 1", deleteAttempts)
+	if got := deleteAttempts.Load(); got != 1 {
+		t.Fatalf("delete attempts = %d, want 1", got)
 	}
 }
 
@@ -114,17 +92,13 @@ func TestDeleteManagedResourcesNonNukeUsesOrdinaryPipelineDeletion(t *testing.T)
 // Elasticsearch existence request.
 func TestIndexExistsUsesCallerContext(t *testing.T) {
 	requestStarted := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+	stub := esstub.New(t)
+	stub.Handle("HEAD /cards", func(_ http.ResponseWriter, r *http.Request) {
 		close(requestStarted)
 		<-r.Context().Done()
-	}))
-	t.Cleanup(server.Close)
+	})
 
-	es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
-	if err != nil {
-		t.Fatalf("new elasticsearch client: %v", err)
-	}
+	es := newStubClient(t, stub)
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
@@ -153,19 +127,15 @@ func TestIndexExistsUsesCallerContext(t *testing.T) {
 // polling delay prevents another existence request.
 func TestWaitForIndexCancellationStopsPolling(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	requests := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		requests++
+	var requests atomic.Int32
+	stub := esstub.New(t)
+	stub.Handle("HEAD /cards", func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
 		cancel()
 		w.WriteHeader(http.StatusNotFound)
-	}))
-	t.Cleanup(server.Close)
+	})
 
-	es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
-	if err != nil {
-		t.Fatalf("new elasticsearch client: %v", err)
-	}
+	es := newStubClient(t, stub)
 
 	var recovered any
 	func() {
@@ -177,8 +147,8 @@ func TestWaitForIndexCancellationStopsPolling(t *testing.T) {
 	if !ok || !errors.Is(recoveredErr, context.Canceled) {
 		t.Fatalf("waitForIndex panic = %#v, want context.Canceled", recovered)
 	}
-	if requests != 1 {
-		t.Fatalf("existence requests = %d, want 1", requests)
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("existence requests = %d, want 1", got)
 	}
 }
 
@@ -186,20 +156,16 @@ func TestWaitForIndexCancellationStopsPolling(t *testing.T) {
 // index-not-found response prevents another policy PUT.
 func TestCreatePoliciesCancellationStopsRetry(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	attempts := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		attempts++
+	var attempts atomic.Int32
+	stub := esstub.New(t)
+	stub.Handle("PUT /_enrich/policy/policy", func(w http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
 		cancel()
 		w.WriteHeader(http.StatusNotFound)
 		_, _ = w.Write([]byte(`{"error":{"type":"index_not_found_exception"}}`))
-	}))
-	t.Cleanup(server.Close)
+	})
 
-	es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
-	if err != nil {
-		t.Fatalf("new elasticsearch client: %v", err)
-	}
+	es := newStubClient(t, stub)
 
 	var recovered any
 	func() {
@@ -211,8 +177,8 @@ func TestCreatePoliciesCancellationStopsRetry(t *testing.T) {
 	if !ok || !errors.Is(recoveredErr, context.Canceled) {
 		t.Fatalf("createPolicies panic = %#v, want context.Canceled", recovered)
 	}
-	if attempts != 1 {
-		t.Fatalf("policy PUT attempts = %d, want 1", attempts)
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("policy PUT attempts = %d, want 1", got)
 	}
 }
 
@@ -221,23 +187,19 @@ func TestCreatePoliciesCancellationStopsRetry(t *testing.T) {
 func TestPutPolicyUsesCallerContext(t *testing.T) {
 	requestStarted := make(chan struct{})
 	releaseHandler := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+	stub := esstub.New(t)
+	stub.Handle("PUT /_enrich/policy/policy", func(_ http.ResponseWriter, r *http.Request) {
 		close(requestStarted)
 		select {
 		case <-r.Context().Done():
 		case <-releaseHandler:
 		}
-	}))
-	t.Cleanup(func() {
-		close(releaseHandler)
-		server.Close()
 	})
+	// Registered after the stub's own cleanup, so it runs first and
+	// unblocks the handler before the server waits for it.
+	t.Cleanup(func() { close(releaseHandler) })
 
-	es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
-	if err != nil {
-		t.Fatalf("new elasticsearch client: %v", err)
-	}
+	es := newStubClient(t, stub)
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
@@ -271,17 +233,13 @@ func TestPutPolicyUsesCallerContext(t *testing.T) {
 // context.Background().
 func TestDeletePipelinesUsesCallerContext(t *testing.T) {
 	requestStarted := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+	stub := esstub.New(t)
+	stub.Handle("DELETE /_ingest/pipeline/pipeline-a", func(_ http.ResponseWriter, r *http.Request) {
 		close(requestStarted)
 		<-r.Context().Done()
-	}))
-	t.Cleanup(server.Close)
+	})
 
-	es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
-	if err != nil {
-		t.Fatalf("new elasticsearch client: %v", err)
-	}
+	es := newStubClient(t, stub)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	var recovered any
@@ -331,27 +289,17 @@ func TestExecuteEnrichPolicyCancellationStopsPolling(t *testing.T) {
 		sleepWithContext = previousSleep
 	})
 
-	taskGetCalls := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		switch {
-		case (r.Method == http.MethodPut || r.Method == http.MethodPost) && r.URL.Path == "/_enrich/policy/policy-a/_execute":
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"task":"node:123"}`))
-		case r.URL.Path == "/_tasks/node:123":
-			taskGetCalls++
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"completed":false,"task":{"status":{"phase":"RUNNING"}}}`))
-		default:
-			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
-		}
-	}))
-	t.Cleanup(server.Close)
+	var taskGetCalls atomic.Int32
+	execute := esstub.JSON(http.StatusOK, `{"task":"node:123"}`)
+	stub := esstub.New(t)
+	stub.Handle("PUT /_enrich/policy/policy-a/_execute", execute)
+	stub.Handle("POST /_enrich/policy/policy-a/_execute", execute)
+	stub.Handle("GET /_tasks/node:123", func(w http.ResponseWriter, _ *http.Request) {
+		taskGetCalls.Add(1)
+		_, _ = w.Write([]byte(`{"completed":false,"task":{"status":{"phase":"RUNNING"}}}`))
+	})
 
-	es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
-	if err != nil {
-		t.Fatalf("new elasticsearch client: %v", err)
-	}
+	es := newStubClient(t, stub)
 
 	result := make(chan bool, 1)
 	go func() {
@@ -370,8 +318,8 @@ func TestExecuteEnrichPolicyCancellationStopsPolling(t *testing.T) {
 	if sleepCalls != 1 {
 		t.Fatalf("sleepWithContext calls = %d, want 1", sleepCalls)
 	}
-	if taskGetCalls != 0 {
-		t.Fatalf("Tasks.Get calls = %d, want 0 (poll loop should stop before polling again)", taskGetCalls)
+	if got := taskGetCalls.Load(); got != 0 {
+		t.Fatalf("Tasks.Get calls = %d, want 0 (poll loop should stop before polling again)", got)
 	}
 }
 
@@ -759,32 +707,6 @@ func TestPreflightTemplateFilesSkipsUnreadablePaths(t *testing.T) {
 	}
 }
 
-// templateRunRecorder is a catch-all Elasticsearch stub that records every
-// request, so tests can prove nothing reached the cluster.
-func templateRunRecorder(t *testing.T) (*httptest.Server, func() []string) {
-	t.Helper()
-
-	var (
-		mu       sync.Mutex
-		requests []string
-	)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		requests = append(requests, r.Method+" "+r.URL.Path)
-		mu.Unlock()
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	t.Cleanup(server.Close)
-
-	return server, func() []string {
-		mu.Lock()
-		defer mu.Unlock()
-		return slices.Clone(requests)
-	}
-}
-
 // TestUnresolvedTemplateVariableFailsRunBeforeClusterChanges guards the
 // fail-before-delete decision: settings and mappings are otherwise templated
 // only at index-create time, after -delete, so without the preflight a typo
@@ -812,10 +734,12 @@ func TestUnresolvedTemplateVariableFailsRunBeforeClusterChanges(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			server, requests := templateRunRecorder(t)
+			// No routes are registered: any request that reaches the
+			// cluster is an unexpected route and fails the test.
+			stub := esstub.New(t)
 			dir := t.TempDir()
 			opts := Options{
-				URL:         server.URL,
+				URL:         stub.URL(),
 				Index:       "products",
 				DeleteIndex: true,
 				SyncManaged: true,
@@ -856,7 +780,7 @@ func TestUnresolvedTemplateVariableFailsRunBeforeClusterChanges(t *testing.T) {
 			if len(tt.names) > 1 && strings.Index(err.Error(), tt.names[0]) > strings.Index(err.Error(), tt.names[1]) {
 				t.Fatalf("error %q lists %q after %q, want argument order", err.Error(), tt.names[0], tt.names[1])
 			}
-			if got := requests(); len(got) != 0 {
+			if got := requestLabels(stub); len(got) != 0 {
 				t.Fatalf("requests reached the cluster before the error: %v", got)
 			}
 		})
@@ -869,12 +793,17 @@ func TestUnresolvedTemplateVariableFailsRunBeforeClusterChanges(t *testing.T) {
 func TestSuppliedTemplateVariablesResolveThroughRun(t *testing.T) {
 	t.Parallel()
 
-	server, requests := templateRunRecorder(t)
+	stub := esstub.New(t)
+	// Only the resolved pipeline PUT is expected; the run is allowed to fail
+	// after it, so the assertion is on the resolved request path.
+	stub.Handle("HEAD /products", esstub.JSON(http.StatusOK, ""))
+	stub.Handle("PUT /_ingest/pipeline/p1", esstub.JSON(http.StatusOK, `{"acknowledged":true}`))
+	requests := func() []string { return requestLabels(stub) }
 	dir := t.TempDir()
 	pipelines := writeTempJSON(t, dir, `{"${PIPE_NAME}":{"processors":[]}}`)
 
 	_, err := Run(t.Context(), Options{
-		URL:               server.URL,
+		URL:               stub.URL(),
 		Index:             "products",
 		SyncManaged:       true,
 		PipelinesFile:     pipelines,
@@ -907,12 +836,17 @@ func TestMissingTemplateFileKeepsReadSiteClassification(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			server, _ := templateRunRecorder(t)
+			// The run reaches the cluster before the read site fails for
+			// settings and mappings, so the delete path is served.
+			stub := esstub.New(t)
+			stub.Handle("HEAD /products", esstub.JSON(http.StatusOK, ""))
+			stub.Handle("DELETE /products", esstub.JSON(http.StatusOK, ackBody))
+			stub.Handle("GET /_nodes", esstub.JSON(http.StatusOK, nodesBody))
 			dir := t.TempDir()
 			missing := filepath.Join(dir, "missing-"+tt.name+".json")
 
 			opts := Options{
-				URL:         server.URL,
+				URL:         stub.URL(),
 				Index:       "products",
 				DeleteIndex: true,
 				SyncManaged: true,
@@ -1097,20 +1031,7 @@ func TestVerifyMappingPreflight(t *testing.T) {
 	t.Run("passes with expected date_detection and field types", func(t *testing.T) {
 		t.Parallel()
 
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("X-Elastic-Product", "Elasticsearch")
-			if r.Method != http.MethodGet || r.URL.Path != "/target-index/_mapping" {
-				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"target-index":{"mappings":{"date_detection":false,"properties":{"notes":{"type":"keyword"}}}}}`))
-		}))
-		t.Cleanup(server.Close)
-
-		es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
-		if err != nil {
-			t.Fatalf("new elasticsearch client: %v", err)
-		}
+		es := newMappingResponseClient(t, "target-index", http.StatusOK, `{"target-index":{"mappings":{"date_detection":false,"properties":{"notes":{"type":"keyword"}}}}}`)
 
 		if err := verifyMappingPreflight(t.Context(), es, "target-index", plan); err != nil {
 			t.Fatalf("verifyMappingPreflight returned error: %v", err)
@@ -1120,22 +1041,9 @@ func TestVerifyMappingPreflight(t *testing.T) {
 	t.Run("fails when root field type mismatches", func(t *testing.T) {
 		t.Parallel()
 
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("X-Elastic-Product", "Elasticsearch")
-			if r.Method != http.MethodGet || r.URL.Path != "/target-index/_mapping" {
-				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"target-index":{"mappings":{"date_detection":false,"properties":{"notes":{"type":"date"}}}}}`))
-		}))
-		t.Cleanup(server.Close)
+		es := newMappingResponseClient(t, "target-index", http.StatusOK, `{"target-index":{"mappings":{"date_detection":false,"properties":{"notes":{"type":"date"}}}}}`)
 
-		es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
-		if err != nil {
-			t.Fatalf("new elasticsearch client: %v", err)
-		}
-
-		err = verifyMappingPreflight(t.Context(), es, "target-index", plan)
+		err := verifyMappingPreflight(t.Context(), es, "target-index", plan)
 		if err == nil {
 			t.Fatal("expected mapping preflight error")
 		}
@@ -1147,22 +1055,9 @@ func TestVerifyMappingPreflight(t *testing.T) {
 	t.Run("fails when date_detection mismatches", func(t *testing.T) {
 		t.Parallel()
 
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("X-Elastic-Product", "Elasticsearch")
-			if r.Method != http.MethodGet || r.URL.Path != "/target-index/_mapping" {
-				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"target-index":{"mappings":{"date_detection":true,"properties":{"notes":{"type":"keyword"}}}}}`))
-		}))
-		t.Cleanup(server.Close)
+		es := newMappingResponseClient(t, "target-index", http.StatusOK, `{"target-index":{"mappings":{"date_detection":true,"properties":{"notes":{"type":"keyword"}}}}}`)
 
-		es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
-		if err != nil {
-			t.Fatalf("new elasticsearch client: %v", err)
-		}
-
-		err = verifyMappingPreflight(t.Context(), es, "target-index", plan)
+		err := verifyMappingPreflight(t.Context(), es, "target-index", plan)
 		if err == nil {
 			t.Fatal("expected date_detection preflight error")
 		}
@@ -1180,22 +1075,7 @@ func TestVerifyMappingPreflight(t *testing.T) {
 func TestVerifyMappingPreflightReportsEveryMismatchInFieldOrder(t *testing.T) {
 	t.Parallel()
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		if r.Method != http.MethodGet || r.URL.Path != "/target-index/_mapping" {
-			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"target-index":{"mappings":{"properties":{"beta":{"type":"text"}}}}}`))
-	}))
-	t.Cleanup(server.Close)
-
-	es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
-	if err != nil {
-		t.Fatalf("new elasticsearch client: %v", err)
-	}
+	es := newMappingResponseClient(t, "target-index", http.StatusOK, `{"target-index":{"mappings":{"properties":{"beta":{"type":"text"}}}}}`)
 
 	plan := mappingPreflightPlan{
 		DateDetectionExpected: boolPointer(false),
@@ -1216,33 +1096,6 @@ func TestVerifyMappingPreflightReportsEveryMismatchInFieldOrder(t *testing.T) {
 			t.Fatalf("attempt %d: preflight error mismatch\n got: %s\nwant: %s", attempt, got, want)
 		}
 	}
-}
-
-// newMappingResponseClient starts an isolated server that answers
-// GET /<requested>/_mapping with the given status and body, and returns a
-// client for it. Each caller gets its own immutable server so parallel
-// subtests never share a mutable response.
-func newMappingResponseClient(t *testing.T, requested string, status int, body string) *elasticsearch.Client {
-	t.Helper()
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		if r.Method != http.MethodGet || r.URL.Path != "/"+requested+"/_mapping" {
-			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(status)
-		_, _ = w.Write([]byte(body))
-	}))
-	t.Cleanup(server.Close)
-
-	es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
-	if err != nil {
-		t.Fatalf("new elasticsearch client: %v", err)
-	}
-	return es
 }
 
 // TestVerifyMappingPreflightChecksEveryAliasTarget guards FIX-ALIASPRE-01:
@@ -1383,14 +1236,13 @@ func TestFetchIndexMappingsRejectsMalformedResponses(t *testing.T) {
 	t.Run("transport error", func(t *testing.T) {
 		t.Parallel()
 
-		server := httptest.NewServer(http.NotFoundHandler())
-		es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}, MaxRetries: 1, DisableRetry: true})
-		if err != nil {
-			t.Fatalf("new elasticsearch client: %v", err)
-		}
-		server.Close()
+		// Explicit early close: the connection must be refused so the
+		// client reports a transport error, not an HTTP status.
+		stub := esstub.New(t)
+		es := newStubClient(t, stub)
+		stub.Close()
 
-		_, err = fetchIndexMappings(es, "cards")
+		_, err := fetchIndexMappings(es, "cards")
 		if err == nil || !strings.Contains(err.Error(), `fetching mappings for index "cards"`) {
 			t.Fatalf("expected transport error, got %v", err)
 		}
@@ -1399,19 +1251,15 @@ func TestFetchIndexMappingsRejectsMalformedResponses(t *testing.T) {
 	t.Run("response body read error", func(t *testing.T) {
 		t.Parallel()
 
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("X-Elastic-Product", "Elasticsearch")
-			w.Header().Set("Content-Type", "application/json")
+		stub := esstub.New(t)
+		stub.Handle("GET /cards/_mapping", func(w http.ResponseWriter, _ *http.Request) {
+			// Declare more bytes than are sent so the body read fails.
 			w.Header().Set("Content-Length", "1000")
 			_, _ = w.Write([]byte(`{"cards-a":`))
-		}))
-		t.Cleanup(server.Close)
-		es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}, DisableRetry: true})
-		if err != nil {
-			t.Fatalf("new elasticsearch client: %v", err)
-		}
+		})
+		es := newStubClient(t, stub)
 
-		err = verifyMappingPreflight(t.Context(), es, "cards", plan)
+		err := verifyMappingPreflight(t.Context(), es, "cards", plan)
 		if err == nil || !strings.Contains(err.Error(), `reading mappings response for index "cards"`) {
 			t.Fatalf("expected body read error, got %v", err)
 		}
@@ -1848,65 +1696,12 @@ func TestRunMalformedMappingsFailsBeforeDelete(t *testing.T) {
 func TestRunStartsTransformsAfterEnrichExecution(t *testing.T) {
 	t.Parallel()
 
-	var (
-		mu         sync.Mutex
-		operations []string
-	)
-	recordOp := func(op string) {
-		mu.Lock()
-		defer mu.Unlock()
-		operations = append(operations, op)
-	}
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		path := r.URL.Path
-		method := r.Method
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-
-		switch {
-		case method == http.MethodHead && path == "/collection":
-			w.WriteHeader(http.StatusOK)
-			return
-		case method == http.MethodGet && path == "/_transform/collection-to-binder":
-			recordOp("transform.get")
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"count":0,"transforms":[]}`))
-			return
-		case method == http.MethodPost && path == "/_transform/collection-to-binder/_stop":
-			recordOp("transform.stop")
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte(`{"error":{"type":"resource_not_found_exception"}}`))
-			return
-		case method == http.MethodPut && path == "/_transform/collection-to-binder":
-			recordOp("transform.put")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"acknowledged":true}`))
-			return
-		case method == http.MethodPost && path == "/collection/_refresh":
-			recordOp("index.refresh")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"_shards":{"total":1,"successful":1,"failed":0}}`))
-			return
-		case method == http.MethodGet && path == "/_enrich/policy":
-			recordOp("enrich.list")
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"policies":[{"config":{"match":{"name":"policy-a"}}}]}`))
-			return
-		case (method == http.MethodPut || method == http.MethodPost) && path == "/_enrich/policy/policy-a/_execute":
-			recordOp("enrich.execute")
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"status":{"phase":"COMPLETED"}}`))
-			return
-		case method == http.MethodPost && path == "/_transform/collection-to-binder/_start":
-			recordOp("transform.start")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"acknowledged":true}`))
-			return
-		default:
-			t.Fatalf("unexpected request: %s %s", method, path)
-		}
-	}))
-	t.Cleanup(server.Close)
+	stub := newLifecycleStub(t, lifecycleConfig{
+		index:       "collection",
+		indexExists: true,
+		transforms:  []string{"collection-to-binder"},
+		policies:    []string{"policy-a"},
+	})
 
 	transformsPath := filepath.Join(t.TempDir(), "transforms.json")
 	if err := os.WriteFile(transformsPath, []byte(`{
@@ -1919,7 +1714,7 @@ func TestRunStartsTransformsAfterEnrichExecution(t *testing.T) {
 	}
 
 	_, err := Run(context.Background(), Options{
-		URL:            server.URL,
+		URL:            stub.URL(),
 		Index:          "collection",
 		SyncManaged:    true,
 		TransformsFile: transformsPath,
@@ -1932,153 +1727,23 @@ func TestRunStartsTransformsAfterEnrichExecution(t *testing.T) {
 		t.Fatalf("Run returned error: %v", err)
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
+	operations := stub.operations()
 	if len(operations) == 0 {
 		t.Fatal("expected transform and enrich operations to be recorded")
 	}
-
-	enrichIdx := -1
-	transformPutIdx := -1
-	startIdx := -1
-	for i, op := range operations {
-		if op == "enrich.execute" && enrichIdx == -1 {
-			enrichIdx = i
-		}
-		if op == "transform.put" && transformPutIdx == -1 {
-			transformPutIdx = i
-		}
-		if op == "transform.start" && startIdx == -1 {
-			startIdx = i
-		}
-	}
-	if enrichIdx == -1 {
-		t.Fatalf("expected enrich.execute operation, got %v", operations)
-	}
-	if transformPutIdx == -1 {
-		t.Fatalf("expected transform.put operation, got %v", operations)
-	}
-	if startIdx == -1 {
-		t.Fatalf("expected transform.start operation, got %v", operations)
-	}
-	if transformPutIdx <= enrichIdx {
-		t.Fatalf("expected transform.put after enrich.execute, got operations %v", operations)
-	}
-	if startIdx <= enrichIdx {
-		t.Fatalf("expected transform.start after enrich.execute, got operations %v", operations)
-	}
+	assertOperationOrder(t, operations, "enrich.execute", "transform.put")
+	assertOperationOrder(t, operations, "enrich.execute", "transform.start")
 }
 
 // TestRunAliasFirstCreateUpsertsTransformsAfterAliasUpdate verifies behavior for the related scenario.
 func TestRunAliasFirstCreateUpsertsTransformsAfterAliasUpdate(t *testing.T) {
 	t.Parallel()
 
-	var (
-		mu           sync.Mutex
-		operations   []string
-		aliasUpdated bool
-		createdIndex string
-	)
-	recordOp := func(op string) {
-		mu.Lock()
-		defer mu.Unlock()
-		operations = append(operations, op)
-	}
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		method := r.Method
-		path := r.URL.Path
-
-		switch {
-		case method == http.MethodGet && path == "/_alias/collection":
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte(`{"error":{"type":"index_not_found_exception"}}`))
-			return
-		case method == http.MethodHead && path == "/collection":
-			w.WriteHeader(http.StatusNotFound)
-			return
-		case method == http.MethodGet && path == "/_nodes":
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"nodes":{"node1":{}}}`))
-			return
-		case method == http.MethodPut && strings.HasPrefix(path, "/collection-"):
-			recordOp("index.create")
-			createdIndex = strings.TrimPrefix(path, "/")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"acknowledged":true}`))
-			return
-		case method == http.MethodHead && strings.HasPrefix(path, "/collection-"):
-			if createdIndex != "" && path == "/"+createdIndex {
-				w.WriteHeader(http.StatusOK)
-			} else {
-				w.WriteHeader(http.StatusNotFound)
-			}
-			return
-		case method == http.MethodPost && path == "/_bulk":
-			recordOp("bulk")
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"errors":false,"items":[{"index":{"_index":"collection","_id":"1","status":201}}]}`))
-			return
-		case method == http.MethodPost && path == "/_aliases":
-			recordOp("alias.update")
-			aliasUpdated = true
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"acknowledged":true}`))
-			return
-		case method == http.MethodPost && createdIndex != "" && path == "/"+createdIndex+"/_refresh":
-			recordOp("index.refresh")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"_shards":{"total":1,"successful":1,"failed":0}}`))
-			return
-		case method == http.MethodGet && path == "/_transform/collection-to-binder":
-			recordOp("transform.get")
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"count":0,"transforms":[]}`))
-			return
-		case method == http.MethodPost && path == "/_transform/collection-to-binder/_stop":
-			recordOp("transform.stop")
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte(`{"error":{"type":"resource_not_found_exception"}}`))
-			return
-		case method == http.MethodPut && path == "/_transform/collection-to-binder":
-			recordOp("transform.put")
-			if !aliasUpdated {
-				w.WriteHeader(http.StatusBadRequest)
-				_, _ = w.Write([]byte(`{"error":{"type":"validation_exception","reason":"Validation Failed: 1: no such index [collection];"},"status":400}`))
-				return
-			}
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"acknowledged":true}`))
-			return
-		case method == http.MethodPost && path == "/_transform/collection-to-binder/_start":
-			recordOp("transform.start")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"acknowledged":true}`))
-			return
-		default:
-			t.Fatalf("unexpected request: %s %s", method, path)
-		}
-	}))
-	t.Cleanup(server.Close)
-
-	tempDir := t.TempDir()
-	dataPath := filepath.Join(tempDir, "data.json")
-	if err := os.WriteFile(dataPath, []byte(`[{"id":"1","name":"card"}]`), 0o644); err != nil {
-		t.Fatalf("write data fixture: %v", err)
-	}
-	transformsPath := filepath.Join(tempDir, "transforms.json")
-	if err := os.WriteFile(transformsPath, []byte(`{
-  "collection-to-binder": {
-    "source_index": "collection",
-    "body": {"source":{"index":"collection"},"dest":{"index":"binder"}}
-  }
-}`), 0o644); err != nil {
-		t.Fatalf("write transforms fixture: %v", err)
-	}
+	stub := newLifecycleStub(t, lifecycleConfig{index: "collection", transforms: []string{"collection-to-binder"}})
+	dataPath, transformsPath := writeCollectionFixtures(t, "data.json", `[{"id":"1","name":"card"}]`)
 
 	_, err := Run(context.Background(), Options{
-		URL:            server.URL,
+		URL:            stub.URL(),
 		Index:          "collection",
 		DataFile:       dataPath,
 		DeleteIndex:    true,
@@ -2090,129 +1755,18 @@ func TestRunAliasFirstCreateUpsertsTransformsAfterAliasUpdate(t *testing.T) {
 		t.Fatalf("Run returned error: %v", err)
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-
-	aliasIdx := firstOperationIndex(operations, "alias.update")
-	transformPutIdx := firstOperationIndex(operations, "transform.put")
-	if aliasIdx == -1 || transformPutIdx == -1 {
-		t.Fatalf("expected alias.update and transform.put operations, got %v", operations)
-	}
-	if transformPutIdx <= aliasIdx {
-		t.Fatalf("expected transform.put after alias.update, got operations %v", operations)
-	}
+	assertOperationOrder(t, stub.operations(), "alias.update", "transform.put")
 }
 
 // TestRunNDJSONAliasFirstCreateUpsertsTransformsAfterAliasUpdate verifies behavior for the related scenario.
 func TestRunNDJSONAliasFirstCreateUpsertsTransformsAfterAliasUpdate(t *testing.T) {
 	t.Parallel()
 
-	var (
-		mu           sync.Mutex
-		operations   []string
-		aliasUpdated bool
-		createdIndex string
-	)
-	recordOp := func(op string) {
-		mu.Lock()
-		defer mu.Unlock()
-		operations = append(operations, op)
-	}
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		method := r.Method
-		path := r.URL.Path
-
-		switch {
-		case method == http.MethodGet && path == "/_alias/collection":
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte(`{"error":{"type":"index_not_found_exception"}}`))
-			return
-		case method == http.MethodHead && path == "/collection":
-			w.WriteHeader(http.StatusNotFound)
-			return
-		case method == http.MethodGet && path == "/_nodes":
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"nodes":{"node1":{}}}`))
-			return
-		case method == http.MethodPut && strings.HasPrefix(path, "/collection-"):
-			recordOp("index.create")
-			createdIndex = strings.TrimPrefix(path, "/")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"acknowledged":true}`))
-			return
-		case method == http.MethodHead && strings.HasPrefix(path, "/collection-"):
-			if createdIndex != "" && path == "/"+createdIndex {
-				w.WriteHeader(http.StatusOK)
-			} else {
-				w.WriteHeader(http.StatusNotFound)
-			}
-			return
-		case method == http.MethodPost && path == "/_bulk":
-			recordOp("bulk")
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"errors":false,"items":[{"index":{"_index":"collection","_id":"1","status":201}}]}`))
-			return
-		case method == http.MethodPost && path == "/_aliases":
-			recordOp("alias.update")
-			aliasUpdated = true
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"acknowledged":true}`))
-			return
-		case method == http.MethodPost && createdIndex != "" && path == "/"+createdIndex+"/_refresh":
-			recordOp("index.refresh")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"_shards":{"total":1,"successful":1,"failed":0}}`))
-			return
-		case method == http.MethodGet && path == "/_transform/collection-to-binder":
-			recordOp("transform.get")
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"count":0,"transforms":[]}`))
-			return
-		case method == http.MethodPost && path == "/_transform/collection-to-binder/_stop":
-			recordOp("transform.stop")
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte(`{"error":{"type":"resource_not_found_exception"}}`))
-			return
-		case method == http.MethodPut && path == "/_transform/collection-to-binder":
-			recordOp("transform.put")
-			if !aliasUpdated {
-				w.WriteHeader(http.StatusBadRequest)
-				_, _ = w.Write([]byte(`{"error":{"type":"validation_exception","reason":"Validation Failed: 1: no such index [collection];"},"status":400}`))
-				return
-			}
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"acknowledged":true}`))
-			return
-		case method == http.MethodPost && path == "/_transform/collection-to-binder/_start":
-			recordOp("transform.start")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"acknowledged":true}`))
-			return
-		default:
-			t.Fatalf("unexpected request: %s %s", method, path)
-		}
-	}))
-	t.Cleanup(server.Close)
-
-	tempDir := t.TempDir()
-	dataPath := filepath.Join(tempDir, "data.ndjson")
-	if err := os.WriteFile(dataPath, []byte("{\"id\":\"1\",\"name\":\"card\"}\n"), 0o644); err != nil {
-		t.Fatalf("write data fixture: %v", err)
-	}
-	transformsPath := filepath.Join(tempDir, "transforms.json")
-	if err := os.WriteFile(transformsPath, []byte(`{
-  "collection-to-binder": {
-    "source_index": "collection",
-    "body": {"source":{"index":"collection"},"dest":{"index":"binder"}}
-  }
-}`), 0o644); err != nil {
-		t.Fatalf("write transforms fixture: %v", err)
-	}
+	stub := newLifecycleStub(t, lifecycleConfig{index: "collection", transforms: []string{"collection-to-binder"}})
+	dataPath, transformsPath := writeCollectionFixtures(t, "data.ndjson", "{\"id\":\"1\",\"name\":\"card\"}\n")
 
 	_, err := Run(context.Background(), Options{
-		URL:            server.URL,
+		URL:            stub.URL(),
 		Index:          "collection",
 		DataFile:       dataPath,
 		DeleteIndex:    true,
@@ -2224,110 +1778,18 @@ func TestRunNDJSONAliasFirstCreateUpsertsTransformsAfterAliasUpdate(t *testing.T
 		t.Fatalf("Run returned error: %v", err)
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-
-	aliasIdx := firstOperationIndex(operations, "alias.update")
-	transformPutIdx := firstOperationIndex(operations, "transform.put")
-	if aliasIdx == -1 || transformPutIdx == -1 {
-		t.Fatalf("expected alias.update and transform.put operations, got %v", operations)
-	}
-	if transformPutIdx <= aliasIdx {
-		t.Fatalf("expected transform.put after alias.update, got operations %v", operations)
-	}
+	assertOperationOrder(t, stub.operations(), "alias.update", "transform.put")
 }
 
 // TestRunNonAliasCreateUpsertsTransformsAfterBulkLoad verifies behavior for the related scenario.
 func TestRunNonAliasCreateUpsertsTransformsAfterBulkLoad(t *testing.T) {
 	t.Parallel()
 
-	var (
-		mu         sync.Mutex
-		operations []string
-		indexReady bool
-	)
-	recordOp := func(op string) {
-		mu.Lock()
-		defer mu.Unlock()
-		operations = append(operations, op)
-	}
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		method := r.Method
-		path := r.URL.Path
-
-		switch {
-		case method == http.MethodHead && path == "/collection":
-			if indexReady {
-				w.WriteHeader(http.StatusOK)
-			} else {
-				w.WriteHeader(http.StatusNotFound)
-			}
-			return
-		case method == http.MethodGet && path == "/_nodes":
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"nodes":{"node1":{}}}`))
-			return
-		case method == http.MethodPut && path == "/collection":
-			recordOp("index.create")
-			indexReady = true
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"acknowledged":true}`))
-			return
-		case method == http.MethodPost && path == "/_bulk":
-			recordOp("bulk")
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"errors":false,"items":[{"index":{"_index":"collection","_id":"1","status":201}}]}`))
-			return
-		case method == http.MethodPost && path == "/collection/_refresh":
-			recordOp("index.refresh")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"_shards":{"total":1,"successful":1,"failed":0}}`))
-			return
-		case method == http.MethodGet && path == "/_transform/collection-to-binder":
-			recordOp("transform.get")
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"count":0,"transforms":[]}`))
-			return
-		case method == http.MethodPost && path == "/_transform/collection-to-binder/_stop":
-			recordOp("transform.stop")
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte(`{"error":{"type":"resource_not_found_exception"}}`))
-			return
-		case method == http.MethodPut && path == "/_transform/collection-to-binder":
-			recordOp("transform.put")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"acknowledged":true}`))
-			return
-		case method == http.MethodPost && path == "/_transform/collection-to-binder/_start":
-			recordOp("transform.start")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"acknowledged":true}`))
-			return
-		default:
-			t.Fatalf("unexpected request: %s %s", method, path)
-		}
-	}))
-	t.Cleanup(server.Close)
-
-	tempDir := t.TempDir()
-	dataPath := filepath.Join(tempDir, "data.json")
-	if err := os.WriteFile(dataPath, []byte(`[{"id":"1","name":"card"}]`), 0o644); err != nil {
-		t.Fatalf("write data fixture: %v", err)
-	}
-	transformsPath := filepath.Join(tempDir, "transforms.json")
-	if err := os.WriteFile(transformsPath, []byte(`{
-  "collection-to-binder": {
-    "source_index": "collection",
-    "body": {"source":{"index":"collection"},"dest":{"index":"binder"}}
-  }
-}`), 0o644); err != nil {
-		t.Fatalf("write transforms fixture: %v", err)
-	}
+	stub := newLifecycleStub(t, lifecycleConfig{index: "collection", transforms: []string{"collection-to-binder"}})
+	dataPath, transformsPath := writeCollectionFixtures(t, "data.json", `[{"id":"1","name":"card"}]`)
 
 	_, err := Run(context.Background(), Options{
-		URL:            server.URL,
+		URL:            stub.URL(),
 		Index:          "collection",
 		DataFile:       dataPath,
 		AddToIndex:     true,
@@ -2338,110 +1800,18 @@ func TestRunNonAliasCreateUpsertsTransformsAfterBulkLoad(t *testing.T) {
 		t.Fatalf("Run returned error: %v", err)
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-
-	bulkIdx := firstOperationIndex(operations, "bulk")
-	transformPutIdx := firstOperationIndex(operations, "transform.put")
-	if bulkIdx == -1 || transformPutIdx == -1 {
-		t.Fatalf("expected bulk and transform.put operations, got %v", operations)
-	}
-	if transformPutIdx <= bulkIdx {
-		t.Fatalf("expected transform.put after bulk, got operations %v", operations)
-	}
+	assertOperationOrder(t, stub.operations(), "bulk", "transform.put")
 }
 
 // TestRunNDJSONNonAliasCreateUpsertsTransformsAfterBulkLoad verifies behavior for the related scenario.
 func TestRunNDJSONNonAliasCreateUpsertsTransformsAfterBulkLoad(t *testing.T) {
 	t.Parallel()
 
-	var (
-		mu         sync.Mutex
-		operations []string
-		indexReady bool
-	)
-	recordOp := func(op string) {
-		mu.Lock()
-		defer mu.Unlock()
-		operations = append(operations, op)
-	}
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		method := r.Method
-		path := r.URL.Path
-
-		switch {
-		case method == http.MethodHead && path == "/collection":
-			if indexReady {
-				w.WriteHeader(http.StatusOK)
-			} else {
-				w.WriteHeader(http.StatusNotFound)
-			}
-			return
-		case method == http.MethodGet && path == "/_nodes":
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"nodes":{"node1":{}}}`))
-			return
-		case method == http.MethodPut && path == "/collection":
-			recordOp("index.create")
-			indexReady = true
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"acknowledged":true}`))
-			return
-		case method == http.MethodPost && path == "/_bulk":
-			recordOp("bulk")
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"errors":false,"items":[{"index":{"_index":"collection","_id":"1","status":201}}]}`))
-			return
-		case method == http.MethodPost && path == "/collection/_refresh":
-			recordOp("index.refresh")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"_shards":{"total":1,"successful":1,"failed":0}}`))
-			return
-		case method == http.MethodGet && path == "/_transform/collection-to-binder":
-			recordOp("transform.get")
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"count":0,"transforms":[]}`))
-			return
-		case method == http.MethodPost && path == "/_transform/collection-to-binder/_stop":
-			recordOp("transform.stop")
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte(`{"error":{"type":"resource_not_found_exception"}}`))
-			return
-		case method == http.MethodPut && path == "/_transform/collection-to-binder":
-			recordOp("transform.put")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"acknowledged":true}`))
-			return
-		case method == http.MethodPost && path == "/_transform/collection-to-binder/_start":
-			recordOp("transform.start")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"acknowledged":true}`))
-			return
-		default:
-			t.Fatalf("unexpected request: %s %s", method, path)
-		}
-	}))
-	t.Cleanup(server.Close)
-
-	tempDir := t.TempDir()
-	dataPath := filepath.Join(tempDir, "data.ndjson")
-	if err := os.WriteFile(dataPath, []byte("{\"id\":\"1\",\"name\":\"card\"}\n"), 0o644); err != nil {
-		t.Fatalf("write data fixture: %v", err)
-	}
-	transformsPath := filepath.Join(tempDir, "transforms.json")
-	if err := os.WriteFile(transformsPath, []byte(`{
-  "collection-to-binder": {
-    "source_index": "collection",
-    "body": {"source":{"index":"collection"},"dest":{"index":"binder"}}
-  }
-}`), 0o644); err != nil {
-		t.Fatalf("write transforms fixture: %v", err)
-	}
+	stub := newLifecycleStub(t, lifecycleConfig{index: "collection", transforms: []string{"collection-to-binder"}})
+	dataPath, transformsPath := writeCollectionFixtures(t, "data.ndjson", "{\"id\":\"1\",\"name\":\"card\"}\n")
 
 	_, err := Run(context.Background(), Options{
-		URL:            server.URL,
+		URL:            stub.URL(),
 		Index:          "collection",
 		DataFile:       dataPath,
 		AddToIndex:     true,
@@ -2452,17 +1822,7 @@ func TestRunNDJSONNonAliasCreateUpsertsTransformsAfterBulkLoad(t *testing.T) {
 		t.Fatalf("Run returned error: %v", err)
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-
-	bulkIdx := firstOperationIndex(operations, "bulk")
-	transformPutIdx := firstOperationIndex(operations, "transform.put")
-	if bulkIdx == -1 || transformPutIdx == -1 {
-		t.Fatalf("expected bulk and transform.put operations, got %v", operations)
-	}
-	if transformPutIdx <= bulkIdx {
-		t.Fatalf("expected transform.put after bulk, got operations %v", operations)
-	}
+	assertOperationOrder(t, stub.operations(), "bulk", "transform.put")
 }
 
 // TestRunRefreshesIndexBeforeStartingTransforms verifies that a _refresh is issued
@@ -2471,91 +1831,11 @@ func TestRunNDJSONNonAliasCreateUpsertsTransformsAfterBulkLoad(t *testing.T) {
 func TestRunRefreshesIndexBeforeStartingTransforms(t *testing.T) {
 	t.Parallel()
 
-	var (
-		mu         sync.Mutex
-		operations []string
-		indexReady bool
-	)
-	recordOp := func(op string) {
-		mu.Lock()
-		defer mu.Unlock()
-		operations = append(operations, op)
-	}
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		method := r.Method
-		path := r.URL.Path
-
-		switch {
-		case method == http.MethodHead && path == "/collection":
-			if indexReady {
-				w.WriteHeader(http.StatusOK)
-			} else {
-				w.WriteHeader(http.StatusNotFound)
-			}
-			return
-		case method == http.MethodGet && path == "/_nodes":
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"nodes":{"node1":{}}}`))
-			return
-		case method == http.MethodPut && path == "/collection":
-			recordOp("index.create")
-			indexReady = true
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"acknowledged":true}`))
-			return
-		case method == http.MethodPost && path == "/_bulk":
-			recordOp("bulk")
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"errors":false,"items":[{"index":{"_index":"collection","_id":"1","status":201}}]}`))
-			return
-		case method == http.MethodPost && path == "/collection/_refresh":
-			recordOp("index.refresh")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"_shards":{"total":1,"successful":1,"failed":0}}`))
-			return
-		case method == http.MethodGet && path == "/_transform/collection-to-binder":
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"count":0,"transforms":[]}`))
-			return
-		case method == http.MethodPost && path == "/_transform/collection-to-binder/_stop":
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte(`{"error":{"type":"resource_not_found_exception"}}`))
-			return
-		case method == http.MethodPut && path == "/_transform/collection-to-binder":
-			recordOp("transform.put")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"acknowledged":true}`))
-			return
-		case method == http.MethodPost && path == "/_transform/collection-to-binder/_start":
-			recordOp("transform.start")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"acknowledged":true}`))
-			return
-		default:
-			t.Fatalf("unexpected request: %s %s", method, path)
-		}
-	}))
-	t.Cleanup(server.Close)
-
-	tempDir := t.TempDir()
-	dataPath := filepath.Join(tempDir, "data.json")
-	if err := os.WriteFile(dataPath, []byte(`[{"id":"1","name":"card"}]`), 0o644); err != nil {
-		t.Fatalf("write data fixture: %v", err)
-	}
-	transformsPath := filepath.Join(tempDir, "transforms.json")
-	if err := os.WriteFile(transformsPath, []byte(`{
-  "collection-to-binder": {
-    "source_index": "collection",
-    "body": {"source":{"index":"collection"},"dest":{"index":"binder"}}
-  }
-}`), 0o644); err != nil {
-		t.Fatalf("write transforms fixture: %v", err)
-	}
+	stub := newLifecycleStub(t, lifecycleConfig{index: "collection", transforms: []string{"collection-to-binder"}})
+	dataPath, transformsPath := writeCollectionFixtures(t, "data.json", `[{"id":"1","name":"card"}]`)
 
 	_, err := Run(context.Background(), Options{
-		URL:            server.URL,
+		URL:            stub.URL(),
 		Index:          "collection",
 		DataFile:       dataPath,
 		AddToIndex:     true,
@@ -2566,76 +1846,14 @@ func TestRunRefreshesIndexBeforeStartingTransforms(t *testing.T) {
 		t.Fatalf("Run returned error: %v", err)
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-
-	refreshIdx := firstOperationIndex(operations, "index.refresh")
-	startIdx := firstOperationIndex(operations, "transform.start")
-
-	if refreshIdx == -1 {
-		t.Fatalf("expected index.refresh operation, got %v", operations)
-	}
-	if startIdx == -1 {
-		t.Fatalf("expected transform.start operation, got %v", operations)
-	}
-	if startIdx <= refreshIdx {
-		t.Fatalf("expected transform.start after index.refresh, got operations %v", operations)
-	}
+	assertOperationOrder(t, stub.operations(), "index.refresh", "transform.start")
 }
 
 // TestRunCreatesPipelinesBeforeIndexWhenDefaultPipelineIsConfigured verifies behavior for the related scenario.
 func TestRunCreatesPipelinesBeforeIndexWhenDefaultPipelineIsConfigured(t *testing.T) {
 	t.Parallel()
 
-	var (
-		mu         sync.Mutex
-		operations []string
-		indexReady bool
-	)
-	recordOp := func(op string) {
-		mu.Lock()
-		defer mu.Unlock()
-		operations = append(operations, op)
-	}
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		method := r.Method
-		path := r.URL.Path
-
-		switch {
-		case method == http.MethodHead && path == "/cards":
-			if indexReady {
-				w.WriteHeader(http.StatusOK)
-			} else {
-				w.WriteHeader(http.StatusNotFound)
-			}
-			return
-		case method == http.MethodPut && path == "/_ingest/pipeline/default-pipe":
-			recordOp("pipeline.put")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"acknowledged":true}`))
-			return
-		case method == http.MethodGet && path == "/_nodes":
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"nodes":{"node1":{}}}`))
-			return
-		case method == http.MethodPut && path == "/cards":
-			recordOp("index.create")
-			indexReady = true
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"acknowledged":true}`))
-			return
-		case method == http.MethodPost && path == "/_bulk":
-			recordOp("bulk")
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"errors":false,"items":[{"index":{"_index":"cards","_id":"1","status":201}}]}`))
-			return
-		default:
-			t.Fatalf("unexpected request: %s %s", method, path)
-		}
-	}))
-	t.Cleanup(server.Close)
+	stub := newPreflightRunStub(t, preflightStubConfig{})
 
 	tempDir := t.TempDir()
 	dataPath := filepath.Join(tempDir, "data.json")
@@ -2657,7 +1875,7 @@ func TestRunCreatesPipelinesBeforeIndexWhenDefaultPipelineIsConfigured(t *testin
 	}
 
 	_, err := Run(context.Background(), Options{
-		URL:           server.URL,
+		URL:           stub.URL(),
 		Index:         "cards",
 		DataFile:      dataPath,
 		AddToIndex:    true,
@@ -2669,17 +1887,7 @@ func TestRunCreatesPipelinesBeforeIndexWhenDefaultPipelineIsConfigured(t *testin
 		t.Fatalf("Run returned error: %v", err)
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-
-	pipelineIdx := firstOperationIndex(operations, "pipeline.put")
-	indexCreateIdx := firstOperationIndex(operations, "index.create")
-	if pipelineIdx == -1 || indexCreateIdx == -1 {
-		t.Fatalf("expected pipeline.put and index.create operations, got %v", operations)
-	}
-	if indexCreateIdx <= pipelineIdx {
-		t.Fatalf("expected pipeline.put before index.create, got operations %v", operations)
-	}
+	assertOperationOrder(t, stub.operations(), "pipeline.put", "index.create")
 }
 
 // TestFlushAndCheckValidatesDeleteByQueryResponse verifies that a flush fails
@@ -2714,28 +1922,17 @@ func TestFlushAndCheckValidatesDeleteByQueryResponse(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("X-Elastic-Product", "Elasticsearch")
-				if r.Method != http.MethodPost || r.URL.Path != "/cards/_delete_by_query" {
-					t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
-					w.WriteHeader(http.StatusNotFound)
-					return
-				}
+			stub := esstub.New(t)
+			stub.Handle("POST /cards/_delete_by_query", func(w http.ResponseWriter, r *http.Request) {
 				if got := r.URL.Query().Get("conflicts"); got != "proceed" {
 					t.Errorf("conflicts query mismatch: got %q want %q", got, "proceed")
 				}
 				if got := r.URL.Query().Get("refresh"); got != "true" {
 					t.Errorf("refresh query mismatch: got %q want %q", got, "true")
 				}
-				w.Header().Set("Content-Type", "application/json")
 				_, _ = w.Write([]byte(tt.body))
-			}))
-			t.Cleanup(server.Close)
-
-			es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
-			if err != nil {
-				t.Fatalf("new elasticsearch client: %v", err)
-			}
+			})
+			es := newStubClient(t, stub)
 
 			if !tt.wantErr {
 				flushAndCheck(t.Context(), es, "cards")
@@ -2755,19 +1952,11 @@ func TestFlushAndCheckValidatesDeleteByQueryResponse(t *testing.T) {
 // TestBulkInsertRejectsUnsupportedDocumentBeforeRequest verifies that payload
 // serialization failures stop the batch before Elasticsearch receives it.
 func TestBulkInsertRejectsUnsupportedDocumentBeforeRequest(t *testing.T) {
-	var requestCount atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		requestCount.Add(1)
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"errors":false,"items":[]}`))
-	}))
-	t.Cleanup(server.Close)
-
-	es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
-	if err != nil {
-		t.Fatalf("new elasticsearch client: %v", err)
-	}
+	// The bulk route is registered so a request would be answered; the
+	// assertion below is that none arrives at all.
+	stub := esstub.New(t)
+	stub.Handle("POST /_bulk", esstub.JSON(http.StatusOK, `{"errors":false,"items":[]}`))
+	es := newStubClient(t, stub)
 
 	runErr := recoverRunError(t, func() {
 		bulkInsert(
@@ -2789,7 +1978,7 @@ func TestBulkInsertRejectsUnsupportedDocumentBeforeRequest(t *testing.T) {
 	if runErr.Kind != ErrBulkFailure {
 		t.Fatalf("error kind mismatch: got %v want %v", runErr.Kind, ErrBulkFailure)
 	}
-	if got := requestCount.Load(); got != 0 {
+	if got := len(stub.Requests()); got != 0 {
 		t.Fatalf("bulk request count mismatch: got %d want 0", got)
 	}
 }
@@ -2798,31 +1987,10 @@ func TestBulkInsertRejectsUnsupportedDocumentBeforeRequest(t *testing.T) {
 func TestRunRetriesBulkOnRetryableStatus(t *testing.T) {
 	t.Parallel()
 
-	var bulkAttempts int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		switch {
-		case r.Method == http.MethodHead && r.URL.Path == "/cards":
-			w.WriteHeader(http.StatusOK)
-			return
-		case r.Method == http.MethodPost && r.URL.Path == "/_bulk":
-			bulkAttempts++
-			if bulkAttempts == 1 {
-				w.WriteHeader(http.StatusServiceUnavailable)
-				_, _ = w.Write([]byte(`{"error":true,"message":"transient"}`))
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"errors":false,"items":[{"index":{"_index":"cards","_id":"1","status":201}}]}`))
-			return
-		default:
-			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
-		}
-	}))
-	t.Cleanup(server.Close)
+	stub, bulkAttempts := newCardsBulkStub(t, bulkAfter(replyTransient503))
 
 	_, err := Run(context.Background(), Options{
-		URL:        server.URL,
+		URL:        stub.URL(),
 		Index:      "cards",
 		DataFile:   writeBulkDataFixture(t),
 		AddToIndex: true,
@@ -2831,8 +1999,8 @@ func TestRunRetriesBulkOnRetryableStatus(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
-	if bulkAttempts != 2 {
-		t.Fatalf("expected 2 bulk attempts, got %d", bulkAttempts)
+	if got := bulkAttempts.Load(); got != 2 {
+		t.Fatalf("expected 2 bulk attempts, got %d", got)
 	}
 }
 
@@ -2840,31 +2008,10 @@ func TestRunRetriesBulkOnRetryableStatus(t *testing.T) {
 func TestRunNDJSONRetriesBulkOnRetryableStatus(t *testing.T) {
 	t.Parallel()
 
-	var bulkAttempts int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		switch {
-		case r.Method == http.MethodHead && r.URL.Path == "/cards":
-			w.WriteHeader(http.StatusOK)
-			return
-		case r.Method == http.MethodPost && r.URL.Path == "/_bulk":
-			bulkAttempts++
-			if bulkAttempts == 1 {
-				w.WriteHeader(http.StatusServiceUnavailable)
-				_, _ = w.Write([]byte(`{"error":true,"message":"transient"}`))
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"errors":false,"items":[{"index":{"_index":"cards","_id":"1","status":201}}]}`))
-			return
-		default:
-			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
-		}
-	}))
-	t.Cleanup(server.Close)
+	stub, bulkAttempts := newCardsBulkStub(t, bulkAfter(replyTransient503))
 
 	_, err := Run(context.Background(), Options{
-		URL:        server.URL,
+		URL:        stub.URL(),
 		Index:      "cards",
 		DataFile:   writeBulkNDJSONFixture(t),
 		AddToIndex: true,
@@ -2873,8 +2020,8 @@ func TestRunNDJSONRetriesBulkOnRetryableStatus(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
-	if bulkAttempts != 2 {
-		t.Fatalf("expected 2 bulk attempts, got %d", bulkAttempts)
+	if got := bulkAttempts.Load(); got != 2 {
+		t.Fatalf("expected 2 bulk attempts, got %d", got)
 	}
 }
 
@@ -2882,38 +2029,10 @@ func TestRunNDJSONRetriesBulkOnRetryableStatus(t *testing.T) {
 func TestRunRetriesBulkOnTransportFailure(t *testing.T) {
 	t.Parallel()
 
-	var bulkAttempts int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		switch {
-		case r.Method == http.MethodHead && r.URL.Path == "/cards":
-			w.WriteHeader(http.StatusOK)
-			return
-		case r.Method == http.MethodPost && r.URL.Path == "/_bulk":
-			bulkAttempts++
-			if bulkAttempts == 1 {
-				hijacker, ok := w.(http.Hijacker)
-				if !ok {
-					t.Fatal("response writer does not support hijacking")
-				}
-				conn, _, err := hijacker.Hijack()
-				if err != nil {
-					t.Fatalf("hijack returned error: %v", err)
-				}
-				_ = conn.Close()
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"errors":false,"items":[{"index":{"_index":"cards","_id":"1","status":201}}]}`))
-			return
-		default:
-			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
-		}
-	}))
-	t.Cleanup(server.Close)
+	stub, bulkAttempts := newCardsBulkStub(t, bulkAfter(func(w http.ResponseWriter) { dropConnection(t, w) }))
 
 	_, err := Run(context.Background(), Options{
-		URL:        server.URL,
+		URL:        stub.URL(),
 		Index:      "cards",
 		DataFile:   writeBulkDataFixture(t),
 		AddToIndex: true,
@@ -2922,8 +2041,8 @@ func TestRunRetriesBulkOnTransportFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
-	if bulkAttempts != 2 {
-		t.Fatalf("expected 2 bulk attempts, got %d", bulkAttempts)
+	if got := bulkAttempts.Load(); got != 2 {
+		t.Fatalf("expected 2 bulk attempts, got %d", got)
 	}
 }
 
@@ -2931,38 +2050,10 @@ func TestRunRetriesBulkOnTransportFailure(t *testing.T) {
 func TestRunNDJSONRetriesBulkOnTransportFailure(t *testing.T) {
 	t.Parallel()
 
-	var bulkAttempts int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		switch {
-		case r.Method == http.MethodHead && r.URL.Path == "/cards":
-			w.WriteHeader(http.StatusOK)
-			return
-		case r.Method == http.MethodPost && r.URL.Path == "/_bulk":
-			bulkAttempts++
-			if bulkAttempts == 1 {
-				hijacker, ok := w.(http.Hijacker)
-				if !ok {
-					t.Fatal("response writer does not support hijacking")
-				}
-				conn, _, err := hijacker.Hijack()
-				if err != nil {
-					t.Fatalf("hijack returned error: %v", err)
-				}
-				_ = conn.Close()
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"errors":false,"items":[{"index":{"_index":"cards","_id":"1","status":201}}]}`))
-			return
-		default:
-			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
-		}
-	}))
-	t.Cleanup(server.Close)
+	stub, bulkAttempts := newCardsBulkStub(t, bulkAfter(func(w http.ResponseWriter) { dropConnection(t, w) }))
 
 	_, err := Run(context.Background(), Options{
-		URL:        server.URL,
+		URL:        stub.URL(),
 		Index:      "cards",
 		DataFile:   writeBulkNDJSONFixture(t),
 		AddToIndex: true,
@@ -2971,8 +2062,8 @@ func TestRunNDJSONRetriesBulkOnTransportFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
-	if bulkAttempts != 2 {
-		t.Fatalf("expected 2 bulk attempts, got %d", bulkAttempts)
+	if got := bulkAttempts.Load(); got != 2 {
+		t.Fatalf("expected 2 bulk attempts, got %d", got)
 	}
 }
 
@@ -2980,26 +2071,10 @@ func TestRunNDJSONRetriesBulkOnTransportFailure(t *testing.T) {
 func TestRunDoesNotRetryBulkOnBadRequest(t *testing.T) {
 	t.Parallel()
 
-	var bulkAttempts int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		switch {
-		case r.Method == http.MethodHead && r.URL.Path == "/cards":
-			w.WriteHeader(http.StatusOK)
-			return
-		case r.Method == http.MethodPost && r.URL.Path == "/_bulk":
-			bulkAttempts++
-			w.WriteHeader(http.StatusBadRequest)
-			_, _ = w.Write([]byte(`{"error":true,"message":"bad request"}`))
-			return
-		default:
-			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
-		}
-	}))
-	t.Cleanup(server.Close)
+	stub, bulkAttempts := newCardsBulkStub(t, bulkAlways(http.StatusBadRequest, `{"error":true,"message":"bad request"}`))
 
 	_, err := Run(context.Background(), Options{
-		URL:        server.URL,
+		URL:        stub.URL(),
 		Index:      "cards",
 		DataFile:   writeBulkDataFixture(t),
 		AddToIndex: true,
@@ -3008,8 +2083,8 @@ func TestRunDoesNotRetryBulkOnBadRequest(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected Run to fail")
 	}
-	if bulkAttempts != 1 {
-		t.Fatalf("expected 1 bulk attempt, got %d", bulkAttempts)
+	if got := bulkAttempts.Load(); got != 1 {
+		t.Fatalf("expected 1 bulk attempt, got %d", got)
 	}
 }
 
@@ -3017,26 +2092,10 @@ func TestRunDoesNotRetryBulkOnBadRequest(t *testing.T) {
 func TestRunNDJSONDoesNotRetryBulkOnBadRequest(t *testing.T) {
 	t.Parallel()
 
-	var bulkAttempts int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		switch {
-		case r.Method == http.MethodHead && r.URL.Path == "/cards":
-			w.WriteHeader(http.StatusOK)
-			return
-		case r.Method == http.MethodPost && r.URL.Path == "/_bulk":
-			bulkAttempts++
-			w.WriteHeader(http.StatusBadRequest)
-			_, _ = w.Write([]byte(`{"error":true,"message":"bad request"}`))
-			return
-		default:
-			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
-		}
-	}))
-	t.Cleanup(server.Close)
+	stub, bulkAttempts := newCardsBulkStub(t, bulkAlways(http.StatusBadRequest, `{"error":true,"message":"bad request"}`))
 
 	_, err := Run(context.Background(), Options{
-		URL:        server.URL,
+		URL:        stub.URL(),
 		Index:      "cards",
 		DataFile:   writeBulkNDJSONFixture(t),
 		AddToIndex: true,
@@ -3045,8 +2104,8 @@ func TestRunNDJSONDoesNotRetryBulkOnBadRequest(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected Run to fail")
 	}
-	if bulkAttempts != 1 {
-		t.Fatalf("expected 1 bulk attempt, got %d", bulkAttempts)
+	if got := bulkAttempts.Load(); got != 1 {
+		t.Fatalf("expected 1 bulk attempt, got %d", got)
 	}
 }
 
@@ -3054,26 +2113,10 @@ func TestRunNDJSONDoesNotRetryBulkOnBadRequest(t *testing.T) {
 func TestRunExhaustsRetriesOnRetryableStatus(t *testing.T) {
 	t.Parallel()
 
-	var bulkAttempts int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		switch {
-		case r.Method == http.MethodHead && r.URL.Path == "/cards":
-			w.WriteHeader(http.StatusOK)
-			return
-		case r.Method == http.MethodPost && r.URL.Path == "/_bulk":
-			bulkAttempts++
-			w.WriteHeader(http.StatusTooManyRequests)
-			_, _ = w.Write([]byte(`{"error":true,"message":"too many requests"}`))
-			return
-		default:
-			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
-		}
-	}))
-	t.Cleanup(server.Close)
+	stub, bulkAttempts := newCardsBulkStub(t, bulkAlways(http.StatusTooManyRequests, `{"error":true,"message":"too many requests"}`))
 
 	_, err := Run(context.Background(), Options{
-		URL:               server.URL,
+		URL:               stub.URL(),
 		Index:             "cards",
 		DataFile:          writeBulkDataFixture(t),
 		AddToIndex:        true,
@@ -3083,8 +2126,8 @@ func TestRunExhaustsRetriesOnRetryableStatus(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected Run to fail")
 	}
-	if bulkAttempts != 3 {
-		t.Fatalf("expected 3 bulk attempts, got %d", bulkAttempts)
+	if got := bulkAttempts.Load(); got != 3 {
+		t.Fatalf("expected 3 bulk attempts, got %d", got)
 	}
 }
 
@@ -3092,26 +2135,10 @@ func TestRunExhaustsRetriesOnRetryableStatus(t *testing.T) {
 func TestRunNDJSONExhaustsRetriesOnRetryableStatus(t *testing.T) {
 	t.Parallel()
 
-	var bulkAttempts int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		switch {
-		case r.Method == http.MethodHead && r.URL.Path == "/cards":
-			w.WriteHeader(http.StatusOK)
-			return
-		case r.Method == http.MethodPost && r.URL.Path == "/_bulk":
-			bulkAttempts++
-			w.WriteHeader(http.StatusTooManyRequests)
-			_, _ = w.Write([]byte(`{"error":true,"message":"too many requests"}`))
-			return
-		default:
-			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
-		}
-	}))
-	t.Cleanup(server.Close)
+	stub, bulkAttempts := newCardsBulkStub(t, bulkAlways(http.StatusTooManyRequests, `{"error":true,"message":"too many requests"}`))
 
 	_, err := Run(context.Background(), Options{
-		URL:               server.URL,
+		URL:               stub.URL(),
 		Index:             "cards",
 		DataFile:          writeBulkNDJSONFixture(t),
 		AddToIndex:        true,
@@ -3121,8 +2148,8 @@ func TestRunNDJSONExhaustsRetriesOnRetryableStatus(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected Run to fail")
 	}
-	if bulkAttempts != 3 {
-		t.Fatalf("expected 3 bulk attempts, got %d", bulkAttempts)
+	if got := bulkAttempts.Load(); got != 3 {
+		t.Fatalf("expected 3 bulk attempts, got %d", got)
 	}
 }
 
@@ -3139,26 +2166,10 @@ func TestRunRetryBackoffCapsAtConfiguredMax(t *testing.T) {
 		sleepWithContext = previousSleep
 	})
 
-	var bulkAttempts int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		switch {
-		case r.Method == http.MethodHead && r.URL.Path == "/cards":
-			w.WriteHeader(http.StatusOK)
-			return
-		case r.Method == http.MethodPost && r.URL.Path == "/_bulk":
-			bulkAttempts++
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = w.Write([]byte(`{"error":true,"message":"transient"}`))
-			return
-		default:
-			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
-		}
-	}))
-	t.Cleanup(server.Close)
+	stub, bulkAttempts := newCardsBulkStub(t, bulkAlways(http.StatusServiceUnavailable, `{"error":true,"message":"transient"}`))
 
 	_, err := Run(context.Background(), Options{
-		URL:                  server.URL,
+		URL:                  stub.URL(),
 		Index:                "cards",
 		DataFile:             writeBulkDataFixture(t),
 		AddToIndex:           true,
@@ -3170,8 +2181,8 @@ func TestRunRetryBackoffCapsAtConfiguredMax(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected Run to fail")
 	}
-	if bulkAttempts != 4 {
-		t.Fatalf("expected 4 bulk attempts, got %d", bulkAttempts)
+	if got := bulkAttempts.Load(); got != 4 {
+		t.Fatalf("expected 4 bulk attempts, got %d", got)
 	}
 	wantSleeps := []time.Duration{200 * time.Millisecond, 300 * time.Millisecond, 300 * time.Millisecond}
 	if !reflect.DeepEqual(sleeps, wantSleeps) {
@@ -3192,26 +2203,10 @@ func TestRunNDJSONRetryBackoffCapsAtConfiguredMax(t *testing.T) {
 		sleepWithContext = previousSleep
 	})
 
-	var bulkAttempts int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		switch {
-		case r.Method == http.MethodHead && r.URL.Path == "/cards":
-			w.WriteHeader(http.StatusOK)
-			return
-		case r.Method == http.MethodPost && r.URL.Path == "/_bulk":
-			bulkAttempts++
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = w.Write([]byte(`{"error":true,"message":"transient"}`))
-			return
-		default:
-			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
-		}
-	}))
-	t.Cleanup(server.Close)
+	stub, bulkAttempts := newCardsBulkStub(t, bulkAlways(http.StatusServiceUnavailable, `{"error":true,"message":"transient"}`))
 
 	_, err := Run(context.Background(), Options{
-		URL:                  server.URL,
+		URL:                  stub.URL(),
 		Index:                "cards",
 		DataFile:             writeBulkNDJSONFixture(t),
 		AddToIndex:           true,
@@ -3223,8 +2218,8 @@ func TestRunNDJSONRetryBackoffCapsAtConfiguredMax(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected Run to fail")
 	}
-	if bulkAttempts != 4 {
-		t.Fatalf("expected 4 bulk attempts, got %d", bulkAttempts)
+	if got := bulkAttempts.Load(); got != 4 {
+		t.Fatalf("expected 4 bulk attempts, got %d", got)
 	}
 	wantSleeps := []time.Duration{200 * time.Millisecond, 300 * time.Millisecond, 300 * time.Millisecond}
 	if !reflect.DeepEqual(sleeps, wantSleeps) {
@@ -3376,30 +2371,10 @@ func TestLoadNDJSONProducesCorrectDocuments(t *testing.T) {
 		t.Fatalf("write NDJSON fixture: %v", err)
 	}
 
-	var bulkBody []byte
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		switch {
-		case r.Method == http.MethodHead && r.URL.Path == "/cards":
-			w.WriteHeader(http.StatusOK)
-			return
-		case r.Method == http.MethodPost && r.URL.Path == "/_bulk":
-			var err error
-			bulkBody, err = io.ReadAll(r.Body)
-			if err != nil {
-				t.Fatalf("read bulk body: %v", err)
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"errors":false,"items":[{"index":{"_index":"cards","_id":"1","status":201}},{"index":{"_index":"cards","_id":"2","status":201}},{"index":{"_index":"cards","_id":"3","status":201}}]}`))
-			return
-		default:
-			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
-		}
-	}))
-	t.Cleanup(server.Close)
+	stub, _ := newCardsBulkStub(t, bulkAlways(http.StatusOK, `{"errors":false,"items":[{"index":{"_index":"cards","_id":"1","status":201}},{"index":{"_index":"cards","_id":"2","status":201}},{"index":{"_index":"cards","_id":"3","status":201}}]}`))
 
 	_, err := Run(context.Background(), Options{
-		URL:        server.URL,
+		URL:        stub.URL(),
 		Index:      "cards",
 		DataFile:   dataPath,
 		AddToIndex: true,
@@ -3407,6 +2382,14 @@ func TestLoadNDJSONProducesCorrectDocuments(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("Run returned error: %v", err)
+	}
+
+	// The body is read from the stub's by-value trace, after Run returned.
+	var bulkBody []byte
+	for _, request := range stub.Requests() {
+		if request.Method == http.MethodPost && request.Path == "/_bulk" {
+			bulkBody = request.Body
+		}
 	}
 
 	lines := strings.Split(strings.TrimSpace(string(bulkBody)), "\n")
@@ -3456,158 +2439,6 @@ func operationCount(operations []string, operation string) int {
 		}
 	}
 	return count
-}
-
-// preflightStubConfig configures newPreflightRunStub for the mapping
-// preflight ordering tests. All indices live under the name "cards".
-type preflightStubConfig struct {
-	indexExists   bool     // HEAD /cards answers 200 before any create
-	aliasTargets  []string // non-empty: GET /_alias/cards resolves to these indices
-	liveMappings  string   // response body for GET /<index>/_mapping
-	mappingStatus int      // status for GET /<index>/_mapping; 0 means 200
-}
-
-// preflightRunStub is an operation-recording Elasticsearch stub shared by the
-// mapping preflight Run tests. operations lists the order of recorded calls;
-// createdIndices and mappingTargets name the concrete index of each create and
-// mapping fetch, so alias tests can prove the timestamped index was checked.
-type preflightRunStub struct {
-	url string
-
-	mu             sync.Mutex
-	ops            []string
-	created        []string
-	mappingTargets []string
-}
-
-// operations returns a copy of the recorded operation names.
-func (s *preflightRunStub) operations() []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return slices.Clone(s.ops)
-}
-
-// createdIndices returns a copy of the index names created through PUT /<index>.
-func (s *preflightRunStub) createdIndices() []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return slices.Clone(s.created)
-}
-
-// mappingFetchTargets returns a copy of the index names whose _mapping was fetched.
-func (s *preflightRunStub) mappingFetchTargets() []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return slices.Clone(s.mappingTargets)
-}
-
-// newPreflightRunStub starts the shared stub. Unknown requests fail the test
-// with t.Errorf (not t.Fatalf, which must not run off the test goroutine).
-func newPreflightRunStub(t *testing.T, cfg preflightStubConfig) *preflightRunStub {
-	t.Helper()
-
-	stub := &preflightRunStub{}
-	present := map[string]bool{"cards": cfg.indexExists}
-	record := func(op string) {
-		stub.mu.Lock()
-		defer stub.mu.Unlock()
-		stub.ops = append(stub.ops, op)
-	}
-	isIndexPath := func(path string) bool {
-		name := strings.TrimPrefix(path, "/")
-		return name == "cards" || (strings.HasPrefix(name, "cards-") && !strings.Contains(name, "/"))
-	}
-	writeJSON := func(w http.ResponseWriter, status int, body string) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(status)
-		_, _ = w.Write([]byte(body))
-	}
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		method := r.Method
-		path := r.URL.Path
-
-		switch {
-		case method == http.MethodHead && isIndexPath(path):
-			record("index.head")
-			stub.mu.Lock()
-			exists := present[strings.TrimPrefix(path, "/")]
-			stub.mu.Unlock()
-			if exists {
-				w.WriteHeader(http.StatusOK)
-			} else {
-				w.WriteHeader(http.StatusNotFound)
-			}
-		case method == http.MethodGet && path == "/_alias/cards":
-			record("alias.get")
-			if len(cfg.aliasTargets) == 0 {
-				writeJSON(w, http.StatusNotFound, `{"error":{"type":"aliases_not_found_exception"},"status":404}`)
-				return
-			}
-			targets := make(map[string]any, len(cfg.aliasTargets))
-			for _, target := range cfg.aliasTargets {
-				targets[target] = map[string]any{"aliases": map[string]any{"cards": map[string]any{}}}
-			}
-			body, _ := json.Marshal(targets)
-			writeJSON(w, http.StatusOK, string(body))
-		case method == http.MethodGet && strings.HasSuffix(path, "/_mapping"):
-			record("mapping.get")
-			stub.mu.Lock()
-			stub.mappingTargets = append(stub.mappingTargets, strings.TrimSuffix(strings.TrimPrefix(path, "/"), "/_mapping"))
-			stub.mu.Unlock()
-			status := cfg.mappingStatus
-			if status == 0 {
-				status = http.StatusOK
-			}
-			if status != http.StatusOK {
-				writeJSON(w, status, fmt.Sprintf(`{"error":{"type":"stub_mapping_failure"},"status":%d}`, status))
-				return
-			}
-			writeJSON(w, http.StatusOK, cfg.liveMappings)
-		case method == http.MethodPost && strings.HasSuffix(path, "/_delete_by_query"):
-			record("flush")
-			writeJSON(w, http.StatusOK, `{"failures":[]}`)
-		case method == http.MethodDelete && isIndexPath(path):
-			record("index.delete")
-			stub.mu.Lock()
-			present[strings.TrimPrefix(path, "/")] = false
-			stub.mu.Unlock()
-			writeJSON(w, http.StatusOK, `{"acknowledged":true}`)
-		case method == http.MethodGet && path == "/_nodes":
-			record("nodes.get")
-			writeJSON(w, http.StatusOK, `{"nodes":{"node1":{}}}`)
-		case method == http.MethodPut && isIndexPath(path):
-			record("index.create")
-			name := strings.TrimPrefix(path, "/")
-			stub.mu.Lock()
-			present[name] = true
-			stub.created = append(stub.created, name)
-			stub.mu.Unlock()
-			writeJSON(w, http.StatusOK, `{"acknowledged":true}`)
-		case method == http.MethodPost && path == "/_bulk":
-			record("bulk")
-			writeJSON(w, http.StatusOK, `{"errors":false,"items":[{"index":{"_index":"cards","_id":"1","status":201}}]}`)
-		case method == http.MethodPost && path == "/_aliases":
-			record("alias.update")
-			writeJSON(w, http.StatusOK, `{"acknowledged":true}`)
-		case method == http.MethodPut && strings.HasPrefix(path, "/_ingest/pipeline/"):
-			record("pipeline.put")
-			writeJSON(w, http.StatusOK, `{"acknowledged":true}`)
-		case method == http.MethodGet && (path == "/_enrich/policy" || path == "/_enrich/policy/"):
-			record("policy.get")
-			writeJSON(w, http.StatusOK, `{"policies":[]}`)
-		case method == http.MethodPut && strings.HasPrefix(path, "/_enrich/policy/"):
-			record("policy.put")
-			writeJSON(w, http.StatusOK, `{"acknowledged":true}`)
-		default:
-			t.Errorf("unexpected request: %s %s", method, path)
-			w.WriteHeader(http.StatusInternalServerError)
-		}
-	}))
-	t.Cleanup(server.Close)
-	stub.url = server.URL
-	return stub
 }
 
 // TestSelectedDataAction verifies behavior for the related scenario.

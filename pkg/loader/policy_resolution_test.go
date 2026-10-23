@@ -4,13 +4,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"slices"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/elastic/go-elasticsearch/v9"
+
+	"github.com/jnovack/es-bulk-loader/internal/testutil/esstub"
 )
 
 // enrichPolicyListServer serves GET /_enrich/policy with one policy per name.
@@ -21,19 +21,9 @@ func enrichPolicyListServer(t *testing.T, names ...string) *elasticsearch.Client
 	for _, name := range names {
 		entries = append(entries, fmt.Sprintf(`{"config":{"match":{"name":%q}}}`, name))
 	}
-	body := `{"policies":[` + strings.Join(entries, ",") + `]}`
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(body))
-	}))
-	t.Cleanup(server.Close)
-
-	es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
-	if err != nil {
-		t.Fatalf("NewClient returned error: %v", err)
-	}
-	return es
+	stub := esstub.New(t)
+	stub.Handle("GET /_enrich/policy", esstub.JSON(http.StatusOK, `{"policies":[`+strings.Join(entries, ",")+`]}`))
+	return newStubClient(t, stub)
 }
 
 var policyResolutionPipelines = namedDefinitions{
@@ -115,27 +105,15 @@ func TestResolvePipelinePolicyFallbacksUnchangedPaths(t *testing.T) {
 // independently of resource spelling.
 func TestAmbiguousPolicyReferenceFailsRunBeforeMutation(t *testing.T) {
 	t.Parallel()
-	var (
-		mu       sync.Mutex
-		requests []string
-	)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		requests = append(requests, r.Method+" "+r.URL.Path)
-		mu.Unlock()
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		w.Header().Set("Content-Type", "application/json")
-		if r.Method == http.MethodGet && r.URL.Path == "/_enrich/policy" {
-			_, _ = w.Write([]byte(`{"policies":[{"config":{"match":{"name":"enrich-bulk-cards-bbbbbb"}}},{"config":{"match":{"name":"enrich-bulk-cards-aaaaaa"}}}]}`))
-			return
-		}
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	t.Cleanup(server.Close)
+
+	// Only the policy listing is registered. Any other request, mutating or
+	// not, is an unexpected route and fails the test.
+	stub := esstub.New(t)
+	stub.Handle("GET /_enrich/policy", esstub.JSON(http.StatusOK, `{"policies":[{"config":{"match":{"name":"enrich-bulk-cards-bbbbbb"}}},{"config":{"match":{"name":"enrich-bulk-cards-aaaaaa"}}}]}`))
 
 	dir := t.TempDir()
 	_, err := Run(t.Context(), Options{
-		URL:           server.URL,
+		URL:           stub.URL(),
 		Index:         "products",
 		FlushIndex:    true,
 		PipelinesFile: writeTempJSON(t, dir, `{"p":{"processors":[{"enrich":{"policy_name":"enrich-bulk-cards"}}]}}`),
@@ -149,12 +127,13 @@ func TestAmbiguousPolicyReferenceFailsRunBeforeMutation(t *testing.T) {
 		t.Fatalf("error %q must name both candidates in sorted order", err.Error())
 	}
 
-	mu.Lock()
-	seen := slices.Clone(requests)
-	mu.Unlock()
+	seen := requestLabels(stub)
 	for _, request := range seen {
 		if !strings.HasPrefix(request, "GET ") && !strings.HasPrefix(request, "HEAD ") {
 			t.Fatalf("mutating request reached the cluster: %v", seen)
 		}
+	}
+	if !slices.Contains(seen, "GET /_enrich/policy") {
+		t.Fatalf("policy listing never requested; the run failed for another reason: %v", seen)
 	}
 }

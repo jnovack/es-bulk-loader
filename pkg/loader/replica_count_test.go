@@ -4,11 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 
 	"github.com/elastic/go-elasticsearch/v9"
+
+	"github.com/jnovack/es-bulk-loader/internal/testutil/esstub"
 )
 
 // TestClusterReplicaCount verifies happy and sad paths for ADR 0001.
@@ -28,48 +29,28 @@ func TestClusterReplicaCount(t *testing.T) {
 			expected: 0,
 		},
 		{
-			name: "single node returns 0",
-			handler: func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("X-Elastic-Product", "Elasticsearch")
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"nodes":{"node1":{}}}`))
-			},
+			name:     "single node returns 0",
+			handler:  esstub.JSON(http.StatusOK, `{"nodes":{"node1":{}}}`),
 			expected: 0,
 		},
 		{
-			name: "multi-node returns 1",
-			handler: func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("X-Elastic-Product", "Elasticsearch")
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"nodes":{"node1":{},"node2":{},"node3":{}}}`))
-			},
+			name:     "multi-node returns 1",
+			handler:  esstub.JSON(http.StatusOK, `{"nodes":{"node1":{},"node2":{},"node3":{}}}`),
 			expected: 1,
 		},
 		{
-			name: "non-2xx response returns 0",
-			handler: func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("X-Elastic-Product", "Elasticsearch")
-				w.WriteHeader(http.StatusForbidden)
-				_, _ = w.Write([]byte(`{"error":{"type":"security_exception"}}`))
-			},
+			name:     "non-2xx response returns 0",
+			handler:  esstub.JSON(http.StatusForbidden, `{"error":{"type":"security_exception"}}`),
 			expected: 0,
 		},
 		{
-			name: "unparseable body returns 0",
-			handler: func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("X-Elastic-Product", "Elasticsearch")
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`not json`))
-			},
+			name:     "unparseable body returns 0",
+			handler:  esstub.JSON(http.StatusOK, `not json`),
 			expected: 0,
 		},
 		{
-			name: "empty nodes object returns 0",
-			handler: func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("X-Elastic-Product", "Elasticsearch")
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"nodes":{}}`))
-			},
+			name:     "empty nodes object returns 0",
+			handler:  esstub.JSON(http.StatusOK, `{"nodes":{}}`),
 			expected: 0,
 		},
 	}
@@ -80,14 +61,9 @@ func TestClusterReplicaCount(t *testing.T) {
 
 			var es *elasticsearch.Client
 			if !tc.wantNil {
-				server := httptest.NewServer(tc.handler)
-				t.Cleanup(server.Close)
-
-				var err error
-				es, err = elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
-				if err != nil {
-					t.Fatalf("NewClient: %v", err)
-				}
+				stub := esstub.New(t)
+				stub.Handle("GET /_nodes", tc.handler)
+				es = newStubClient(t, stub)
 			}
 
 			got := clusterReplicaCount(t.Context(), es)
@@ -162,21 +138,12 @@ func TestNormalizeIndexSettingsReplicaOverridesFixture(t *testing.T) {
 func newReplicaStubClient(t *testing.T, nodeHits *atomic.Int32) *elasticsearch.Client {
 	t.Helper()
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Elastic-Product", "Elasticsearch")
-		w.Header().Set("Content-Type", "application/json")
-		if r.URL.Path == "/_nodes" {
-			nodeHits.Add(1)
-		}
+	stub := esstub.New(t)
+	stub.Handle("GET /_nodes", func(w http.ResponseWriter, _ *http.Request) {
+		nodeHits.Add(1)
 		_, _ = w.Write([]byte(`{"nodes":{"n1":{},"n2":{}}}`))
-	}))
-	t.Cleanup(server.Close)
-
-	es, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
-	return es
+	})
+	return newStubClient(t, stub)
 }
 
 // replicasInBody parses the create-index body and returns settings.number_of_replicas.
