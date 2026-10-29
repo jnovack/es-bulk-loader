@@ -1,6 +1,10 @@
 package loader
 
-import "time"
+import (
+	"time"
+
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/progress"
+)
 
 // ProgressStage names the lifecycle stage a ProgressEvent describes.
 type ProgressStage string
@@ -100,13 +104,21 @@ func (p progressEmitter) emit(e ProgressEvent) {
 	}
 }
 
-// emitBulkBatch reports per-batch bulk progress; shared so the four batch sites stay identical.
-func emitBulkBatch(emit progressEmitter, index string, processed, total int, start time.Time) {
-	emit.emit(ProgressEvent{
-		Stage:    ProgressStageBulk,
-		Resource: index,
-		Done:     int64(processed),
-		Total:    int64(total),
-		Elapsed:  progressNow().Sub(start),
-	})
+// stage returns the internal snapshot callback for one public stage. It is
+// the single mapping from progress.Snapshot to ProgressEvent, shared by the
+// enrich, transform and bulk boundaries so the fields cannot drift between
+// them; a nil Options.Progress still creates no events.
+func (p progressEmitter) stage(stage ProgressStage) func(progress.Snapshot) {
+	return func(s progress.Snapshot) {
+		p.emit(ProgressEvent{
+			Stage:    stage,
+			Resource: s.Resource,
+			Phase:    s.Phase,
+			Done:     s.Done,
+			Total:    s.Total,
+			Elapsed:  s.Elapsed,
+			Final:    s.Final,
+			Err:      s.Err,
+		})
+	}
 }

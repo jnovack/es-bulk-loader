@@ -1,9 +1,13 @@
-// Package progress provides the poll cadence and the heartbeat throttle that
-// pkg/loader uses while it waits on enrich tasks and transforms. It does not
-// log.
+// Package progress provides the poll cadence and heartbeat throttle shared by
+// the enrich and transform waits, plus the Snapshot and Seams contract that
+// enrich, transform and bulk use to report progress to package loader without
+// importing it. It does not log.
 package progress
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 const (
 	// initialPollInterval keeps the first few task checks responsive.
@@ -49,4 +53,39 @@ func (h *Heartbeat) Due() bool {
 	}
 	h.last = current
 	return true
+}
+
+// Snapshot is one progress observation that an internal owner (enrich,
+// transform, bulk) hands to package loader through a synchronous
+// func(Snapshot) callback. It deliberately has no stage: loader's single
+// adapter adds the public ProgressStage, so the field mapping to the public
+// ProgressEvent exists once and no internal package imports loader. Done and
+// Total are -1 when unknown.
+type Snapshot struct {
+	Resource string
+	Phase    string
+	Done     int64
+	Total    int64
+	Elapsed  time.Duration
+	Final    bool
+	Err      error
+}
+
+// Seams carries a Run's clock, sleep and progress callback into an internal
+// owner (enrich, transform, bulk), so no owner keeps its own copy of the
+// package-level seams that tests swap. Now times elapsed values and
+// heartbeats; Sleep waits and must return ctx.Err() once ctx is done;
+// OnProgress, when non-nil, receives each Snapshot synchronously on the
+// calling goroutine.
+type Seams struct {
+	Now        func() time.Time
+	Sleep      func(context.Context, time.Duration) error
+	OnProgress func(Snapshot)
+}
+
+// Report delivers s to OnProgress, or does nothing when there is none.
+func (s Seams) Report(snapshot Snapshot) {
+	if s.OnProgress != nil {
+		s.OnProgress(snapshot)
+	}
 }

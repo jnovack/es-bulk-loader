@@ -1,5 +1,7 @@
-// Package enrich interprets enrich task status for progress reporting. It is
-// used by pkg/loader and does not log.
+// Package enrich lists, selects and executes enrich policies for a Run and
+// interprets enrich task status for progress. It logs through internal/runlog
+// and reports progress as internal snapshots; package loader maps them to
+// public ProgressEvents and its Result. A failed policy is counted, not fatal.
 package enrich
 
 import (

@@ -12,8 +12,6 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/elastic/go-elasticsearch/v9"
-
 	"github.com/jnovack/es-bulk-loader/internal/testutil/esstub"
 )
 
@@ -28,18 +26,6 @@ const (
 	refreshBody = `{"_shards":{"total":1,"successful":1,"failed":0}}`
 )
 
-// newStubClient returns an Elasticsearch client bound to stub. A failure to
-// build the client is reported on the calling test goroutine, never from a
-// handler.
-func newStubClient(t *testing.T, stub *esstub.Stub) *elasticsearch.Client {
-	t.Helper()
-	es, err := stub.Client()
-	if err != nil {
-		t.Fatalf("new elasticsearch client: %v", err)
-	}
-	return es
-}
-
 // requestLabels renders the stub's request trace as "METHOD /path" strings in
 // arrival order.
 func requestLabels(stub *esstub.Stub) []string {
@@ -49,18 +35,6 @@ func requestLabels(stub *esstub.Stub) []string {
 		labels[i] = r.Method + " " + r.Path
 	}
 	return labels
-}
-
-// newMappingResponseClient starts an isolated stub that answers
-// GET /<requested>/_mapping with the given status and body, and returns a
-// client for it. Each caller gets its own immutable stub so parallel subtests
-// never share a mutable response. Any other request is an unexpected route.
-func newMappingResponseClient(t *testing.T, requested string, status int, body string) *elasticsearch.Client {
-	t.Helper()
-
-	stub := esstub.New(t)
-	stub.Handle("GET /"+requested+"/_mapping", esstub.JSON(status, body))
-	return newStubClient(t, stub)
 }
 
 // opRecorder records operation labels (such as "bulk" or "transform.put") in

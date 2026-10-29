@@ -1,5 +1,8 @@
-// Package transform parses transform _stats responses and decides when a
-// started transform is done. It is used by pkg/loader and does not log.
+// Package transform owns the managed transform lifecycle of a Run: source
+// filtering, stop/put/start calls and the wait on the first checkpoint, which
+// parses _stats and decides when a started transform is done. The lifecycle
+// logs through internal/runlog and reports progress as internal snapshots; the
+// _stats parsing and done rules themselves do not log.
 package transform
 
 import (

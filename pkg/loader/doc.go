@@ -6,12 +6,6 @@
 //   - load/replace/append source data in bulk,
 //   - execute enrich policies and managed transform lifecycle steps.
 //
-// File layout:
-//   - loader.go: runtime orchestration, API calls, option parsing helpers.
-//   - main_test.go: unit coverage for flags, mapping logic, and execution ordering.
-//   - pipeline_defaults_test.go: settings/pipeline normalization behavior tests.
-//   - doc.go: package contract and lifecycle semantics.
-//
 // Non-obvious decisions:
 //   - managed enrich policy names are content-hashed and rewritten in dependent
 //     pipelines to make updates deterministic and garbage-collectable.
@@ -23,9 +17,10 @@
 //     global logger, so concurrent Runs need no consumer-side mutex.
 //   - Options.Progress is a plain function field, called synchronously on Run's
 //     goroutine and never concurrently. A resource that causes a run-ending
-//     error gets no Final event: Run's error is the only failure signal, since
-//     those errors are raised by panics deep in the call graph (see
-//     ProgressEvent and docs/decisions/0004).
+//     error gets no Final event: Run's error is the only failure signal. Internal
+//     helpers return operation errors that Run converts once into a *RunError
+//     and returns at once, so no later stage runs (see ProgressEvent and
+//     docs/decisions/0004).
 //   - waiting on managed transforms is opt-in (Options.Transforms.Wait): the
 //     zero value starts transforms and returns, as it always has. The wait
 //     polls _stats per transform under a timeout that bounds HTTP and sleeps.

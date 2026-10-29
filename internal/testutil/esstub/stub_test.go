@@ -363,3 +363,23 @@ func TestCloseIsIdempotentAndRefusesConnections(t *testing.T) {
 		t.Fatal("expected connection to be refused after Close")
 	}
 }
+
+// TestMustClientReachesStub proves MustClient's client talks to this stub with
+// retries disabled: a 503 is answered once, not retried.
+func TestMustClientReachesStub(t *testing.T) {
+	s := New(t)
+	s.Handle("GET /_cluster/health", JSON(http.StatusServiceUnavailable, `{"status":"red"}`))
+
+	es := s.MustClient(t)
+	res, err := es.Cluster.Health()
+	if err != nil {
+		t.Fatalf("health request: %v", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", res.StatusCode)
+	}
+	if got := len(s.Requests()); got != 1 {
+		t.Fatalf("requests = %d, want exactly 1 (no retries)", got)
+	}
+}

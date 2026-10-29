@@ -317,9 +317,9 @@ func TestNilLoggerUsesGlobalWithTimestamp(t *testing.T) {
 	}
 }
 
-// TestFatalLogsToInjectedLogger proves fatal(ctx) writes to the injected
-// logger and that the RunError classification is unchanged by the new logger
-// source.
+// TestFatalLogsToInjectedLogger proves a helper's returned operation error
+// logs its fatal-level event on the injected logger and that the RunError
+// classification, Op and cause are unchanged at the Run boundary.
 func TestFatalLogsToInjectedLogger(t *testing.T) {
 	t.Parallel()
 
@@ -404,24 +404,5 @@ func TestConvenienceEntrypointsPropagateLogger(t *testing.T) {
 				t.Fatalf("%s with Disabled logger: %v", ep.name, err)
 			}
 		})
-	}
-}
-
-// TestLoggerFromFallsBackToGlobal pins the documented fallback and that a
-// Disabled logger carried on ctx is returned as-is, not replaced.
-func TestLoggerFromFallsBackToGlobal(t *testing.T) {
-	t.Parallel()
-
-	var nilCtx context.Context
-	if got := loggerFrom(nilCtx); got != &log.Logger {
-		t.Fatal("loggerFrom(nil) must return the global logger")
-	}
-	if got := loggerFrom(t.Context()); got != &log.Logger {
-		t.Fatal("loggerFrom(ctx without logger) must return the global logger")
-	}
-
-	nop := zerolog.Nop()
-	if got := loggerFrom(withRunLogger(t.Context(), &nop)); got != &nop {
-		t.Fatal("loggerFrom must return the logger attached with withRunLogger, even when Disabled")
 	}
 }

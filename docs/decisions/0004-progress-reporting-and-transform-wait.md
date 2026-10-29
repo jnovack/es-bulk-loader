@@ -49,6 +49,10 @@ commitment.
 - A Final event with `Err` before every run-ending error: rejected, it needs a
   `recover` around each stage because those errors are `fatal()` panics, and
   the project prohibits clever control flow in lifecycle ordering.
+  - Note, 2026-10-29: REFACTOR-INTERNAL-01 replaced those panics with returned
+    operation errors, so the premise changed. The decision stands: Run returns
+    at the first failure, which stays the only failure signal, and no Final
+    event precedes a run-ending error.
 
 ## Consequences
 

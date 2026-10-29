@@ -98,3 +98,17 @@ func TestHeartbeatDue(t *testing.T) {
 		})
 	}
 }
+
+// TestSeamsReportIsNilSafe pins that Report delivers the snapshot unchanged
+// and that a nil OnProgress creates nothing.
+func TestSeamsReportIsNilSafe(t *testing.T) {
+	t.Parallel()
+
+	want := Snapshot{Resource: "r", Done: -1, Total: -1, Final: true}
+	var got []Snapshot
+	Seams{OnProgress: func(s Snapshot) { got = append(got, s) }}.Report(want)
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("reported %+v, want [%+v]", got, want)
+	}
+	Seams{}.Report(want) // must not panic
+}

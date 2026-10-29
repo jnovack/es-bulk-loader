@@ -74,6 +74,18 @@ func (s *Stub) Client() (*elasticsearch.Client, error) {
 	})
 }
 
+// MustClient is Client for test bodies in every package that drives the real
+// client against a Stub: a failure to build the client stops the calling
+// test. Call it on the test goroutine, never from a handler.
+func (s *Stub) MustClient(t testing.TB) *elasticsearch.Client {
+	t.Helper()
+	es, err := s.Client()
+	if err != nil {
+		t.Fatalf("new elasticsearch client: %v", err)
+	}
+	return es
+}
+
 // Handle registers handler for a Go ServeMux pattern such as
 // "PUT /_ingest/pipeline/{name}". Register routes before requests begin.
 func (s *Stub) Handle(pattern string, handler http.HandlerFunc) {

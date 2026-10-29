@@ -19,6 +19,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/jnovack/es-bulk-loader/internal/testutil/esstub"
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/progress"
 )
 
 // Every test in this file is serial: they replace the package variables
@@ -1210,36 +1211,22 @@ func TestProgressResourceNamesDoNotCollide(t *testing.T) {
 	}
 }
 
-// TestProgressCallbackPanicContract pins the documented panic semantics: an
-// error value fails Run through the existing recover; any other value
-// propagates as it does today.
-func TestProgressCallbackPanicContract(t *testing.T) {
-	t.Run("error panic becomes a failed Run", func(t *testing.T) {
-		installFakeClock(t, time.Second)
-		server, ops := newProgressStub(t, nil)
-		boom := errors.New("callback exploded")
+// TestProgressStageAdapterMapsEverySnapshotField guards the single
+// Snapshot-to-ProgressEvent mapping shared by the enrich, transform and bulk
+// boundaries: every field crosses unchanged under the fixed stage, and a nil
+// callback creates nothing.
+func TestProgressStageAdapterMapsEverySnapshotField(t *testing.T) {
+	t.Parallel()
 
-		run := runProgress(t, server, ops, zerolog.InfoLevel, func(o *Options) {
-			o.Progress = func(ProgressEvent) { panic(boom) }
-		})
-		var runErr *RunError
-		if !errors.As(run.err, &runErr) || !errors.Is(run.err, boom) || runErr.Op != "panic" {
-			t.Fatalf("error = %v, want a *RunError{Op: panic} wrapping the panic value", run.err)
+	cause := errors.New("policy failed")
+	snapshot := progress.Snapshot{Resource: "r", Phase: "p", Done: 3, Total: -1, Elapsed: 2 * time.Second, Final: true, Err: cause}
+	for _, stage := range []ProgressStage{ProgressStageBulk, ProgressStageEnrich, ProgressStageTransform} {
+		var got []ProgressEvent
+		progressEmitter(func(e ProgressEvent) { got = append(got, e) }).stage(stage)(snapshot)
+		want := ProgressEvent{Stage: stage, Resource: "r", Phase: "p", Done: 3, Total: -1, Elapsed: 2 * time.Second, Final: true, Err: cause}
+		if len(got) != 1 || got[0] != want {
+			t.Fatalf("stage %s: events = %+v, want [%+v]", stage, got, want)
 		}
-	})
-
-	t.Run("non-error panic propagates", func(t *testing.T) {
-		installFakeClock(t, time.Second)
-		server, ops := newProgressStub(t, nil)
-
-		defer func() {
-			if recovered := recover(); recovered != "string panic" {
-				t.Fatalf("recovered %v, want the original string panic to propagate", recovered)
-			}
-		}()
-		runProgress(t, server, ops, zerolog.InfoLevel, func(o *Options) {
-			o.Progress = func(ProgressEvent) { panic("string panic") }
-		})
-		t.Fatal("Run returned; the non-error panic should have propagated")
-	})
+	}
+	progressEmitter(nil).stage(ProgressStageBulk)(snapshot) // must not panic
 }
