@@ -5,12 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/elastic/go-elasticsearch/v9"
 
 	"github.com/jnovack/es-bulk-loader/internal/testutil/esstub"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/failure"
@@ -217,6 +221,241 @@ func TestLoadReportsBatchesAndTotals(t *testing.T) {
 			if len(snapshots) != 2 || snapshots[0].Done != 2 || snapshots[1].Done != 3 ||
 				snapshots[0].Total != 3 || snapshots[1].Total != 3 || snapshots[0].Resource != "cards" || snapshots[1].Final {
 				t.Fatalf("snapshots = %+v, want two non-final batches 2/3 then 3/3 for cards", snapshots)
+			}
+		})
+	}
+}
+
+// fakeNetError is a net.Error whose Timeout and Temporary results are set
+// directly, so the classifier table can pin every flag combination.
+type fakeNetError struct{ timeout, temporary bool }
+
+func (e fakeNetError) Error() string   { return "fake net error" }
+func (e fakeNetError) Timeout() bool   { return e.timeout }
+func (e fakeNetError) Temporary() bool { return e.temporary }
+
+// TestIsRetryableTransportError pins the retry decision for transport errors.
+// Only net.Error.Timeout() retries; Temporary() is deprecated and no longer
+// consulted, so a temporary-only error must not retry. A revert to
+// Timeout() || Temporary() fails the named row.
+func TestIsRetryableTransportError(t *testing.T) {
+	t.Parallel()
+
+	errnoOp := func(e syscall.Errno) error {
+		return &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", e)}
+	}
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"context canceled", context.Canceled, false},
+		{"wrapped context canceled", fmt.Errorf("send: %w", context.Canceled), false},
+		{"timeout is retried", fakeNetError{timeout: true}, true},
+		{"timeout with temporary is retried", fakeNetError{timeout: true, temporary: true}, true},
+		{"neither flag is not retried", fakeNetError{}, false},
+		{"temporary-only is no longer retried FIX-NETTEMP-01", fakeNetError{temporary: true}, false},
+		{"wrapped timeout is retried", fmt.Errorf("send: %w", fakeNetError{timeout: true}), true},
+		{"wrapped temporary-only is not retried", fmt.Errorf("send: %w", fakeNetError{temporary: true}), false},
+		{"context deadline exceeded is retried", context.DeadlineExceeded, true},
+		{"wrapped context deadline exceeded is retried", fmt.Errorf("send: %w", context.DeadlineExceeded), true},
+		{"temporary DNS failure is not retried", &net.DNSError{Err: "temporary lookup failure", Name: "es.invalid", IsTemporary: true}, false},
+		{"DNS timeout is retried", &net.DNSError{Err: "i/o timeout", Name: "es.invalid", IsTimeout: true}, true},
+		{"EINTR is not retried", errnoOp(syscall.EINTR), false},
+		{"EMFILE is not retried", errnoOp(syscall.EMFILE), false},
+		{"ENFILE is not retried", errnoOp(syscall.ENFILE), false},
+		{"ECONNREFUSED is not retried", errnoOp(syscall.ECONNREFUSED), false},
+		{"ECONNRESET is not retried", errnoOp(syscall.ECONNRESET), false},
+		{"io.EOF is retried", io.EOF, true},
+		{"wrapped io.EOF is retried", fmt.Errorf("read: %w", io.EOF), true},
+		{"io.ErrUnexpectedEOF is retried", io.ErrUnexpectedEOF, true},
+		{"plain error is retried", errors.New("boom"), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isRetryableTransportError(tt.err); got != tt.want {
+				t.Fatalf("isRetryableTransportError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+// bulkRoundTripFunc adapts a function to http.RoundTripper so a test can fail
+// chosen bulk attempts with real stdlib errors before any bytes reach the stub.
+type bulkRoundTripFunc func(*http.Request) (*http.Response, error)
+
+// RoundTrip calls f.
+func (f bulkRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+// TestBulkInsertTransportRetryPolicy drives bulkInsert through the real client
+// with injected transport errors. A timeout is retried until the budget runs
+// out, a temporary-only DNS failure fails on its first attempt, and an ended
+// request context stops the loop before classification. Sleeps are recorded,
+// never waited on, and no real DNS is used.
+func TestBulkInsertTransportRetryPolicy(t *testing.T) {
+	t.Parallel()
+
+	timeoutErr := &net.OpError{Op: "dial", Net: "tcp", Err: os.ErrDeadlineExceeded}
+	dnsErr := &net.DNSError{Err: "temporary lookup failure", Name: "es.invalid", IsTemporary: true}
+
+	tests := []struct {
+		name string
+		// fail returns the transport error for the 1-based attempt, or nil to
+		// delegate that attempt to the stub.
+		fail          func(attempt int, cancel context.CancelFunc) error
+		wantAttempts  int
+		wantSleeps    int
+		wantServer    int
+		wantCause     error // nil means the call must succeed
+		wantSucceeded int
+	}{
+		{
+			name: "timeout is retried then succeeds",
+			fail: func(attempt int, _ context.CancelFunc) error {
+				if attempt == 1 {
+					return timeoutErr
+				}
+				return nil
+			},
+			wantAttempts:  2,
+			wantSleeps:    1,
+			wantServer:    1,
+			wantSucceeded: 1,
+		},
+		{
+			name: "temporary-only DNS failure fails on first attempt FIX-NETTEMP-01",
+			fail: func(int, context.CancelFunc) error {
+				return dnsErr
+			},
+			wantAttempts: 1,
+			wantCause:    dnsErr,
+		},
+		{
+			name: "timeout on every call exhausts the budget",
+			fail: func(int, context.CancelFunc) error {
+				return timeoutErr
+			},
+			wantAttempts: 3,
+			wantSleeps:   2,
+			wantCause:    timeoutErr,
+		},
+		{
+			name: "request context ended during timeout stops retrying",
+			fail: func(attempt int, cancel context.CancelFunc) error {
+				if attempt == 1 {
+					cancel()
+				}
+				return timeoutErr
+			},
+			wantAttempts: 1,
+			wantCause:    context.Canceled,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+
+			stub := esstub.New(t)
+			stub.Handle("POST /_bulk", esstub.JSON(http.StatusOK, `{"errors":false,"items":[{"index":{"_index":"cards","_id":"1","status":201}}]}`))
+
+			base := &http.Transport{}
+			t.Cleanup(base.CloseIdleConnections)
+			var attempts atomic.Int32
+			transport := bulkRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.Method != http.MethodPost || req.URL.Path != "/_bulk" {
+					// Non-bulk traffic (the client's product check) goes to the
+					// strict stub, which fails the test on any unexpected route.
+					return base.RoundTrip(req)
+				}
+				attempt := int(attempts.Add(1))
+				if err := tt.fail(attempt, cancel); err != nil {
+					if req.Body != nil {
+						if closeErr := req.Body.Close(); closeErr != nil {
+							t.Errorf("close intercepted bulk body: %v", closeErr)
+						}
+					}
+					return nil, err
+				}
+				return base.RoundTrip(req)
+			})
+
+			es, err := elasticsearch.NewClient(elasticsearch.Config{
+				Addresses:    []string{stub.URL()},
+				Transport:    transport,
+				DisableRetry: true,
+				MaxRetries:   0,
+			})
+			if err != nil {
+				t.Fatalf("new elasticsearch client: %v", err)
+			}
+
+			var sleeps []time.Duration
+			sleep := func(ctx context.Context, d time.Duration) error {
+				sleeps = append(sleeps, d)
+				return ctx.Err()
+			}
+
+			got, err := bulkInsert(
+				ctx,
+				es,
+				"cards",
+				[]map[string]interface{}{{"id": "1"}},
+				1,
+				1,
+				3,
+				time.Millisecond,
+				time.Millisecond,
+				"id",
+				sleep,
+			)
+
+			if n := int(attempts.Load()); n != tt.wantAttempts {
+				t.Fatalf("transport attempts = %d, want %d", n, tt.wantAttempts)
+			}
+			if len(sleeps) != tt.wantSleeps {
+				t.Fatalf("retry sleeps = %v, want %d", sleeps, tt.wantSleeps)
+			}
+			for _, d := range sleeps {
+				if d != time.Millisecond {
+					t.Fatalf("retry sleep = %v, want %v", d, time.Millisecond)
+				}
+			}
+			server := 0
+			for _, r := range stub.Requests() {
+				if r.Method == http.MethodPost && r.Path == "/_bulk" {
+					server++
+				}
+			}
+			if server != tt.wantServer {
+				t.Fatalf("server bulk requests = %d, want %d", server, tt.wantServer)
+			}
+
+			if tt.wantCause == nil {
+				if err != nil {
+					t.Fatalf("bulkInsert returned error: %v", err)
+				}
+				if want := (bulkInsertResult{Succeeded: tt.wantSucceeded}); got != want {
+					t.Fatalf("bulkInsert result = %+v, want %+v", got, want)
+				}
+				return
+			}
+
+			var opErr *failure.Error
+			if !errors.As(err, &opErr) || opErr.Op != "Bulk API request failed" {
+				t.Fatalf("bulkInsert error = %#v, want operation error %q", err, "Bulk API request failed")
+			}
+			if !errors.Is(err, tt.wantCause) {
+				t.Fatalf("bulkInsert error = %v, want cause %v", err, tt.wantCause)
+			}
+			if got != (bulkInsertResult{}) {
+				t.Fatalf("bulkInsert result = %+v, want zero on failure", got)
 			}
 		})
 	}

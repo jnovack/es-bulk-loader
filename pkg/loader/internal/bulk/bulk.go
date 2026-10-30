@@ -494,7 +494,14 @@ func isRetryableBulkStatus(statusCode int) bool {
 	}
 }
 
-// isRetryableTransportError centralizes retryable transport error classification.
+// isRetryableTransportError classifies a failed bulk transport call for retry.
+// Among net.Error values (wrapped or not) only Timeout() errors retry. Temporary()
+// is deprecated and ill-defined, so it is never consulted: a temporary-only
+// error, such as a temporary DNS failure or, on Unix, EINTR/EMFILE/ENFILE, fails
+// on its first attempt. Cancellation (including wrapped context.Canceled) never
+// retries. Errors that are not net.Error, such as io.EOF from a dropped
+// connection, retry. bulkInsert separately stops once its request context has
+// ended, whatever this returns.
 func isRetryableTransportError(err error) bool {
 	if err == nil {
 		return false
@@ -504,7 +511,7 @@ func isRetryableTransportError(err error) bool {
 	}
 	var netErr net.Error
 	if errors.As(err, &netErr) {
-		return netErr.Timeout() || netErr.Temporary()
+		return netErr.Timeout()
 	}
 	return true
 }
