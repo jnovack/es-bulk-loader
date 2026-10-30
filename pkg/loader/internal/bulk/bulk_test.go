@@ -55,7 +55,7 @@ func TestBulkInsertRejectsUnsupportedDocumentBeforeRequest(t *testing.T) {
 	}
 }
 
-// TestPeekFirstByte verifies behavior for the related scenario.
+// TestPeekFirstByte guards reading the first non-whitespace byte that data-format detection depends on.
 func TestPeekFirstByte(t *testing.T) {
 	t.Parallel()
 
@@ -99,7 +99,7 @@ func TestPeekFirstByte(t *testing.T) {
 	}
 }
 
-// TestCountNDJSONLines verifies behavior for the related scenario.
+// TestCountNDJSONLines guards the non-empty line count that sizes NDJSON progress totals.
 func TestCountNDJSONLines(t *testing.T) {
 	t.Parallel()
 

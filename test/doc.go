@@ -1,13 +1,6 @@
 //go:build e2e
 
-// Package e2e contains Docker-backed integration scenarios for es-bulk-loader.
-//
-// Responsibilities:
-//   - stand up disposable Elasticsearch fixtures,
-//   - execute CLI flows across delete/flush/add/nuke/enrich/alias modes,
-//   - assert final index, pipeline, policy, and document-state outcomes.
-//
-// File layout:
-//   - e2e_test.go: scenario harness, fixture setup, and assertions.
-//   - doc.go: package-level contract for build-tagged integration coverage.
+// Package e2e runs the built es-bulk-loader binary against a disposable
+// Elasticsearch container. Its tests need Docker; go vet -tags=e2e ./test
+// compiles them without starting Docker.
 package e2e

@@ -88,7 +88,7 @@ func TestWaitForIndexCancellationStopsPolling(t *testing.T) {
 	}
 }
 
-// TestVerifyMappings verifies behavior for the related scenario.
+// TestVerifyMappings guards that VerifyMappings accepts live mappings that match the plan and rejects a mismatch.
 func TestVerifyMappings(t *testing.T) {
 	t.Parallel()
 
@@ -663,7 +663,7 @@ func newMappingResponseClient(t *testing.T, requested string, status int, body s
 	return stub.MustClient(t)
 }
 
-// boolPointer centralizes this code path so package behavior stays consistent.
+// boolPointer returns a pointer to value, for building optional expectation fields in tests.
 func boolPointer(value bool) *bool {
 	return &value
 }

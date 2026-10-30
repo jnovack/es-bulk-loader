@@ -150,7 +150,7 @@ func TestEnrichFromOptions(t *testing.T) {
 	}
 }
 
-// TestRunWarningLogIncludesTimestamp verifies behavior for the related scenario.
+// TestRunWarningLogIncludesTimestamp guards that warnings logged through an injected logger carry a timestamp, because Run decorates every injected logger.
 func TestRunWarningLogIncludesTimestamp(t *testing.T) {
 	t.Parallel()
 
@@ -720,7 +720,7 @@ func TestRunMalformedMappingsFailsBeforeDelete(t *testing.T) {
 	}
 }
 
-// TestRunStartsTransformsAfterEnrichExecution verifies behavior for the related scenario.
+// TestRunStartsTransformsAfterEnrichExecution guards the stage order: enrich executes before managed transforms start.
 func TestRunStartsTransformsAfterEnrichExecution(t *testing.T) {
 	t.Parallel()
 
@@ -763,7 +763,7 @@ func TestRunStartsTransformsAfterEnrichExecution(t *testing.T) {
 	assertOperationOrder(t, operations, "enrich.execute", "transform.start")
 }
 
-// TestRunAliasFirstCreateUpsertsTransformsAfterAliasUpdate verifies behavior for the related scenario.
+// TestRunAliasFirstCreateUpsertsTransformsAfterAliasUpdate guards that on the first alias-mode create, transforms are upserted after the alias is repointed.
 func TestRunAliasFirstCreateUpsertsTransformsAfterAliasUpdate(t *testing.T) {
 	t.Parallel()
 
@@ -786,7 +786,7 @@ func TestRunAliasFirstCreateUpsertsTransformsAfterAliasUpdate(t *testing.T) {
 	assertOperationOrder(t, stub.operations(), "alias.update", "transform.put")
 }
 
-// TestRunNDJSONAliasFirstCreateUpsertsTransformsAfterAliasUpdate verifies behavior for the related scenario.
+// TestRunNDJSONAliasFirstCreateUpsertsTransformsAfterAliasUpdate guards the same alias-first ordering with an NDJSON data file.
 func TestRunNDJSONAliasFirstCreateUpsertsTransformsAfterAliasUpdate(t *testing.T) {
 	t.Parallel()
 
@@ -809,7 +809,7 @@ func TestRunNDJSONAliasFirstCreateUpsertsTransformsAfterAliasUpdate(t *testing.T
 	assertOperationOrder(t, stub.operations(), "alias.update", "transform.put")
 }
 
-// TestRunNonAliasCreateUpsertsTransformsAfterBulkLoad verifies behavior for the related scenario.
+// TestRunNonAliasCreateUpsertsTransformsAfterBulkLoad guards that a non-alias create upserts transforms only after the bulk load.
 func TestRunNonAliasCreateUpsertsTransformsAfterBulkLoad(t *testing.T) {
 	t.Parallel()
 
@@ -831,7 +831,7 @@ func TestRunNonAliasCreateUpsertsTransformsAfterBulkLoad(t *testing.T) {
 	assertOperationOrder(t, stub.operations(), "bulk", "transform.put")
 }
 
-// TestRunNDJSONNonAliasCreateUpsertsTransformsAfterBulkLoad verifies behavior for the related scenario.
+// TestRunNDJSONNonAliasCreateUpsertsTransformsAfterBulkLoad guards the same bulk-load ordering with an NDJSON data file.
 func TestRunNDJSONNonAliasCreateUpsertsTransformsAfterBulkLoad(t *testing.T) {
 	t.Parallel()
 
@@ -877,7 +877,7 @@ func TestRunRefreshesIndexBeforeStartingTransforms(t *testing.T) {
 	assertOperationOrder(t, stub.operations(), "index.refresh", "transform.start")
 }
 
-// TestRunCreatesPipelinesBeforeIndexWhenDefaultPipelineIsConfigured verifies behavior for the related scenario.
+// TestRunCreatesPipelinesBeforeIndexWhenDefaultPipelineIsConfigured guards that pipelines exist before the index is created when settings name a default pipeline.
 func TestRunCreatesPipelinesBeforeIndexWhenDefaultPipelineIsConfigured(t *testing.T) {
 	t.Parallel()
 
@@ -918,7 +918,7 @@ func TestRunCreatesPipelinesBeforeIndexWhenDefaultPipelineIsConfigured(t *testin
 	assertOperationOrder(t, stub.operations(), "pipeline.put", "index.create")
 }
 
-// TestRunRetriesBulkOnRetryableStatus verifies behavior for the related scenario.
+// TestRunRetriesBulkOnRetryableStatus guards that a retryable HTTP status on a bulk request is retried.
 func TestRunRetriesBulkOnRetryableStatus(t *testing.T) {
 	t.Parallel()
 
@@ -939,7 +939,7 @@ func TestRunRetriesBulkOnRetryableStatus(t *testing.T) {
 	}
 }
 
-// TestRunNDJSONRetriesBulkOnRetryableStatus verifies behavior for the related scenario.
+// TestRunNDJSONRetriesBulkOnRetryableStatus guards the same retry rule with an NDJSON data file.
 func TestRunNDJSONRetriesBulkOnRetryableStatus(t *testing.T) {
 	t.Parallel()
 
@@ -960,7 +960,7 @@ func TestRunNDJSONRetriesBulkOnRetryableStatus(t *testing.T) {
 	}
 }
 
-// TestRunRetriesBulkOnTransportFailure verifies behavior for the related scenario.
+// TestRunRetriesBulkOnTransportFailure guards that a transport failure on a bulk request is retried.
 func TestRunRetriesBulkOnTransportFailure(t *testing.T) {
 	t.Parallel()
 
@@ -981,7 +981,7 @@ func TestRunRetriesBulkOnTransportFailure(t *testing.T) {
 	}
 }
 
-// TestRunNDJSONRetriesBulkOnTransportFailure verifies behavior for the related scenario.
+// TestRunNDJSONRetriesBulkOnTransportFailure guards the same retry rule with an NDJSON data file.
 func TestRunNDJSONRetriesBulkOnTransportFailure(t *testing.T) {
 	t.Parallel()
 
@@ -1002,7 +1002,7 @@ func TestRunNDJSONRetriesBulkOnTransportFailure(t *testing.T) {
 	}
 }
 
-// TestRunDoesNotRetryBulkOnBadRequest verifies behavior for the related scenario.
+// TestRunDoesNotRetryBulkOnBadRequest guards that a non-retryable bulk response (400) is not retried.
 func TestRunDoesNotRetryBulkOnBadRequest(t *testing.T) {
 	t.Parallel()
 
@@ -1023,7 +1023,7 @@ func TestRunDoesNotRetryBulkOnBadRequest(t *testing.T) {
 	}
 }
 
-// TestRunNDJSONDoesNotRetryBulkOnBadRequest verifies behavior for the related scenario.
+// TestRunNDJSONDoesNotRetryBulkOnBadRequest guards the same no-retry rule with an NDJSON data file.
 func TestRunNDJSONDoesNotRetryBulkOnBadRequest(t *testing.T) {
 	t.Parallel()
 
@@ -1044,7 +1044,7 @@ func TestRunNDJSONDoesNotRetryBulkOnBadRequest(t *testing.T) {
 	}
 }
 
-// TestRunExhaustsRetriesOnRetryableStatus verifies behavior for the related scenario.
+// TestRunExhaustsRetriesOnRetryableStatus guards that bulk retries stop at the attempt limit and then fail the run.
 func TestRunExhaustsRetriesOnRetryableStatus(t *testing.T) {
 	t.Parallel()
 
@@ -1066,7 +1066,7 @@ func TestRunExhaustsRetriesOnRetryableStatus(t *testing.T) {
 	}
 }
 
-// TestRunNDJSONExhaustsRetriesOnRetryableStatus verifies behavior for the related scenario.
+// TestRunNDJSONExhaustsRetriesOnRetryableStatus guards the same attempt limit with an NDJSON data file.
 func TestRunNDJSONExhaustsRetriesOnRetryableStatus(t *testing.T) {
 	t.Parallel()
 
@@ -1088,7 +1088,7 @@ func TestRunNDJSONExhaustsRetriesOnRetryableStatus(t *testing.T) {
 	}
 }
 
-// TestRunRetryBackoffCapsAtConfiguredMax verifies behavior for the related scenario.
+// TestRunRetryBackoffCapsAtConfiguredMax guards that bulk retry waits grow from the base but never exceed the configured maximum.
 func TestRunRetryBackoffCapsAtConfiguredMax(t *testing.T) {
 	// Not parallel: swaps sleepWithContext.
 	previousSleep := sleepWithContext
@@ -1125,7 +1125,7 @@ func TestRunRetryBackoffCapsAtConfiguredMax(t *testing.T) {
 	}
 }
 
-// TestRunNDJSONRetryBackoffCapsAtConfiguredMax verifies behavior for the related scenario.
+// TestRunNDJSONRetryBackoffCapsAtConfiguredMax guards the same backoff cap with an NDJSON data file.
 func TestRunNDJSONRetryBackoffCapsAtConfiguredMax(t *testing.T) {
 	// Not parallel: swaps sleepWithContext.
 	previousSleep := sleepWithContext
@@ -1162,7 +1162,7 @@ func TestRunNDJSONRetryBackoffCapsAtConfiguredMax(t *testing.T) {
 	}
 }
 
-// writeBulkDataFixture centralizes this code path so package behavior stays consistent.
+// writeBulkDataFixture writes a one-document JSON-array data file in a test temp directory and returns its path.
 func writeBulkDataFixture(t *testing.T) string {
 	t.Helper()
 
@@ -1185,7 +1185,7 @@ func writeBulkNDJSONFixture(t *testing.T) string {
 	return path
 }
 
-// TestLoadNDJSONProducesCorrectDocuments verifies behavior for the related scenario.
+// TestLoadNDJSONProducesCorrectDocuments guards that an NDJSON data file is loaded as the expected bulk documents.
 func TestLoadNDJSONProducesCorrectDocuments(t *testing.T) {
 	t.Parallel()
 
@@ -1253,7 +1253,7 @@ func TestLoadNDJSONProducesCorrectDocuments(t *testing.T) {
 	}
 }
 
-// firstOperationIndex centralizes this code path so package behavior stays consistent.
+// firstOperationIndex returns the index of the first recorded operation equal to operation, or -1 when none matches.
 func firstOperationIndex(operations []string, operation string) int {
 	for idx, current := range operations {
 		if current == operation {
@@ -1274,7 +1274,7 @@ func operationCount(operations []string, operation string) int {
 	return count
 }
 
-// TestSelectedDataAction verifies behavior for the related scenario.
+// TestSelectedDataAction guards that selectedDataAction rejects more than one of -add, -flush and -delete, and selects none when none is set.
 func TestSelectedDataAction(t *testing.T) {
 	t.Parallel()
 

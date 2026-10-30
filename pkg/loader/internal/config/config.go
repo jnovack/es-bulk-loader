@@ -33,7 +33,7 @@ func (p MappingPlan) HasExpectations() bool {
 	return p.DateDetectionExpected != nil || len(p.RootFieldTypes) > 0
 }
 
-// BuildMappingPlan centralizes this code path so package behavior stays consistent.
+// BuildMappingPlan reads the mappings file and extracts the preflight expectations (boolean date_detection and root field types) that VerifyMappings checks. An empty path yields an empty plan.
 // A read or parse failure of the mappings file is returned as that read
 // site's own operation error; only a section that is not a JSON object fails
 // as "Failed to build mapping preflight plan".
@@ -158,7 +158,7 @@ func PreflightIndexInputs(ctx context.Context, settingsFile, mappingsFile string
 	return nil
 }
 
-// NormalizeIndexSettings centralizes this code path so package behavior stays consistent.
+// NormalizeIndexSettings returns the settings object as JSON with number_of_replicas set to replicas. When defaultPipeline is set and the file has no default_pipeline, it is added as the default.
 func NormalizeIndexSettings(ctx context.Context, path, defaultPipeline string, replicas int, replicasSource string, variables template.Variables) (string, error) {
 	settings, err := ParseSettingsFile(ctx, path, variables)
 	if err != nil {
@@ -186,12 +186,12 @@ func NormalizeIndexSettings(ctx context.Context, path, defaultPipeline string, r
 	return string(normalized), nil
 }
 
-// normalizeSettingKey centralizes this code path so package behavior stays consistent.
+// normalizeSettingKey strips a leading "index." so index.number_of_shards and number_of_shards become one key.
 func normalizeSettingKey(key string) string {
 	return strings.TrimPrefix(key, "index.")
 }
 
-// NormalizeIndexSection centralizes this code path so package behavior stays consistent.
+// NormalizeIndexSection reads the template-expanded file at path and returns its section object, or the whole document when the section key is absent. An empty path yields "{}".
 func NormalizeIndexSection(ctx context.Context, path, section string, variables template.Variables) (string, error) {
 	if path == "" {
 		return "{}", nil
@@ -214,7 +214,7 @@ func NormalizeIndexSection(ctx context.Context, path, section string, variables 
 	return string(content), nil
 }
 
-// ReadNamedDefinitions centralizes this code path so package behavior stays consistent.
+// ReadNamedDefinitions reads a keyed JSON file of named definitions and returns them in file order with their names. An empty path returns none.
 func ReadNamedDefinitions(ctx context.Context, path, resourceType string, variables template.Variables) (Definitions, []string, error) {
 	if path == "" {
 		return nil, nil, nil

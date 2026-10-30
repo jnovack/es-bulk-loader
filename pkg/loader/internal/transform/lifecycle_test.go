@@ -17,7 +17,7 @@ import (
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/progress"
 )
 
-// TestResolveForSourceFiltersBySourceIndex verifies behavior for the related scenario.
+// TestResolveForSourceFiltersBySourceIndex guards that only transform definitions for the run's source index are kept.
 func TestResolveForSourceFiltersBySourceIndex(t *testing.T) {
 	t.Parallel()
 
@@ -49,7 +49,7 @@ func TestResolveForSourceFiltersBySourceIndex(t *testing.T) {
 	}
 }
 
-// TestResolveForSourceRejectsMissingSourceIndex verifies behavior for the related scenario.
+// TestResolveForSourceRejectsMissingSourceIndex guards that a transform definition without a source index is rejected.
 func TestResolveForSourceRejectsMissingSourceIndex(t *testing.T) {
 	t.Parallel()
 
@@ -64,7 +64,7 @@ func TestResolveForSourceRejectsMissingSourceIndex(t *testing.T) {
 	}
 }
 
-// TestResolveForSourceRejectsMissingBody verifies behavior for the related scenario.
+// TestResolveForSourceRejectsMissingBody guards that a transform definition without a body is rejected.
 func TestResolveForSourceRejectsMissingBody(t *testing.T) {
 	t.Parallel()
 

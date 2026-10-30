@@ -25,7 +25,7 @@ import (
 // consecutive one-second timestamp suffixes.
 const timestampedIndexCollisionLimit = 300
 
-// buildTimestampedIndexName centralizes this code path so package behavior stays consistent.
+// buildTimestampedIndexName formats now as the numeric <alias>-YYYYMMDDHHMMSS name. Callers pass UTC times, so the name does not depend on the host time zone.
 func buildTimestampedIndexName(alias string, now time.Time) string {
 	return fmt.Sprintf("%s-%s", alias, now.Format("20060102150405"))
 }
@@ -42,7 +42,7 @@ func NextAvailableIndexName(ctx context.Context, es *elasticsearch.Client, alias
 	return name, nil
 }
 
-// nextAvailableTimestampedIndexNameWithCheck centralizes this code path so package behavior stays consistent.
+// nextAvailableTimestampedIndexNameWithCheck is the testable core of NextAvailableIndexName. existsFn is asked about each candidate, and a taken name advances the candidate by one second, up to timestampedIndexCollisionLimit attempts.
 func nextAvailableTimestampedIndexNameWithCheck(ctx context.Context, alias string, base time.Time, existsFn func(candidate string) (bool, error)) (string, error) {
 	candidateTime := base.UTC()
 	for attempt := 0; attempt < timestampedIndexCollisionLimit; attempt++ {
@@ -166,7 +166,7 @@ func DeleteIndices(ctx context.Context, es *elasticsearch.Client, indices []stri
 	return nil
 }
 
-// TimestampedIndex groups state used to coordinate related package behavior.
+// TimestampedIndex is one generation index of an alias, with its name and the time parsed from its numeric suffix.
 type TimestampedIndex struct {
 	Name      string
 	Timestamp time.Time

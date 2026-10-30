@@ -156,7 +156,7 @@ func transformExists(ctx context.Context, es *elasticsearch.Client, name string)
 	return true, nil
 }
 
-// StopBestEffort centralizes this code path so package behavior stays consistent.
+// StopBestEffort force-stops each named transform before it is re-created. A transform that is already stopped or missing is skipped; any other error stops the loop and fails the run.
 func StopBestEffort(ctx context.Context, es *elasticsearch.Client, names []string) error {
 	for _, name := range names {
 		res, err := es.TransformStopTransform(

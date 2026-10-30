@@ -139,7 +139,7 @@ func TestBracelessDollarNameIsNotSubstituted(t *testing.T) {
 	}
 }
 
-// TestBuildVariablesIncludesAdditionalValues verifies behavior for the related scenario.
+// TestBuildVariablesIncludesAdditionalValues guards that BuildVariables adds caller-supplied variables alongside INDEX.
 func TestBuildVariablesIncludesAdditionalValues(t *testing.T) {
 	t.Parallel()
 

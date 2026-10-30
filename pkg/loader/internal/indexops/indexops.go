@@ -217,7 +217,7 @@ func fetchIndexMappings(es *elasticsearch.Client, name string) (map[string]map[s
 	return result, nil
 }
 
-// extractDateDetection centralizes this code path so package behavior stays consistent.
+// extractDateDetection returns the top-level date_detection value and whether it is a boolean. Any other value reports as absent.
 func extractDateDetection(mappings map[string]any) (bool, bool) {
 	value, ok := mappings["date_detection"]
 	if !ok {
@@ -231,7 +231,7 @@ func extractDateDetection(mappings map[string]any) (bool, bool) {
 	return typed, true
 }
 
-// resolveFieldType centralizes this code path so package behavior stays consistent.
+// resolveFieldType returns the declared type of a dotted field path under mappings.properties. It returns false when a segment is missing or the leaf has no string type.
 func resolveFieldType(mappings map[string]any, fieldPath string) (string, bool) {
 	current, ok := mappings["properties"].(map[string]any)
 	if !ok {

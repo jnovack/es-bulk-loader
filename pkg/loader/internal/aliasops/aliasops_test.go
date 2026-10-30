@@ -15,7 +15,7 @@ import (
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/runlog"
 )
 
-// TestBuildTimestampedIndexName verifies behavior for the related scenario.
+// TestBuildTimestampedIndexName guards the <alias>-YYYYMMDDHHMMSS name format for a fixed UTC time.
 func TestBuildTimestampedIndexName(t *testing.T) {
 	t.Parallel()
 
@@ -25,7 +25,7 @@ func TestBuildTimestampedIndexName(t *testing.T) {
 	}
 }
 
-// TestParseTimestampedIndexName verifies behavior for the related scenario.
+// TestParseTimestampedIndexName guards parsing a generation name's numeric suffix back into its timestamp.
 func TestParseTimestampedIndexName(t *testing.T) {
 	t.Parallel()
 
@@ -82,7 +82,7 @@ func TestParseTimestampedIndexName(t *testing.T) {
 	}
 }
 
-// TestNextAvailableTimestampedIndexNameWithCheck verifies behavior for the related scenario.
+// TestNextAvailableTimestampedIndexNameWithCheck guards that name selection advances one second at a time past existing candidates.
 func TestNextAvailableTimestampedIndexNameWithCheck(t *testing.T) {
 	t.Parallel()
 
@@ -105,7 +105,7 @@ func TestNextAvailableTimestampedIndexNameWithCheck(t *testing.T) {
 	}
 }
 
-// TestNextAvailableTimestampedIndexNameWithCheckPropagatesErrors verifies behavior for the related scenario.
+// TestNextAvailableTimestampedIndexNameWithCheckPropagatesErrors guards that an error from the existence check is returned, not treated as a free name.
 func TestNextAvailableTimestampedIndexNameWithCheckPropagatesErrors(t *testing.T) {
 	t.Parallel()
 

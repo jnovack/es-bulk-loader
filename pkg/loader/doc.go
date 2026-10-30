@@ -1,32 +1,68 @@
-// Package loader implements the Elasticsearch lifecycle used by es-bulk-loader.
+// Package loader runs the Elasticsearch data-loading lifecycle for one index:
+// it validates options, resolves managed resources, applies a data action,
+// bulk-loads a data file, then executes enrich policies and managed transforms.
+// The CLI and external callers import Run, LoadData, SyncManaged and
+// ExecuteEnrich, so their signatures and the contracts below are public API.
 //
-// Responsibilities:
-//   - validate run options and choose data action modes,
-//   - create/update managed resources (settings, mappings, pipelines, policies, transforms),
-//   - load/replace/append source data in bulk,
-//   - execute enrich policies and managed transform lifecycle steps.
+// Stage order within one Run. Each stage finishes before the next begins. The
+// first run-ending error stops the sequence. Stages 1 to 3 make no cluster
+// writes.
 //
-// Non-obvious decisions:
-//   - managed enrich policy names are content-hashed and rewritten in dependent
-//     pipelines to make updates deterministic and garbage-collectable.
-//   - transform definitions are filtered by logical source index so a single
-//     transforms file can serve multiple loader runs.
-//   - the run logger travels on the context under a private key, not zerolog's
-//     WithContext, which silently drops a Disabled logger and would turn an
-//     injected zerolog.Nop() back into global output. Run never writes the
-//     global logger, so concurrent Runs need no consumer-side mutex.
-//   - Options.Progress is a plain function field, called synchronously on Run's
-//     goroutine and never concurrently. A resource that causes a run-ending
-//     error gets no Final event: Run's error is the only failure signal. Internal
-//     helpers return operation errors that Run converts once into a *RunError
-//     and returns at once, so no later stage runs (see ProgressEvent and
-//     docs/decisions/0004).
-//   - waiting on managed transforms is opt-in (Options.Transforms.Wait): the
-//     zero value starts transforms and returns, as it always has. The wait
-//     polls _stats per transform under a timeout that bounds HTTP and sleeps.
+//  1. Validate options and select the data action (-add, -flush, -delete or none).
+//
+//  2. Read and template-expand every input file, resolve managed policy names,
+//     and preflight the settings, mappings and data file.
+//
+//  3. Look up the alias targets or the index.
+//
+//  4. -nuke: delete the alias targets and timestamped generations, or the index,
+//     then the declared managed resources.
+//
+//  5. -delete on a concrete index: delete the index, then the managed resources.
+//     In AliasMode, -delete keeps managed resources and rolls forward in steps 8 to 11.
+//
+//  6. For -add and -flush on an existing index, verify its live mappings.
+//
+//  7. -flush: flush the existing index or the alias targets.
+//
+//  8. Create the index when one is needed. Managed pipelines are upserted first
+//     when syncing. In AliasMode the index name is a new timestamped index.
+//
+//  9. -sync-managed: upsert pipelines and policies, and garbage-collect unreferenced
+//     policy versions, only when the index exists or step 8 created it. For an
+//     alias create, policies wait for step 11.
+//
+//  10. Verify the mappings of a newly created index, then bulk-load the data file.
+//
+//  11. AliasMode create: repoint the alias, then upsert the deferred policies.
+//
+//  12. -keep-last: prune older generations.
+//
+//  13. -enrich: refresh the write index and execute the selected policies.
+//
+//  14. Transforms synced in step 9: refresh, stop, create or update, and start them,
+//     then wait for the first checkpoint when Options.Transforms.Wait is set.
+//
+// Concurrency and callbacks. Options.Progress is a plain function field, called
+// synchronously on Run's goroutine and never concurrently. A resource that causes
+// a run-ending error gets no Final event, because Run's error is the only failure
+// signal. See ProgressEvent and docs/decisions/0004.
+//
+// Logging. Run resolves its logger from Options.Logger and carries it on the
+// context under a private key, not zerolog's WithContext, which silently drops a
+// Disabled logger and would turn an injected zerolog.Nop() back into global
+// output. Run never writes the global logger, so concurrent Runs with injected
+// loggers need no consumer-side mutex.
+//
+// Transforms. Waiting on managed transforms is opt-in. The zero value starts
+// transforms and returns. The wait polls _stats per transform under a timeout
+// that bounds HTTP calls and sleeps.
 //
 // Failure modes:
-//   - option validation and managed resource failures return typed sentinel errors,
-//   - bulk item failures include per-item diagnostics and fail the run,
-//   - enrich/transform lifecycle failures are treated as fatal when requested.
+//   - option validation and template preflight fail before any cluster write with ErrInvalidOptions,
+//   - a bulk item rejection is counted in Result.DocumentsFailed and does not fail Run,
+//   - a failed enrich policy is counted in Result.EnrichFailed and the run continues,
+//   - every other run-ending error is returned as a *RunError whose Kind is chosen
+//     from its Op name: bulk, then enrich, then pipeline/policy/transform/managed,
+//     then index/indices/alias, otherwise ErrLoaderExecution (see RunError).
 package loader

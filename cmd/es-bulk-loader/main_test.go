@@ -99,7 +99,7 @@ func TestParseLogLevel(t *testing.T) {
 	}
 }
 
-// TestNewConsoleLoggerIncludesTimestamp verifies behavior for the related scenario.
+// TestNewConsoleLoggerIncludesTimestamp guards that CLI console output carries a timestamp on each event.
 func TestNewConsoleLoggerIncludesTimestamp(t *testing.T) {
 	var output bytes.Buffer
 	logger := newConsoleLogger(&output)

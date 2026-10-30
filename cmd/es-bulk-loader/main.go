@@ -37,7 +37,7 @@ const (
 
 // ─── Enrich Flag Parsing ───────────────────────────────────────────────────────
 
-// enrichFlagValue groups state used to coordinate related package behavior.
+// enrichFlagValue is the -enrich flag value. An empty or "true" value selects all policies, "false" disables enrich, and any other text is a comma-separated policy list.
 type enrichFlagValue struct {
 	enabled bool
 	all     bool
@@ -79,7 +79,7 @@ func (e *enrichFlagValue) IsBoolFlag() bool {
 	return true
 }
 
-// explicitPolicies applies method-specific behavior to keep package workflows consistent.
+// explicitPolicies returns the trimmed, de-duplicated names from an explicit -enrich list, or nil when enrich is disabled or selects all.
 func (e *enrichFlagValue) explicitPolicies() []string {
 	if e == nil || !e.enabled || e.all {
 		return nil
@@ -103,7 +103,7 @@ func (e *enrichFlagValue) explicitPolicies() []string {
 
 // ─── Runtime Helpers ───────────────────────────────────────────────────────────
 
-// populateBuildMetadataFromBuildInfo centralizes this code path so package behavior stays consistent.
+// populateBuildMetadataFromBuildInfo fills version, revision and build time from debug.ReadBuildInfo, but only for values still at their defaults, so linker flags always win.
 func populateBuildMetadataFromBuildInfo() {
 	info, ok := debug.ReadBuildInfo()
 	if !ok {
@@ -128,7 +128,7 @@ func populateBuildMetadataFromBuildInfo() {
 	}
 }
 
-// parseLogLevel centralizes this code path so package behavior stays consistent.
+// parseLogLevel maps a level name, case-insensitively, to a zerolog level. An unknown name is an error, so a typo fails at startup.
 func parseLogLevel(level string) (zerolog.Level, error) {
 	switch strings.ToLower(strings.TrimSpace(level)) {
 	case "trace":
@@ -146,7 +146,7 @@ func parseLogLevel(level string) (zerolog.Level, error) {
 	}
 }
 
-// newConsoleLogger centralizes this code path so package behavior stays consistent.
+// newConsoleLogger returns the human-readable logger for CLI output, with a timestamp on every event.
 func newConsoleLogger(out io.Writer) zerolog.Logger {
 	return zerolog.New(zerolog.ConsoleWriter{Out: out, TimeFormat: "15:04:05"}).With().Timestamp().Logger()
 }
@@ -164,7 +164,7 @@ func replicasOption(v int) *int {
 	return &v
 }
 
-// main centralizes this code path so package behavior stays consistent.
+// main parses flags into loader.Options, logs build metadata at startup, calls loader.Run once, and exits 1 after logging when the run fails.
 func main() {
 	populateBuildMetadataFromBuildInfo()
 

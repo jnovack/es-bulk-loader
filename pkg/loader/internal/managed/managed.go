@@ -31,6 +31,11 @@ import (
 
 // PolicyPlan maps each declared logical policy to its content-hashed managed
 // name (<logical>-<sha256[:6]>) and holds the definitions under those names.
+// Names are content-hashed because an enrich policy cannot be updated in place:
+// a changed definition gets a new name, identical content reuses its name, and
+// dependent pipelines are rewritten to it. Older versions stay recognisable as
+// <logical>-<hash>, so garbage collection can delete them once no pipeline
+// references them.
 type PolicyPlan struct {
 	LogicalNames     []string
 	DesiredNames     []string

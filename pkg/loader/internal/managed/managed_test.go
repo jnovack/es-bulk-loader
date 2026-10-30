@@ -205,7 +205,7 @@ func TestDeletePipelinesUsesCallerContext(t *testing.T) {
 	}
 }
 
-// TestPipelineNamesReferencingPolicy verifies behavior for the related scenario.
+// TestPipelineNamesReferencingPolicy guards finding every pipeline that references a given enrich policy.
 func TestPipelineNamesReferencingPolicy(t *testing.T) {
 	t.Parallel()
 
@@ -234,7 +234,7 @@ func TestPipelineNamesReferencingPolicy(t *testing.T) {
 	}
 }
 
-// TestPolicyDeleteBlockedByPipelineReference verifies behavior for the related scenario.
+// TestPolicyDeleteBlockedByPipelineReference guards that a policy-delete error naming a referencing pipeline is detected, and unrelated delete errors are ignored.
 func TestPolicyDeleteBlockedByPipelineReference(t *testing.T) {
 	t.Parallel()
 
@@ -247,7 +247,7 @@ func TestPolicyDeleteBlockedByPipelineReference(t *testing.T) {
 	}
 }
 
-// TestPipelineDeleteBlockedByDefaultIndex verifies behavior for the related scenario.
+// TestPipelineDeleteBlockedByDefaultIndex guards that a pipeline-delete error naming a default-pipeline conflict is detected, and unrelated delete errors are ignored.
 func TestPipelineDeleteBlockedByDefaultIndex(t *testing.T) {
 	t.Parallel()
 
@@ -260,7 +260,7 @@ func TestPipelineDeleteBlockedByDefaultIndex(t *testing.T) {
 	}
 }
 
-// TestHashedPolicyNameIsStableAndShortHashed verifies behavior for the related scenario.
+// TestHashedPolicyNameIsStableAndShortHashed guards that a content-hashed policy name is stable for equal content and uses a six-character hash suffix.
 func TestHashedPolicyNameIsStableAndShortHashed(t *testing.T) {
 	t.Parallel()
 
@@ -277,7 +277,7 @@ func TestHashedPolicyNameIsStableAndShortHashed(t *testing.T) {
 	}
 }
 
-// TestRewritePipelinePolicyReferences verifies behavior for the related scenario.
+// TestRewritePipelinePolicyReferences guards that pipeline enrich processors are rewritten to resolved managed policy names.
 func TestRewritePipelinePolicyReferences(t *testing.T) {
 	t.Parallel()
 
@@ -316,7 +316,7 @@ func TestRewritePipelinePolicyReferences(t *testing.T) {
 	}
 }
 
-// TestRemapEnrichSelectionMapsLogicalNames verifies behavior for the related scenario.
+// TestRemapEnrichSelectionMapsLogicalNames guards that a logical enrich selection is remapped to managed policy names.
 func TestRemapEnrichSelectionMapsLogicalNames(t *testing.T) {
 	t.Parallel()
 

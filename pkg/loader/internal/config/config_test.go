@@ -17,7 +17,7 @@ import (
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/template"
 )
 
-// TestReadNamedDefinitionsPreservesFileOrder verifies behavior for the related scenario.
+// TestReadNamedDefinitionsPreservesFileOrder guards that named definitions are returned in file order, which is the order they are applied.
 func TestReadNamedDefinitionsPreservesFileOrder(t *testing.T) {
 	t.Parallel()
 
@@ -51,7 +51,7 @@ func TestReadNamedDefinitionsPreservesFileOrder(t *testing.T) {
 	}
 }
 
-// TestNormalizeIndexSettingsUsesFirstPipelineWhenUnset verifies behavior for the related scenario.
+// TestNormalizeIndexSettingsUsesFirstPipelineWhenUnset guards that the first declared pipeline becomes default_pipeline when settings do not set one.
 func TestNormalizeIndexSettingsUsesFirstPipelineWhenUnset(t *testing.T) {
 	t.Parallel()
 
@@ -79,7 +79,7 @@ func TestNormalizeIndexSettingsUsesFirstPipelineWhenUnset(t *testing.T) {
 	}
 }
 
-// TestNormalizeIndexSettingsPreservesExplicitDefault verifies behavior for the related scenario.
+// TestNormalizeIndexSettingsPreservesExplicitDefault guards that an explicit default_pipeline in settings wins over the first declared pipeline.
 func TestNormalizeIndexSettingsPreservesExplicitDefault(t *testing.T) {
 	t.Parallel()
 
@@ -104,7 +104,7 @@ func TestNormalizeIndexSettingsPreservesExplicitDefault(t *testing.T) {
 	}
 }
 
-// TestNormalizeIndexSettingsFlattensNestedIndexObject verifies behavior for the related scenario.
+// TestNormalizeIndexSettingsFlattensNestedIndexObject guards that a nested "index" settings object is flattened into top-level keys.
 func TestNormalizeIndexSettingsFlattensNestedIndexObject(t *testing.T) {
 	t.Parallel()
 
@@ -144,7 +144,7 @@ func TestNormalizeIndexSettingsFlattensNestedIndexObject(t *testing.T) {
 	}
 }
 
-// TestReadNamedDefinitionsPreservesFileOrderWithReverseInput verifies behavior for the related scenario.
+// TestReadNamedDefinitionsPreservesFileOrderWithReverseInput guards file-order preservation when the keys are in reverse order.
 func TestReadNamedDefinitionsPreservesFileOrderWithReverseInput(t *testing.T) {
 	t.Parallel()
 
@@ -176,7 +176,7 @@ func TestReadNamedDefinitionsPreservesFileOrderWithReverseInput(t *testing.T) {
 	}
 }
 
-// TestBuildCreateIndexBodySupportsWrappedAndRawSections verifies behavior for the related scenario.
+// TestBuildCreateIndexBodySupportsWrappedAndRawSections guards that settings and mappings are accepted both wrapped in their section key and as raw objects.
 func TestBuildCreateIndexBodySupportsWrappedAndRawSections(t *testing.T) {
 	t.Parallel()
 
@@ -212,7 +212,7 @@ func TestBuildCreateIndexBodySupportsWrappedAndRawSections(t *testing.T) {
 	}
 }
 
-// TestReadNamedDefinitionsExpandsIndexVariable verifies behavior for the related scenario.
+// TestReadNamedDefinitionsExpandsIndexVariable guards that ${INDEX} in definitions expands to the run's index.
 func TestReadNamedDefinitionsExpandsIndexVariable(t *testing.T) {
 	t.Parallel()
 
@@ -237,7 +237,7 @@ func TestReadNamedDefinitionsExpandsIndexVariable(t *testing.T) {
 	}
 }
 
-// TestBuildMappingPlan verifies behavior for the related scenario.
+// TestBuildMappingPlan guards extraction of the date_detection and root field-type expectations from a mappings file.
 func TestBuildMappingPlan(t *testing.T) {
 	t.Parallel()
 

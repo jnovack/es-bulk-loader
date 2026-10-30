@@ -28,23 +28,53 @@ import (
 // ─── Error Sentinels ───────────────────────────────────────────────────────────
 
 var (
-	// ErrInvalidOptions defines package-level state shared by related execution paths.
+	// ErrInvalidOptions reports an Options value Run rejects during validation,
+	// or an unresolved ${NAME} in a template file, before any cluster request
+	// that changes state. Run sets it explicitly, not from the operation name.
+	// A malformed or unreadable settings, mappings, definitions or data file is
+	// not this Kind: it is classified from its Op like any other failure (see
+	// RunError), usually as ErrLoaderExecution or ErrManagedResource.
 	ErrInvalidOptions = errors.New("invalid options")
-	// ErrIndexOperation defines package-level state shared by related execution paths.
+	// ErrIndexOperation reports a failure whose Op mentions index, indices or
+	// alias and matched none of the earlier rules (see RunError). For example,
+	// "clearing index.default_pipeline" names a pipeline and is
+	// ErrManagedResource.
 	ErrIndexOperation = errors.New("index operation failed")
-	// ErrManagedResource defines package-level state shared by related execution paths.
+	// ErrManagedResource reports a failure whose Op mentions pipeline, policy,
+	// transform or managed but not bulk or enrich. Enrich policy create, delete
+	// and garbage-collection Ops name "enrich", so they are ErrEnrichExecution,
+	// not this Kind.
 	ErrManagedResource = errors.New("managed resource failed")
-	// ErrBulkFailure defines package-level state shared by related execution paths.
+	// ErrBulkFailure reports a failure whose Op mentions bulk: a failed _bulk
+	// request (transport, non-2xx after retries, unreadable response,
+	// unserializable document) or a mapping preflight failure, whose Op names
+	// the bulk insert. A data file that cannot be opened or decoded during the
+	// load is ErrLoaderExecution. Rejected items are not errors; they are
+	// counted in Result.DocumentsFailed.
 	ErrBulkFailure = errors.New("bulk insert failed")
-	// ErrEnrichExecution defines package-level state shared by related execution paths.
+	// ErrEnrichExecution reports a run-ending failure whose Op mentions enrich:
+	// listing policies before execution, and creating, deleting or
+	// garbage-collecting enrich policies. A policy that fails to execute does
+	// not end the run; it is counted in Result.EnrichFailed.
 	ErrEnrichExecution = errors.New("enrich execution failed")
-	// ErrLoaderExecution defines package-level state shared by related execution paths.
+	// ErrLoaderExecution reports any other failure: an Op that matches no rule
+	// (see RunError), an untyped internal error (empty Op), or a panic whose
+	// value is an error (Op "panic"). A panic carrying a *RunError is
+	// returned as that error; any other panic value propagates.
 	ErrLoaderExecution = errors.New("loader execution failed")
 )
 
 // ─── Core Runtime Types ────────────────────────────────────────────────────────
 
-// RunError groups state used to coordinate related package behavior.
+// RunError is the error type Run returns for every failure. Kind is one of the
+// Err sentinels and matches through errors.Is; Op names the failed operation;
+// Err is the underlying cause, returned by Unwrap.
+//
+// Except for ErrInvalidOptions, which Run sets explicitly, Kind is chosen from
+// Op by case-insensitive substring, first match wins: bulk (ErrBulkFailure),
+// then enrich (ErrEnrichExecution), then pipeline, policy, transform or managed
+// (ErrManagedResource), then index, indices or alias (ErrIndexOperation),
+// otherwise ErrLoaderExecution.
 type RunError struct {
 	Kind error
 	Op   string
@@ -101,42 +131,107 @@ type EnrichOptions struct {
 	Policies []string
 }
 
-// Options groups state used to coordinate related package behavior.
+// Options configures one Run. Zero values select the defaults documented on
+// each field. Run works on its own copy, so the caller's Options, including
+// the TemplateVariables map and Enrich.Policies slice, is never modified.
 type Options struct {
-	URL                string
+	// URL is the Elasticsearch base URL. Empty means http://localhost:9200.
+	URL string
+	// InsecureSkipVerify disables TLS certificate verification for URL.
 	InsecureSkipVerify bool
-	Index              string
-	SettingsFile       string
-	MappingsFile       string
-	PipelinesFile      string
-	PoliciesFile       string
-	TransformsFile     string
-	DataFile           string
-	BatchSize          int
-	DeleteIndex        bool
-	AddToIndex         bool
-	FlushIndex         bool
-	SyncManaged        bool
-	AliasMode          bool
-	KeepLast           int
+	// Index is required. It names the concrete index, or the alias when AliasMode is set.
+	Index string
+	// SettingsFile is an optional index settings JSON file, either wrapped in
+	// "settings" or a raw object. It is applied only when Run creates an index.
+	// It is parsed before any destructive step when a data action or SyncManaged
+	// is set.
+	SettingsFile string
+	// MappingsFile is an optional mappings JSON file, either wrapped in
+	// "mappings" or a raw object. It is applied when Run creates an index. For
+	// -add and -flush, an existing index's live mappings must match the file's
+	// date_detection and root field types before any write.
+	MappingsFile string
+	// PipelinesFile is an optional keyed JSON file of ingest pipelines. Pipelines
+	// are upserted only with SyncManaged. With SyncManaged, the first declared
+	// pipeline becomes index.default_pipeline on a created index whose settings
+	// do not set one.
+	PipelinesFile string
+	// PoliciesFile is an optional keyed JSON file of enrich policies. Policies
+	// are upserted only with SyncManaged, under content-hashed managed names.
+	PoliciesFile string
+	// TransformsFile is an optional keyed JSON file of transforms. Only the
+	// transforms whose source index is Index are used, and they are started only
+	// with SyncManaged.
+	TransformsFile string
+	// DataFile is the data to load: a JSON array or NDJSON, detected from the
+	// first non-whitespace byte. It is required for AddToIndex, FlushIndex and
+	// DeleteIndex.
+	DataFile string
+	// BatchSize is the number of documents per bulk request. Values <= 0 mean 1000.
+	BatchSize int
+	// DeleteIndex (-delete) drops the index before loading, or rolls an alias
+	// forward in AliasMode. It is mutually exclusive with AddToIndex and FlushIndex.
+	DeleteIndex bool
+	// AddToIndex (-add) appends documents without resetting the index. LoadData
+	// sets it when no data action is chosen.
+	AddToIndex bool
+	// FlushIndex (-flush) deletes existing documents but keeps the index and its
+	// managed resources, then loads DataFile.
+	FlushIndex bool
+	// SyncManaged upserts the declared pipelines, policies and transforms, and
+	// garbage-collects unreferenced policy versions. Both run only when the
+	// index or alias target exists or this run creates it: a sync-only run
+	// against a missing index with no settings or mappings file creates,
+	// upserts and deletes nothing, and still succeeds. Alias -delete implies
+	// SyncManaged, with a warning, when it is not set.
+	SyncManaged bool
+	// AliasMode treats Index as an alias. Creating or recreating the index makes
+	// a timestamped <alias>-YYYYMMDDHHMMSS index, loads it, and then repoints the
+	// alias.
+	AliasMode bool
+	// KeepLast keeps only the newest N timestamped generations. It prunes at the
+	// end of every AliasMode run, not only a rollover. Zero keeps all of them.
+	// Negative values are rejected. A non-zero value without AliasMode is
+	// ignored with a warning.
+	KeepLast int
 	// Replicas, when non-nil, sets number_of_replicas on indices this run
 	// creates, overriding the cluster-topology default (ADR 0001). nil keeps
 	// the topology rule; an explicit 0 is honoured. Must be >= 0.
 	Replicas *int
-	Nuke     bool
-	IDField  string
+	// Nuke (-nuke) deletes the index, or in AliasMode the alias's target indices
+	// and timestamped generations, plus the declared managed resources, before
+	// the data action runs.
+	Nuke bool
+	// IDField names a document field whose non-empty string value becomes the
+	// bulk _id. Otherwise Elasticsearch assigns the ID.
+	IDField string
 	// BulkRetryAttempts controls total bulk request attempts, including the first attempt.
+	// Values <= 0 use the package default.
 	BulkRetryAttempts int
 	// BulkRetryBackoffBase controls the first retry wait for retryable bulk failures.
+	// Values <= 0 use the package default.
 	BulkRetryBackoffBase time.Duration
-	// BulkRetryBackoffMax caps exponential bulk retry waits.
+	// BulkRetryBackoffMax caps exponential bulk retry waits. A value below
+	// BulkRetryBackoffBase is raised to it.
 	BulkRetryBackoffMax time.Duration
-	User                string
-	Pass                string
-	APIKey              string
-	TemplateVariables   map[string]string
-	Enrich              EnrichOptions
-	// Transforms controls waiting on managed transforms after they start.
+	// User and Pass enable basic auth together; both must be non-empty. A lone
+	// User or Pass is currently ignored rather than rejected.
+	User string
+	// Pass is the basic-auth password; see User.
+	Pass string
+	// APIKey authenticates with an Elasticsearch API key. It cannot be combined
+	// with User or Pass.
+	APIKey string
+	// TemplateVariables adds ${NAME} values for file templates. Precedence: this
+	// map (including an INDEX override), then the run's Index for INDEX, then the
+	// process environment. A name none of them resolve fails Run with
+	// ErrInvalidOptions before any cluster change. Run reads the map and never
+	// writes it.
+	TemplateVariables map[string]string
+	// Enrich selects the enrich policies to execute after the load; see EnrichOptions.
+	Enrich EnrichOptions
+	// Transforms controls waiting on managed transforms after they start. Its
+	// zero value starts transforms without waiting.
 	Transforms TransformOptions
 	// Progress, when non-nil, receives ProgressEvents; see ProgressEvent for
 	// the delivery contract. nil creates no events.
@@ -144,47 +239,77 @@ type Options struct {
 	// Logger, when non-nil, receives all of Run's log output — including a
 	// Disabled logger such as zerolog.Nop(), which silences Run. nil uses the
 	// zerolog global (log.Logger), read but never modified, so concurrent
-	// Runs with different loggers do not interfere.
+	// Runs with different loggers do not interfere. Concurrent Runs that share
+	// a logger, including the nil fallback, write to the same writer, which
+	// must be safe for concurrent use. With nil, do not reassign log.Logger
+	// while a Run is in progress.
 	Logger *zerolog.Logger
 }
 
-// Result groups state used to coordinate related package behavior.
+// Result reports what a Run did. Fields are filled as each stage completes, so
+// a Run that returns an error reports only the stages that finished before the
+// failure. Result is not a rollback record.
 type Result struct {
+	// ResolvedAliasTarget is Options.Index in AliasMode, set once the run reaches
+	// the index stage, and empty otherwise. It names the alias or, when a
+	// concrete index already has that name, that index (Run warns).
 	ResolvedAliasTarget string
-	WriteIndex          string
-	CreatedIndex        string
-	DocumentsProcessed  int
-	DocumentsSucceeded  int
-	DocumentsFailed     int
-	EnrichSelected      []string
-	EnrichMissing       []string
-	EnrichSucceeded     int
-	EnrichFailed        int
-	Warnings            []string
+	// WriteIndex is the name the bulk load wrote to: the new timestamped index when
+	// one was created, otherwise Index. In AliasMode with existing targets, that is
+	// the alias, which Elasticsearch resolves to its write target.
+	WriteIndex string
+	// CreatedIndex is the timestamped index this run created in AliasMode. It is
+	// empty when no index was created.
+	CreatedIndex string
+	// DocumentsProcessed is the number of documents the bulk load attempted. It is
+	// zero when no data action loaded a file.
+	DocumentsProcessed int
+	// DocumentsSucceeded counts bulk items Elasticsearch accepted.
+	DocumentsSucceeded int
+	// DocumentsFailed counts bulk items Elasticsearch rejected. Item failures do
+	// not make Run return an error, so callers must check this field.
+	DocumentsFailed int
+	// EnrichSelected lists the managed policy names Run executed.
+	EnrichSelected []string
+	// EnrichMissing lists requested policy names absent from a cluster that has
+	// at least one enrich policy. Each is skipped with a log warning and is not
+	// an error. It stays empty when the cluster has no enrich policies or the
+	// enrich API is unavailable; neither case is an error, so check
+	// EnrichSelected too.
+	EnrichMissing []string
+	// EnrichSucceeded counts enrich policies that completed.
+	EnrichSucceeded int
+	// EnrichFailed counts enrich policies that failed. The run continues after a
+	// failed policy, so callers must check this field.
+	EnrichFailed int
+	// Warnings holds, in order, the messages Run routes through its internal
+	// warning helper. Other Warn-level logs, such as the nuke deletion notices and
+	// skipped missing policies, are logged but not listed here.
+	Warnings []string
 }
 
-// dataAction groups state used to coordinate related package behavior.
+// dataAction is the data action chosen by -add, -flush or -delete. dataActionNone means the run loads no data file.
 type dataAction string
 
 const (
-	// dataActionNone defines package-level values shared by related execution paths.
+	// dataActionNone selects no data action. The run may still sync managed resources or enrich.
 	dataActionNone dataAction = ""
-	// dataActionAdd defines package-level values shared by related execution paths.
+	// dataActionAdd appends documents to the existing index or alias target (-add).
 	dataActionAdd dataAction = "add"
-	// dataActionFlush defines package-level values shared by related execution paths.
+	// dataActionFlush deletes existing documents, keeps the index, then loads replacement documents (-flush).
 	dataActionFlush dataAction = "flush"
-	// dataActionDelete defines package-level values shared by related execution paths.
+	// dataActionDelete drops the index, or rolls an alias forward, before loading (-delete).
 	dataActionDelete dataAction = "delete"
 )
 
-// sleepWithContext centralizes retry sleeps so the code path can be reused by tests.
+// sleepWithContext is the sleep seam for retries and polls; tests replace it to avoid real waits.
 var sleepWithContext = sleepForDuration
 
 // progressNow is the clock for progress timing (elapsed values, heartbeats).
 // It exists so tests can drive heartbeats without sleeping.
 var progressNow = time.Now
 
-// sleepForDuration centralizes this code path so package behavior stays consistent.
+// sleepForDuration waits for d or until ctx is done, returning ctx.Err() on cancellation. A non-positive d returns at once.
 func sleepForDuration(ctx context.Context, d time.Duration) error {
 	if d <= 0 {
 		return nil
@@ -280,11 +405,13 @@ func runFailure(err error) error {
 
 // ─── Primary Execution Entry Points ────────────────────────────────────────────
 
-// Run executes the loader lifecycle for one index; see the package
-// documentation for stage ordering. opts is received by value and zero-valued
-// fields are normalized on Run's private copy, so the caller's Options —
-// including the TemplateVariables map and Enrich.Policies slice — is never
-// modified. TestRunDoesNotMutateCallerOptions guards that contract.
+// Run executes one lifecycle pass for opts.Index, in the stage order listed in
+// the package documentation. It normalizes zero-valued options on a private copy,
+// so the caller's Options is never modified (TestRunDoesNotMutateCallerOptions).
+// A nil ctx is replaced with context.Background(). The first run-ending error
+// stops the run and is returned as a *RunError, with the Result filled so far.
+// A bulk item rejection or a failed enrich policy is counted in the Result and
+// does not stop the run.
 func Run(ctx context.Context, opts Options) (result Result, err error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -870,7 +997,12 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 	return result, nil
 }
 
-// SyncManaged centralizes this code path so package behavior stays consistent.
+// SyncManaged runs Run with every data action and Nuke cleared and SyncManaged
+// set. It loads no documents. It creates the index only when it is missing and
+// settings or mappings are supplied. It upserts managed resources and
+// garbage-collects unreferenced policy versions only when the index exists or
+// is created (see Options.SyncManaged). With AliasMode and KeepLast > 0 it
+// still prunes older generations.
 func SyncManaged(ctx context.Context, opts Options) (Result, error) {
 	opts.AddToIndex = false
 	opts.FlushIndex = false
@@ -880,7 +1012,7 @@ func SyncManaged(ctx context.Context, opts Options) (Result, error) {
 	return Run(ctx, opts)
 }
 
-// LoadData centralizes this code path so package behavior stays consistent.
+// LoadData runs Run and selects -add when no data action is set. Every other option, including SyncManaged and Nuke, passes through unchanged.
 func LoadData(ctx context.Context, opts Options) (Result, error) {
 	if !opts.AddToIndex && !opts.FlushIndex && !opts.DeleteIndex {
 		opts.AddToIndex = true
@@ -888,7 +1020,13 @@ func LoadData(ctx context.Context, opts Options) (Result, error) {
 	return Run(ctx, opts)
 }
 
-// ExecuteEnrich centralizes this code path so package behavior stays consistent.
+// ExecuteEnrich runs Run with every data action and Nuke cleared, so it loads
+// no documents. It checks only Enrich.Enabled: when that field is false it
+// replaces Enrich with an all-policies selection, discarding Policies, All and
+// Raw. Set Enabled with Policies to execute a subset. SyncManaged passes
+// through unchanged, so when set it still upserts managed resources and
+// garbage-collects policy versions (see Options.SyncManaged), and AliasMode with
+// KeepLast > 0 still prunes older generations.
 func ExecuteEnrich(ctx context.Context, opts Options) (Result, error) {
 	opts.AddToIndex = false
 	opts.FlushIndex = false
@@ -902,7 +1040,7 @@ func ExecuteEnrich(ctx context.Context, opts Options) (Result, error) {
 
 // ─── Managed Asset and Mapping Preflight Helpers ──────────────────────────────
 
-// logEffectiveManagedAssets centralizes this code path so package behavior stays consistent.
+// logEffectiveManagedAssets logs, at Info, the settings, mappings, pipelines, policies and transforms files the run resolved, with declared and selected counts. It runs before any destructive step, so the log shows what the run intends to apply.
 func logEffectiveManagedAssets(ctx context.Context, index, settingsFile, mappingsFile, pipelinesFile, policiesFile, transformsFile string, pipelineNames, policyNames, logicalTransformNames, selectedTransformNames []string) {
 	runlog.From(ctx).Info().
 		Str("index", index).
@@ -918,7 +1056,7 @@ func logEffectiveManagedAssets(ctx context.Context, index, settingsFile, mapping
 		Msg("Effective managed assets resolved")
 }
 
-// displayManagedAsset centralizes this code path so package behavior stays consistent.
+// displayManagedAsset returns the trimmed file path for logs, or "none" when the option is unset.
 func displayManagedAsset(path string) string {
 	trimmed := strings.TrimSpace(path)
 	if trimmed == "" {
@@ -954,12 +1092,12 @@ func requireMappingPreflight(ctx context.Context, es *elasticsearch.Client, inde
 
 // ─── Data Action Selection ─────────────────────────────────────────────────────
 
-// requiresDataFile applies method-specific behavior to keep package workflows consistent.
+// requiresDataFile reports whether the action loads documents from Options.DataFile. dataActionNone does not.
 func (a dataAction) requiresDataFile() bool {
 	return a != dataActionNone
 }
 
-// selectedDataAction centralizes this code path so package behavior stays consistent.
+// selectedDataAction maps the -add, -flush and -delete flags to one dataAction. Setting more than one is an error; setting none selects dataActionNone.
 func selectedDataAction(addToIndex, flushIndex, deleteIndex bool) (dataAction, error) {
 	actionCount := 0
 	if addToIndex {

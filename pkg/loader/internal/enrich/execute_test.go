@@ -79,7 +79,7 @@ func TestExecutePolicyCancellationStopsPolling(t *testing.T) {
 	}
 }
 
-// TestResolveTargetsAllPolicies verifies behavior for the related scenario.
+// TestResolveTargetsAllPolicies guards that an "all" selection targets every available policy, sorted.
 func TestResolveTargetsAllPolicies(t *testing.T) {
 	t.Parallel()
 
@@ -96,7 +96,7 @@ func TestResolveTargetsAllPolicies(t *testing.T) {
 	}
 }
 
-// TestResolveTargetsWarnsForMissingPolicies verifies behavior for the related scenario.
+// TestResolveTargetsWarnsForMissingPolicies guards that explicitly named policies absent from the cluster are reported as missing, not targeted.
 func TestResolveTargetsWarnsForMissingPolicies(t *testing.T) {
 	t.Parallel()
 
@@ -113,7 +113,7 @@ func TestResolveTargetsWarnsForMissingPolicies(t *testing.T) {
 	}
 }
 
-// TestResolveTargetsUsesDeclaredPoliciesWhenRequestedAll verifies behavior for the related scenario.
+// TestResolveTargetsUsesDeclaredPoliciesWhenRequestedAll guards that an "all" selection is limited to the declared policies when a declared list is supplied.
 func TestResolveTargetsUsesDeclaredPoliciesWhenRequestedAll(t *testing.T) {
 	t.Parallel()
 

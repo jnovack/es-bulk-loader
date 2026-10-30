@@ -24,7 +24,7 @@ import (
 
 // ─── Harness Types ─────────────────────────────────────────────────────────────
 
-// testEnv groups state used to coordinate related package behavior.
+// testEnv is the per-run harness state: the repo root, the built loader binary, the Elasticsearch container and its URL, and an HTTP client.
 type testEnv struct {
 	repoRoot      string
 	binaryPath    string
@@ -33,7 +33,7 @@ type testEnv struct {
 	httpClient    *http.Client
 }
 
-// scenarioContext groups state used to coordinate related package behavior.
+// scenarioContext holds one scenario's index, pipeline and policy names, all prefixed so scenarios do not collide, and its fixture directories.
 type scenarioContext struct {
 	env *testEnv
 
@@ -63,13 +63,13 @@ type scenarioContext struct {
 	targetReferenceDir string
 }
 
-// commandResult groups state used to coordinate related package behavior.
+// commandResult is the combined output and exit error of one loader invocation.
 type commandResult struct {
 	output string
 	err    error
 }
 
-// scenario groups state used to coordinate related package behavior.
+// scenario is one row of the end-to-end table: its CLI flags, the outcome it asserts, and the function that runs it.
 type scenario struct {
 	name   string
 	flags  string
@@ -77,12 +77,12 @@ type scenario struct {
 	run    func(t *testing.T, ctx *scenarioContext)
 }
 
-// sharedEnv defines package-level state shared by related execution paths.
+// sharedEnv is the environment set up by TestMain and shared by every scenario.
 var sharedEnv *testEnv
 
 // ─── Test Entry Points ─────────────────────────────────────────────────────────
 
-// TestMain verifies behavior for the related scenario.
+// TestMain starts the shared Elasticsearch container, runs the scenarios, and removes the container afterward.
 func TestMain(m *testing.M) {
 	env, err := setupTestEnv()
 	if err != nil {
@@ -103,7 +103,7 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// TestEndToEndScenarios verifies behavior for the related scenario.
+// TestEndToEndScenarios runs each scenario table row against the shared container and asserts the outcome named in its checks field.
 func TestEndToEndScenarios(t *testing.T) {
 	scenarios := []scenario{
 		{
@@ -309,7 +309,7 @@ func scenarioDeleteSyncManagedEnrich(t *testing.T, ctx *scenarioContext) {
 	}
 }
 
-// scenarioFlush centralizes this code path so package behavior stays consistent.
+// scenarioFlush loads the base data, then replaces the documents with -flush and no managed-resource sync.
 func scenarioFlush(t *testing.T, ctx *scenarioContext) {
 	mustSucceed(t, runLoader(t, ctx, nil, sourceArgs(ctx, ctx.sourceBaseDir, "-delete", true, true, "")))
 
@@ -332,7 +332,7 @@ func scenarioFlush(t *testing.T, ctx *scenarioContext) {
 	assertEqual(t, nestedFloat(doc, "_source", "calculated_value"), 20)
 }
 
-// scenarioFlushSyncManaged centralizes this code path so package behavior stays consistent.
+// scenarioFlushSyncManaged loads the base data, then flushes with -sync-managed and asserts the managed pipelines are present afterward.
 func scenarioFlushSyncManaged(t *testing.T, ctx *scenarioContext) {
 	mustSucceed(t, runLoader(t, ctx, nil, sourceArgs(ctx, ctx.sourceBaseDir, "-delete", true, true, "")))
 
@@ -351,7 +351,7 @@ func scenarioFlushSyncManaged(t *testing.T, ctx *scenarioContext) {
 	assertMissingField(t, doc, "_source", "pipeline_version")
 }
 
-// scenarioAdd centralizes this code path so package behavior stays consistent.
+// scenarioAdd loads the base data, then appends replacement documents with -add.
 func scenarioAdd(t *testing.T, ctx *scenarioContext) {
 	mustSucceed(t, runLoader(t, ctx, nil, sourceArgs(ctx, ctx.sourceBaseDir, "-delete", true, false, "")))
 
@@ -366,7 +366,7 @@ func scenarioAdd(t *testing.T, ctx *scenarioContext) {
 	assertEqual(t, nestedString(doc, "_source", "source_label"), "gamma-20")
 }
 
-// scenarioAddSyncManaged centralizes this code path so package behavior stays consistent.
+// scenarioAddSyncManaged loads the base data, then appends a document with -add and -sync-managed and asserts the managed alt-source resources exist.
 func scenarioAddSyncManaged(t *testing.T, ctx *scenarioContext) {
 	mustSucceed(t, runLoader(t, ctx, nil, sourceArgs(ctx, ctx.sourceBaseDir, "-delete", true, false, "")))
 
@@ -381,7 +381,7 @@ func scenarioAddSyncManaged(t *testing.T, ctx *scenarioContext) {
 	assertEqual(t, nestedString(doc, "_source", "source_label"), "gamma-20")
 }
 
-// scenarioDeleteReferencedPolicyFails centralizes this code path so package behavior stays consistent.
+// scenarioDeleteReferencedPolicyFails asserts that a -delete run fails when the enrich policy it would remove is still referenced by a pipeline.
 func scenarioDeleteReferencedPolicyFails(t *testing.T, ctx *scenarioContext) {
 	mustSucceed(t, runLoader(t, ctx, nil, sourceArgs(ctx, ctx.sourceBaseDir, "-delete", true, true, "")))
 	mustSucceed(t, runLoader(t, ctx, nil, targetArgs(ctx, "-delete", true)))
@@ -396,7 +396,7 @@ func scenarioDeleteReferencedPolicyFails(t *testing.T, ctx *scenarioContext) {
 	assertPipelineExists(t, ctx, ctx.targetPipelinePrimary)
 }
 
-// scenarioNuke centralizes this code path so package behavior stays consistent.
+// scenarioNuke loads the source and target indices, then runs -nuke against the source index.
 func scenarioNuke(t *testing.T, ctx *scenarioContext) {
 	mustSucceed(t, runLoader(t, ctx, nil, sourceArgs(ctx, ctx.sourceBaseDir, "-delete", true, true, "")))
 	mustSucceed(t, runLoader(t, ctx, nil, targetArgs(ctx, "-delete", true)))
@@ -412,7 +412,7 @@ func scenarioNuke(t *testing.T, ctx *scenarioContext) {
 	assertNoDefaultPipeline(t, ctx, ctx.targetIndex)
 }
 
-// scenarioNukeDeleteSyncManaged centralizes this code path so package behavior stays consistent.
+// scenarioNukeDeleteSyncManaged loads the source and target indices, then runs -nuke with -delete and -sync-managed against the source index.
 func scenarioNukeDeleteSyncManaged(t *testing.T, ctx *scenarioContext) {
 	mustSucceed(t, runLoader(t, ctx, nil, sourceArgs(ctx, ctx.sourceBaseDir, "-delete", true, true, "")))
 	mustSucceed(t, runLoader(t, ctx, nil, targetArgs(ctx, "-delete", true)))
@@ -430,7 +430,7 @@ func scenarioNukeDeleteSyncManaged(t *testing.T, ctx *scenarioContext) {
 	assertNoDefaultPipeline(t, ctx, ctx.targetIndex)
 }
 
-// scenarioEnrichMissingPolicies centralizes this code path so package behavior stays consistent.
+// scenarioEnrichMissingPolicies asserts that -enrich against a cluster with no enrich policies warns ("No enrich policies found") and succeeds, leaving the index and its documents in place.
 func scenarioEnrichMissingPolicies(t *testing.T, ctx *scenarioContext) {
 	result := runLoader(t, ctx, nil, sourceArgsNoPolicies(ctx, "-delete", false, true, ""))
 	mustSucceed(t, result)
@@ -441,7 +441,7 @@ func scenarioEnrichMissingPolicies(t *testing.T, ctx *scenarioContext) {
 	assertPolicyMissing(t, ctx, ctx.sourcePolicy)
 }
 
-// scenarioEnrichExplicitUnknownPolicy centralizes this code path so package behavior stays consistent.
+// scenarioEnrichExplicitUnknownPolicy asserts that an unknown policy named in -enrich is skipped with a warning and the run still succeeds.
 func scenarioEnrichExplicitUnknownPolicy(t *testing.T, ctx *scenarioContext) {
 	mustSucceed(t, runLoader(t, ctx, nil, sourceArgs(ctx, ctx.sourceBaseDir, "-delete", true, true, "")))
 
@@ -454,7 +454,7 @@ func scenarioEnrichExplicitUnknownPolicy(t *testing.T, ctx *scenarioContext) {
 	assertEnrichBackingIndexExists(t, ctx, ctx.sourcePolicy)
 }
 
-// scenarioAliasDeleteCreatesTimestampedIndex centralizes this code path so package behavior stays consistent.
+// scenarioAliasDeleteCreatesTimestampedIndex asserts that -delete -alias without -sync-managed warns that it is assuming -sync-managed, then rolls to a timestamped index.
 func scenarioAliasDeleteCreatesTimestampedIndex(t *testing.T, ctx *scenarioContext) {
 	args := append(sourceArgsNoPolicies(ctx, "-delete", false, false, ""), "-alias")
 	result := runLoader(t, ctx, nil, args)
@@ -533,7 +533,7 @@ func scenarioDeleteSyncManagedWaitTransforms(t *testing.T, ctx *scenarioContext)
 	assertDocCount(t, ctx, destIndex, 2)
 }
 
-// scenarioAliasKeepLastPrunesOldestAfterThirdRun centralizes this code path so package behavior stays consistent.
+// scenarioAliasKeepLastPrunesOldestAfterThirdRun runs three alias rollovers with -keep-last 2 and asserts that the oldest generation is pruned.
 func scenarioAliasKeepLastPrunesOldestAfterThirdRun(t *testing.T, ctx *scenarioContext) {
 	baseArgs := []string{
 		"-url", ctx.env.esURL,
@@ -698,7 +698,7 @@ func scenarioAliasFlushStaleTargetFailsBeforeFlush(t *testing.T, ctx *scenarioCo
 
 // ─── Environment and Fixture Setup ─────────────────────────────────────────────
 
-// setupTestEnv centralizes this code path so package behavior stays consistent.
+// setupTestEnv resolves the repo root, creates a temp directory, builds the loader binary, and starts the Elasticsearch container.
 func setupTestEnv() (*testEnv, error) {
 	repoRoot, err := repoRoot()
 	if err != nil {
@@ -741,7 +741,7 @@ func setupTestEnv() (*testEnv, error) {
 	return env, nil
 }
 
-// teardownTestEnv centralizes this code path so package behavior stays consistent.
+// teardownTestEnv force-removes the Elasticsearch container and the temp directory holding the built binary. A container that is already gone is not an error.
 func teardownTestEnv(env *testEnv) error {
 	var errs []string
 	if env.containerName != "" {
@@ -761,7 +761,7 @@ func teardownTestEnv(env *testEnv) error {
 	return nil
 }
 
-// repoRoot centralizes this code path so package behavior stays consistent.
+// repoRoot returns the repository root, derived from this source file's location at runtime.
 func repoRoot() (string, error) {
 	_, filename, _, ok := runtime.Caller(0)
 	if !ok {
@@ -770,7 +770,7 @@ func repoRoot() (string, error) {
 	return filepath.Clean(filepath.Join(filepath.Dir(filename), "..")), nil
 }
 
-// startElasticsearchContainer centralizes this code path so package behavior stays consistent.
+// startElasticsearchContainer starts a single-node Elasticsearch container with the given name and returns the host port published for 9200.
 func startElasticsearchContainer(containerName string) (string, error) {
 	cmd := exec.Command(
 		"docker", "run", "-d", "-P", "--name", containerName,
@@ -801,7 +801,7 @@ func startElasticsearchContainer(containerName string) (string, error) {
 	return port, nil
 }
 
-// waitForCluster centralizes this code path so package behavior stays consistent.
+// waitForCluster polls cluster health until it answers OK, or fails after 90 seconds.
 func waitForCluster(env *testEnv) error {
 	deadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(deadline) {
@@ -821,7 +821,7 @@ func waitForCluster(env *testEnv) error {
 	return fmt.Errorf("elasticsearch did not become ready at %s\n%s", env.esURL, string(logs))
 }
 
-// newScenarioContext centralizes this code path so package behavior stays consistent.
+// newScenarioContext creates a scenario's names and fixture directories under t.TempDir(), prefixed so scenarios do not collide.
 func newScenarioContext(t *testing.T, prefix string) *scenarioContext {
 	t.Helper()
 
@@ -859,7 +859,7 @@ func newScenarioContext(t *testing.T, prefix string) *scenarioContext {
 	return ctx
 }
 
-// writeFixtures applies method-specific behavior to keep package workflows consistent.
+// writeFixtures writes every fixture file a scenario reads, with pipeline and policy names templated per scenario.
 func (ctx *scenarioContext) writeFixtures(t *testing.T) {
 	t.Helper()
 
@@ -923,7 +923,7 @@ func (ctx *scenarioContext) writeFixtures(t *testing.T) {
 	})
 }
 
-// cleanup applies method-specific behavior to keep package workflows consistent.
+// cleanup deletes the scenario's target index, source index and alias-generation indices, so a rerun starts clean.
 func (ctx *scenarioContext) cleanup(t *testing.T) {
 	t.Helper()
 
@@ -967,7 +967,7 @@ func writeSourceVariant(t *testing.T, ctx *scenarioContext, dirName string, over
 	return dir
 }
 
-// writeFixtureDir centralizes this code path so package behavior stays consistent.
+// writeFixtureDir writes each named file, newline-terminated, into dir, creating dir first.
 func writeFixtureDir(t *testing.T, dir string, files map[string]string) {
 	t.Helper()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -980,7 +980,7 @@ func writeFixtureDir(t *testing.T, dir string, files map[string]string) {
 	}
 }
 
-// runLoader centralizes this code path so package behavior stays consistent.
+// runLoader runs the built loader binary with args from the repo root and returns its combined output and error. extraEnv is added to the environment.
 func runLoader(t *testing.T, ctx *scenarioContext, extraEnv map[string]string, args []string) commandResult {
 	t.Helper()
 
@@ -1013,7 +1013,7 @@ func runLoader(t *testing.T, ctx *scenarioContext, extraEnv map[string]string, a
 	return commandResult{output: string(output), err: err}
 }
 
-// sourceArgs centralizes this code path so package behavior stays consistent.
+// sourceArgs builds the argument list for the source index, selecting the fixture directory and the action flags.
 func sourceArgs(ctx *scenarioContext, fixtureDir, action string, syncManaged, enrich bool, enrichValue string) []string {
 	args := []string{
 		"-url", ctx.env.esURL,
@@ -1039,7 +1039,7 @@ func sourceArgs(ctx *scenarioContext, fixtureDir, action string, syncManaged, en
 	return args
 }
 
-// sourceArgsNoPolicies centralizes this code path so package behavior stays consistent.
+// sourceArgsNoPolicies is sourceArgs without a policies file, for runs that must see no declared policies.
 func sourceArgsNoPolicies(ctx *scenarioContext, action string, syncManaged, enrich bool, enrichValue string) []string {
 	args := []string{
 		"-url", ctx.env.esURL,
@@ -1063,13 +1063,13 @@ func sourceArgsNoPolicies(ctx *scenarioContext, action string, syncManaged, enri
 	return args
 }
 
-// sourceArgsWithNuke centralizes this code path so package behavior stays consistent.
+// sourceArgsWithNuke is sourceArgs with -nuke appended.
 func sourceArgsWithNuke(ctx *scenarioContext, fixtureDir, action string, syncManaged, enrich bool, enrichValue string) []string {
 	args := sourceArgs(ctx, fixtureDir, action, syncManaged, enrich, enrichValue)
 	return append(args, "-nuke")
 }
 
-// targetArgs centralizes this code path so package behavior stays consistent.
+// targetArgs builds the argument list for the target index fixtures.
 func targetArgs(ctx *scenarioContext, action string, syncManaged bool) []string {
 	args := []string{
 		"-url", ctx.env.esURL,
@@ -1087,7 +1087,7 @@ func targetArgs(ctx *scenarioContext, action string, syncManaged bool) []string 
 	return args
 }
 
-// nukeArgs centralizes this code path so package behavior stays consistent.
+// nukeArgs builds the argument list for a bare -nuke run against the source index.
 func nukeArgs(ctx *scenarioContext) []string {
 	return []string{
 		"-url", ctx.env.esURL,
@@ -1136,7 +1136,7 @@ func aliasTargets(t *testing.T, ctx *scenarioContext, alias string) []string {
 	return targets
 }
 
-// singleAliasTarget centralizes this code path so package behavior stays consistent.
+// singleAliasTarget returns the one concrete index the alias points to, and fails the test when the alias has zero or several targets.
 func singleAliasTarget(t *testing.T, ctx *scenarioContext, alias string) string {
 	t.Helper()
 	targets := aliasTargets(t, ctx, alias)
@@ -1146,7 +1146,7 @@ func singleAliasTarget(t *testing.T, ctx *scenarioContext, alias string) string 
 	return targets[0]
 }
 
-// timestampedIndices centralizes this code path so package behavior stays consistent.
+// timestampedIndices lists the indices that match the alias's timestamped generation pattern.
 func timestampedIndices(t *testing.T, ctx *scenarioContext, alias string) []string {
 	t.Helper()
 	var response []map[string]any
@@ -1162,7 +1162,7 @@ func timestampedIndices(t *testing.T, ctx *scenarioContext, alias string) []stri
 	return indices
 }
 
-// deleteTimestampedIndicesForAlias centralizes this code path so package behavior stays consistent.
+// deleteTimestampedIndicesForAlias deletes every timestamped generation of alias, for cleanup.
 func deleteTimestampedIndicesForAlias(t *testing.T, ctx *scenarioContext, alias string) {
 	t.Helper()
 	for _, index := range timestampedIndices(t, ctx, alias) {
@@ -1170,7 +1170,7 @@ func deleteTimestampedIndicesForAlias(t *testing.T, ctx *scenarioContext, alias 
 	}
 }
 
-// assertTimestampedIndexName centralizes this code path so package behavior stays consistent.
+// assertTimestampedIndexName fails the test unless index matches <alias>-YYYYMMDDHHMMSS.
 func assertTimestampedIndexName(t *testing.T, alias, index string) {
 	t.Helper()
 	if !isTimestampedIndexName(alias, index) {
@@ -1178,7 +1178,7 @@ func assertTimestampedIndexName(t *testing.T, alias, index string) {
 	}
 }
 
-// isTimestampedIndexName centralizes this code path so package behavior stays consistent.
+// isTimestampedIndexName reports whether index is alias followed by a 14-digit numeric suffix.
 func isTimestampedIndexName(alias, index string) bool {
 	prefix := alias + "-"
 	if !strings.HasPrefix(index, prefix) {
@@ -1195,7 +1195,7 @@ func isTimestampedIndexName(alias, index string) bool {
 	return err == nil
 }
 
-// containsString centralizes this code path so package behavior stays consistent.
+// containsString reports whether target is one of values.
 func containsString(values []string, target string) bool {
 	for _, value := range values {
 		if value == target {
@@ -1207,7 +1207,7 @@ func containsString(values []string, target string) bool {
 
 // ─── Assertions and Utilities ──────────────────────────────────────────────────
 
-// assertIndexExists centralizes this code path so package behavior stays consistent.
+// assertIndexExists fails the test unless the named index exists in Elasticsearch.
 func assertIndexExists(t *testing.T, ctx *scenarioContext, index string) {
 	t.Helper()
 	if !indexExists(t, ctx, index) {
@@ -1215,7 +1215,7 @@ func assertIndexExists(t *testing.T, ctx *scenarioContext, index string) {
 	}
 }
 
-// assertIndexMissing centralizes this code path so package behavior stays consistent.
+// assertIndexMissing fails the test if the named index exists.
 func assertIndexMissing(t *testing.T, ctx *scenarioContext, index string) {
 	t.Helper()
 	if indexExists(t, ctx, index) {
@@ -1223,7 +1223,7 @@ func assertIndexMissing(t *testing.T, ctx *scenarioContext, index string) {
 	}
 }
 
-// indexExists centralizes this code path so package behavior stays consistent.
+// indexExists queries Elasticsearch and reports whether the named index exists.
 func indexExists(t *testing.T, ctx *scenarioContext, index string) bool {
 	t.Helper()
 	resp := doRequest(t, ctx, http.MethodHead, "/"+index, nil)
@@ -1231,7 +1231,7 @@ func indexExists(t *testing.T, ctx *scenarioContext, index string) bool {
 	return resp.StatusCode == http.StatusOK
 }
 
-// assertDocCount centralizes this code path so package behavior stays consistent.
+// assertDocCount fails the test unless the index holds exactly want documents.
 func assertDocCount(t *testing.T, ctx *scenarioContext, index string, want int) {
 	t.Helper()
 	refreshIndex(t, ctx, index)
@@ -1244,7 +1244,7 @@ func assertDocCount(t *testing.T, ctx *scenarioContext, index string, want int) 
 	}
 }
 
-// assertDefaultPipeline centralizes this code path so package behavior stays consistent.
+// assertDefaultPipeline fails the test unless the index's default pipeline equals pipeline.
 func assertDefaultPipeline(t *testing.T, ctx *scenarioContext, index, want string) {
 	t.Helper()
 	var response map[string]map[string]map[string]map[string]string
@@ -1255,7 +1255,7 @@ func assertDefaultPipeline(t *testing.T, ctx *scenarioContext, index, want strin
 	}
 }
 
-// assertNoDefaultPipeline centralizes this code path so package behavior stays consistent.
+// assertNoDefaultPipeline fails the test if the index has a default pipeline set.
 func assertNoDefaultPipeline(t *testing.T, ctx *scenarioContext, index string) {
 	t.Helper()
 	var response map[string]map[string]map[string]map[string]string
@@ -1269,7 +1269,7 @@ func assertNoDefaultPipeline(t *testing.T, ctx *scenarioContext, index string) {
 	}
 }
 
-// assertMappingField centralizes this code path so package behavior stays consistent.
+// assertMappingField fails the test unless the index mappings declare the field at fieldPath.
 func assertMappingField(t *testing.T, ctx *scenarioContext, index, field string) {
 	t.Helper()
 	if !mappingFieldExists(t, ctx, index, field) {
@@ -1277,7 +1277,7 @@ func assertMappingField(t *testing.T, ctx *scenarioContext, index, field string)
 	}
 }
 
-// assertNoMappingField centralizes this code path so package behavior stays consistent.
+// assertNoMappingField fails the test if the index mappings declare the field at fieldPath.
 func assertNoMappingField(t *testing.T, ctx *scenarioContext, index, field string) {
 	t.Helper()
 	if mappingFieldExists(t, ctx, index, field) {
@@ -1285,7 +1285,7 @@ func assertNoMappingField(t *testing.T, ctx *scenarioContext, index, field strin
 	}
 }
 
-// mappingFieldExists centralizes this code path so package behavior stays consistent.
+// mappingFieldExists reports whether the index mappings declare the dotted field path.
 func mappingFieldExists(t *testing.T, ctx *scenarioContext, index, field string) bool {
 	t.Helper()
 	var response map[string]map[string]any
@@ -1302,7 +1302,7 @@ func mappingFieldExists(t *testing.T, ctx *scenarioContext, index, field string)
 	return ok
 }
 
-// assertPipelineExists centralizes this code path so package behavior stays consistent.
+// assertPipelineExists fails the test unless the named ingest pipeline exists.
 func assertPipelineExists(t *testing.T, ctx *scenarioContext, name string) {
 	t.Helper()
 	resp := doRequest(t, ctx, http.MethodGet, "/_ingest/pipeline/"+name, nil)
@@ -1331,7 +1331,7 @@ func pipelineDefinition(t *testing.T, ctx *scenarioContext, name string) string 
 	return string(canonical)
 }
 
-// assertPipelineMissing centralizes this code path so package behavior stays consistent.
+// assertPipelineMissing fails the test if the named ingest pipeline exists.
 func assertPipelineMissing(t *testing.T, ctx *scenarioContext, name string) {
 	t.Helper()
 	resp := doRequest(t, ctx, http.MethodGet, "/_ingest/pipeline/"+name, nil)
@@ -1342,7 +1342,7 @@ func assertPipelineMissing(t *testing.T, ctx *scenarioContext, name string) {
 	}
 }
 
-// assertPolicyExists centralizes this code path so package behavior stays consistent.
+// assertPolicyExists fails the test unless the named enrich policy exists.
 func assertPolicyExists(t *testing.T, ctx *scenarioContext, name string) {
 	t.Helper()
 
@@ -1360,7 +1360,7 @@ func assertPolicyExists(t *testing.T, ctx *scenarioContext, name string) {
 	}
 }
 
-// assertPolicyMissing centralizes this code path so package behavior stays consistent.
+// assertPolicyMissing fails the test if the named enrich policy exists.
 func assertPolicyMissing(t *testing.T, ctx *scenarioContext, name string) {
 	t.Helper()
 	for _, policy := range listPolicyNames(t, ctx) {
@@ -1384,7 +1384,7 @@ func assertPolicyMissing(t *testing.T, ctx *scenarioContext, name string) {
 	t.Fatalf("expected policy %q to be missing, status=%d body=%s", name, resp.StatusCode, string(body))
 }
 
-// listPolicyNames centralizes this code path so package behavior stays consistent.
+// listPolicyNames returns the names of all enrich policies in the cluster.
 func listPolicyNames(t *testing.T, ctx *scenarioContext) []string {
 	t.Helper()
 	resp := doRequest(t, ctx, http.MethodGet, "/_enrich/policy", nil)
@@ -1420,7 +1420,7 @@ func listPolicyNames(t *testing.T, ctx *scenarioContext) []string {
 	return names
 }
 
-// isManagedPolicyForLogical centralizes this code path so package behavior stays consistent.
+// isManagedPolicyForLogical reports whether name is a content-hashed managed version of logical, in the form <logical>-<sha256[:6]>.
 func isManagedPolicyForLogical(logical, candidate string) bool {
 	prefix := logical + "-"
 	if !strings.HasPrefix(candidate, prefix) {
@@ -1438,7 +1438,7 @@ func isManagedPolicyForLogical(logical, candidate string) bool {
 	return true
 }
 
-// assertEnrichBackingIndexExists centralizes this code path so package behavior stays consistent.
+// assertEnrichBackingIndexExists fails the test unless the policy's .enrich-<policy> backing index exists.
 func assertEnrichBackingIndexExists(t *testing.T, ctx *scenarioContext, policy string) {
 	t.Helper()
 	var response []map[string]any
@@ -1460,7 +1460,7 @@ func enrichAliasTargets(t *testing.T, ctx *scenarioContext, policy string) []str
 	return aliasTargets(t, ctx, ".enrich-"+policy)
 }
 
-// getDocument centralizes this code path so package behavior stays consistent.
+// getDocument fetches one document by ID and returns its parsed response.
 func getDocument(t *testing.T, ctx *scenarioContext, index, id string) map[string]any {
 	t.Helper()
 	refreshIndex(t, ctx, index)
@@ -1469,7 +1469,7 @@ func getDocument(t *testing.T, ctx *scenarioContext, index, id string) map[strin
 	return response
 }
 
-// refreshIndex centralizes this code path so package behavior stays consistent.
+// refreshIndex refreshes the index so documents written by the previous step are searchable.
 func refreshIndex(t *testing.T, ctx *scenarioContext, index string) {
 	t.Helper()
 	resp := doRequest(t, ctx, http.MethodPost, "/"+index+"/_refresh", nil)
@@ -1480,7 +1480,7 @@ func refreshIndex(t *testing.T, ctx *scenarioContext, index string) {
 	}
 }
 
-// doRequest centralizes this code path so package behavior stays consistent.
+// doRequest sends one request to Elasticsearch and returns the response.
 func doRequest(t *testing.T, ctx *scenarioContext, method, path string, body []byte) *http.Response {
 	t.Helper()
 	var reader io.Reader
@@ -1501,7 +1501,7 @@ func doRequest(t *testing.T, ctx *scenarioContext, method, path string, body []b
 	return resp
 }
 
-// deleteIndexIfExists centralizes this code path so package behavior stays consistent.
+// deleteIndexIfExists deletes the index when present and ignores a 404.
 func deleteIndexIfExists(t *testing.T, ctx *scenarioContext, index string) {
 	t.Helper()
 	resp := doRequest(t, ctx, http.MethodDelete, "/"+index, nil)
@@ -1526,7 +1526,7 @@ func deleteTransformIfExists(t *testing.T, ctx *scenarioContext, name string) {
 	}
 }
 
-// deletePipelineIfExists centralizes this code path so package behavior stays consistent.
+// deletePipelineIfExists deletes the ingest pipeline when present and ignores a 404.
 func deletePipelineIfExists(t *testing.T, ctx *scenarioContext, name string) {
 	t.Helper()
 	resp := doRequest(t, ctx, http.MethodDelete, "/_ingest/pipeline/"+name, nil)
@@ -1537,7 +1537,7 @@ func deletePipelineIfExists(t *testing.T, ctx *scenarioContext, name string) {
 	}
 }
 
-// deletePolicyIfExists centralizes this code path so package behavior stays consistent.
+// deletePolicyIfExists deletes the enrich policy when present and ignores a 404.
 func deletePolicyIfExists(t *testing.T, ctx *scenarioContext, name string) {
 	t.Helper()
 	resp := doRequest(t, ctx, http.MethodDelete, "/_enrich/policy/"+name, nil)
@@ -1551,7 +1551,7 @@ func deletePolicyIfExists(t *testing.T, ctx *scenarioContext, name string) {
 	}
 }
 
-// deleteManagedPoliciesForLogical centralizes this code path so package behavior stays consistent.
+// deleteManagedPoliciesForLogical deletes every managed policy version of logical, for cleanup.
 func deleteManagedPoliciesForLogical(t *testing.T, ctx *scenarioContext, logical string) {
 	t.Helper()
 	for _, policy := range listPolicyNames(t, ctx) {
@@ -1561,7 +1561,7 @@ func deleteManagedPoliciesForLogical(t *testing.T, ctx *scenarioContext, logical
 	}
 }
 
-// readJSON centralizes this code path so package behavior stays consistent.
+// readJSON decodes a JSON response body into out and fails the test on a parse error.
 func readJSON(t *testing.T, resp *http.Response, target any) {
 	t.Helper()
 	defer resp.Body.Close()
@@ -1577,7 +1577,7 @@ func readJSON(t *testing.T, resp *http.Response, target any) {
 	}
 }
 
-// mustSucceed centralizes this code path so package behavior stays consistent.
+// mustSucceed fails the test, printing the loader output, when the command exited with an error.
 func mustSucceed(t *testing.T, result commandResult) {
 	t.Helper()
 	if result.err != nil {
@@ -1585,7 +1585,7 @@ func mustSucceed(t *testing.T, result commandResult) {
 	}
 }
 
-// mustFailWith centralizes this code path so package behavior stays consistent.
+// mustFailWith fails the test unless the command failed and its output contains want.
 func mustFailWith(t *testing.T, result commandResult, substring string) {
 	t.Helper()
 	if result.err == nil {
@@ -1594,7 +1594,7 @@ func mustFailWith(t *testing.T, result commandResult, substring string) {
 	mustContain(t, result.output, substring)
 }
 
-// mustContain centralizes this code path so package behavior stays consistent.
+// mustContain fails the test unless output contains want.
 func mustContain(t *testing.T, output, substring string) {
 	t.Helper()
 	if !strings.Contains(output, substring) {
@@ -1602,7 +1602,7 @@ func mustContain(t *testing.T, output, substring string) {
 	}
 }
 
-// assertEqual centralizes this code path so package behavior stays consistent.
+// assertEqual fails the test when got and want differ, printing both.
 func assertEqual[T comparable](t *testing.T, got, want T) {
 	t.Helper()
 	if got != want {
@@ -1610,7 +1610,7 @@ func assertEqual[T comparable](t *testing.T, got, want T) {
 	}
 }
 
-// nestedString centralizes this code path so package behavior stays consistent.
+// nestedString returns the string at the nested key path, or an empty string when a key is missing or the value is not a string.
 func nestedString(value map[string]any, path ...string) string {
 	current := nestedValue(value, path...)
 	if s, ok := current.(string); ok {
@@ -1619,7 +1619,7 @@ func nestedString(value map[string]any, path ...string) string {
 	return ""
 }
 
-// nestedFloat centralizes this code path so package behavior stays consistent.
+// nestedFloat returns the number at the nested key path, or 0 when a key is missing or the value is not numeric.
 func nestedFloat(value map[string]any, path ...string) float64 {
 	current := nestedValue(value, path...)
 	if f, ok := current.(float64); ok {
@@ -1628,7 +1628,7 @@ func nestedFloat(value map[string]any, path ...string) float64 {
 	return 0
 }
 
-// assertMissingField centralizes this code path so package behavior stays consistent.
+// assertMissingField fails the test if the nested key path exists in v.
 func assertMissingField(t *testing.T, value map[string]any, path ...string) {
 	t.Helper()
 	if nestedValue(value, path...) != nil {
@@ -1636,7 +1636,7 @@ func assertMissingField(t *testing.T, value map[string]any, path ...string) {
 	}
 }
 
-// nestedValue centralizes this code path so package behavior stays consistent.
+// nestedValue returns the raw value at the nested key path, or nil when a key is missing.
 func nestedValue(value map[string]any, path ...string) any {
 	var current any = value
 	for _, part := range path {
@@ -1652,7 +1652,7 @@ func nestedValue(value map[string]any, path ...string) any {
 	return current
 }
 
-// managedPolicyNameForLogicalAndIndex centralizes this code path so package behavior stays consistent.
+// managedPolicyNameForLogicalAndIndex computes the expected managed policy name, mirroring the loader's <logical>-<sha256[:6]> rule for the given index.
 func managedPolicyNameForLogicalAndIndex(logical, index string) string {
 	raw := map[string]any{
 		"match": map[string]any{
@@ -1689,10 +1689,10 @@ const sourceTransformsJSON = `{
   }
 }`
 
-// sourceSettingsJSON defines package-level values shared by related execution paths.
+// sourceSettingsJSON is the source index settings fixture: an empty settings object.
 const sourceSettingsJSON = `{"settings":{}}`
 
-// sourceBaseMappingsJSON defines package-level values shared by related execution paths.
+// sourceBaseMappingsJSON is the source index mappings fixture for the base load.
 const sourceBaseMappingsJSON = `{
   "mappings": {
     "properties": {
@@ -1726,7 +1726,7 @@ const sourceSyncMappingsJSON = `{
   }
 }`
 
-// sourcePipelinesJSON defines package-level values shared by related execution paths.
+// sourcePipelinesJSON is the keyed source pipeline fixture. Its two %s slots take the scenario's primary and secondary pipeline names.
 const sourcePipelinesJSON = `{
   "%s": {
     "description": "Default source pipeline",
@@ -1752,7 +1752,7 @@ const sourcePipelinesJSON = `{
   }
 }`
 
-// sourceSyncPipelinesJSON defines package-level values shared by related execution paths.
+// sourceSyncPipelinesJSON is the source pipeline fixture for -sync-managed scenarios, with its pipeline and policy names templated per scenario.
 const sourceSyncPipelinesJSON = `{
   "%s": {
     "description": "Synced source pipeline",
@@ -1778,7 +1778,7 @@ const sourceSyncPipelinesJSON = `{
   }
 }`
 
-// sourcePoliciesJSON defines package-level values shared by related execution paths.
+// sourcePoliciesJSON is the keyed source enrich policy fixture. Its %s slot takes the scenario's policy name.
 const sourcePoliciesJSON = `{
   "%s": {
     "match": {
@@ -1789,7 +1789,7 @@ const sourcePoliciesJSON = `{
   }
 }`
 
-// sourceSyncPoliciesJSON defines package-level values shared by related execution paths.
+// sourceSyncPoliciesJSON is the source enrich policy fixture for -sync-managed scenarios.
 const sourceSyncPoliciesJSON = `{
   "%s": {
     "match": {
@@ -1800,26 +1800,26 @@ const sourceSyncPoliciesJSON = `{
   }
 }`
 
-// sourceInitialDataJSON defines package-level values shared by related execution paths.
+// sourceInitialDataJSON is the first source data load: two documents.
 const sourceInitialDataJSON = `[
   { "lookup_id": "A1", "base_value": 7, "multiplier": 3, "source_name": "alpha" },
   { "lookup_id": "B2", "base_value": 5, "multiplier": 4, "source_name": "beta" }
 ]`
 
-// sourceReplacementDataJSON defines package-level values shared by related execution paths.
+// sourceReplacementDataJSON is the replacement load used by -flush scenarios: one document.
 const sourceReplacementDataJSON = `[
   { "lookup_id": "C3", "base_value": 4, "multiplier": 5, "source_name": "gamma" }
 ]`
 
-// sourceAppendDataJSON defines package-level values shared by related execution paths.
+// sourceAppendDataJSON is the document appended by -add scenarios.
 const sourceAppendDataJSON = `[
   { "lookup_id": "C3", "base_value": 4, "multiplier": 5, "source_name": "gamma" }
 ]`
 
-// targetSettingsJSON defines package-level values shared by related execution paths.
+// targetSettingsJSON is the target index settings fixture: an empty settings object.
 const targetSettingsJSON = `{"settings":{}}`
 
-// targetMappingsJSON defines package-level values shared by related execution paths.
+// targetMappingsJSON is the target index mappings fixture, including the enrich target object.
 const targetMappingsJSON = `{
   "mappings": {
     "properties": {
@@ -1836,7 +1836,7 @@ const targetMappingsJSON = `{
   }
 }`
 
-// targetPipelinesJSON defines package-level values shared by related execution paths.
+// targetPipelinesJSON is the keyed target pipeline fixture. Its enrich processor references the source policy.
 const targetPipelinesJSON = `{
   "%s": {
     "description": "Target enrich pipeline",
@@ -1865,7 +1865,7 @@ const targetPipelinesJSON = `{
   }
 }`
 
-// targetDataJSON defines package-level values shared by related execution paths.
+// targetDataJSON is the target index's two documents, keyed to the source lookup_id values.
 const targetDataJSON = `[
   { "lookup_id": "A1", "target_name": "first" },
   { "lookup_id": "B2", "target_name": "second" }
