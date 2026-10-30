@@ -40,11 +40,14 @@ print-vars:
 test-unit:
 	go test ./...
 
+# -count=1: the E2E suite builds the CLI in a subprocess and talks to a live
+# container, so Go's test cache cannot see loader edits or cluster state. A
+# cached "ok" here is a false pass.
 test-e2e:
-	go test -tags=e2e ./test -run TestEndToEndScenarios
+	go test -count=1 -tags=e2e ./test -run TestEndToEndScenarios
 
 test-e2e-verbose:
-	go test -tags=e2e ./test -run TestEndToEndScenarios -v
+	go test -count=1 -tags=e2e ./test -run TestEndToEndScenarios -v
 
 docker-build:
 	docker buildx build \

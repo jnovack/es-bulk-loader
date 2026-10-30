@@ -20,14 +20,14 @@ go test ./...
 Use the tagged E2E suite when you want real Elasticsearch lifecycle coverage:
 
 ```bash
-go test -tags=e2e ./test -run TestEndToEndScenarios
+go test -count=1 -tags=e2e ./test -run TestEndToEndScenarios
 ```
 
 Run the E2E suite in verbose mode to see each scenario and the checks it
 performs:
 
 ```bash
-go test -tags=e2e ./test -run TestEndToEndScenarios -v
+go test -count=1 -tags=e2e ./test -run TestEndToEndScenarios -v
 ```
 
 Canonical shortcuts from repo root:

@@ -248,13 +248,16 @@ Canonical E2E command (also available as `make test-e2e`) uses the tagged
 suite entrypoint:
 
 ```bash
-go test -tags=e2e ./test -run TestEndToEndScenarios
+go test -count=1 -tags=e2e ./test -run TestEndToEndScenarios
 ```
+
+`-count=1` disables Go's test cache: the suite builds the CLI in a
+subprocess, so a cached result cannot see loader changes.
 
 Verbose E2E output:
 
 ```bash
-go test -tags=e2e ./test -run TestEndToEndScenarios -v
+go test -count=1 -tags=e2e ./test -run TestEndToEndScenarios -v
 ```
 
 If you see `build constraints exclude all Go files` for `./test`, the run is
