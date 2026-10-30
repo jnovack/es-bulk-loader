@@ -244,6 +244,14 @@ Unit tests stay in the default Go test path:
 go test ./...
 ```
 
+Deprecated-API check (staticcheck is pinned in `go.mod` and built with
+the active toolchain):
+
+```bash
+go tool staticcheck -checks=SA1019 ./...
+go tool staticcheck -tags=e2e -checks=SA1019 ./...
+```
+
 Canonical E2E command (also available as `make test-e2e`) uses the tagged
 suite entrypoint:
 
