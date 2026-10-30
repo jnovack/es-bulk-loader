@@ -270,6 +270,13 @@ func newLifecycleStub(t *testing.T, cfg lifecycleConfig) *lifecycleStub {
 	executePolicy := s.recorded("enrich.execute", esstub.JSON(http.StatusOK, `{"status":{"phase":"COMPLETED"}}`))
 	stub.Handle("PUT /_enrich/policy/{name}/_execute", executePolicy)
 	stub.Handle("POST /_enrich/policy/{name}/_execute", executePolicy)
+	// Each execution first snapshots the policy's backing alias (absent here).
+	// The routes are exact per policy: a generic GET /_alias/{name} would
+	// conflict with GET /{name}/_mapping in ServeMux. They are reads, so they
+	// are not recorded as lifecycle operations.
+	for _, policy := range cfg.policies {
+		stub.Handle("GET /_alias/.enrich-"+policy, esstub.JSON(http.StatusNotFound, `{"error":"alias [.enrich-`+policy+`] missing","status":404}`))
+	}
 
 	for _, id := range cfg.transforms {
 		// Elasticsearch validates the transform source at PUT time, so the

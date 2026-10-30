@@ -62,12 +62,33 @@ commitment.
   change a policy's outcome.
 - Task polls that return a non-2xx status, or a task `error`, now count as a
   failed policy instead of looping or being logged as success.
-- An enrich task whose record is gone (HTTP 404) still counts as succeeded.
+- An enrich task whose record is gone (HTTP 404) is verified, not assumed.
   Elasticsearch 9.3.1 never stores the result of an async enrich task, so this
-  is the normal ending, and a policy that failed between polls looks the same:
-  the success is assumed, not verified. The existing behavior is kept, and
-  `ProgressEvent` documents it. Verifying the outcome (for example by reading
-  the policy's enrich alias) is a separate decision.
+  is the normal ending, and a policy that failed between polls looks the same.
+  - Amended 2026-10-30 (FIX-ENRICH404-01): before kickoff the loader reads the
+    `.enrich-<policy>` alias, using the selected policy's actual managed name
+    with its hash suffix. On a task 404 it reads the alias again. The policy
+    succeeds only if both reads succeed and the alias now has a non-empty
+    target set that differs from the earlier one. Comparing sets ignores the
+    order Elasticsearch lists them in. An unchanged or absent alias fails the
+    policy. So does either unreadable snapshot: transport error, non-404
+    status (for example a 403 from missing alias metadata privileges),
+    malformed JSON or a JSON `null` body. An unreadable snapshot is never
+    treated as an absent alias.
+  - A failed policy is counted in `Result.EnrichFailed` and gets one Final
+    event with `Err`; later policies and stages still run and Run does not
+    fail. Each policy makes one extra alias GET before kickoff and one more
+    after a task 404. A synchronous or completed task status stays
+    authoritative: it ignores a failed first read and makes no second read.
+  - The `.enrich-<policy>` alias convention is Elasticsearch behavior that the
+    Docker E2E proves on 9.3.1, not a documented API contract. A changed alias
+    shows that the policy produced new output, not that this task produced
+    it: another client running the same policy at the same time is
+    indistinguishable.
+  - Guards: `TestExecutePolicyVerifiesTask404`,
+    `TestExecutePolicyExplicitOutcomesSkipAliasCheck`,
+    `TestProgressEnrichAliasFailureContinues` and
+    `TestEndToEndScenarios/delete_sync-managed_enrich`.
 - A transform wait fails on the first transport error or non-2xx `_stats`
   reply, and an enrich policy on the first non-2xx task poll. This is
   deliberate: it fails closed and never reports a false success. Retrying

@@ -90,6 +90,13 @@ func ResolveTargets(ctx context.Context, es *elasticsearch.Client, alias string)
 	if err := json.NewDecoder(res.Body).Decode(&parsed); err != nil {
 		return nil, runlog.Fail(runlog.FailureEvent(ctx).Str("alias", alias), "Unable to parse alias response", err)
 	}
+	// A JSON null body decodes without error into a nil map. Returning nil, nil
+	// would make an unreadable response indistinguishable from a missing alias
+	// (404), and the enrich task-404 check would then accept an unreadable
+	// before-state as "absent" and report a first execution as verified.
+	if parsed == nil {
+		return nil, runlog.Fail(runlog.FailureEvent(ctx).Str("alias", alias), "Unable to parse alias response", fmt.Errorf("alias response was null"))
+	}
 
 	targets := make([]string, 0, len(parsed))
 	for index := range parsed {

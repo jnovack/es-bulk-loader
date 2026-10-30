@@ -240,8 +240,21 @@ func TestEndToEndScenarios(t *testing.T) {
 
 // ─── Scenario Implementations ──────────────────────────────────────────────────
 
-// scenarioDeleteSyncManagedEnrich centralizes this code path so package behavior stays consistent.
+// scenarioDeleteSyncManagedEnrich runs a full -delete -sync-managed -enrich
+// load, then re-executes the same managed policy on its own. It also guards
+// FIX-ENRICH404-01 on the pinned cluster: the exact .enrich-<managed> alias
+// is absent before the first execution, present after it, and moves to a new
+// target set on re-execution; and the re-execution logs the loader's task-404
+// verification diagnostic, proving that branch, not an explicit task status,
+// decided the outcome. Exit 0 alone proves nothing here: a failed enrich
+// policy does not fail the Run.
 func scenarioDeleteSyncManagedEnrich(t *testing.T, ctx *scenarioContext) {
+	// The isolated container and this first scenario mean no execution of
+	// the managed policy has happened yet.
+	if before := enrichAliasTargets(t, ctx, ctx.sourcePolicyManaged); before != nil {
+		t.Fatalf("expected enrich alias for %s to be absent before the first execution, got %v", ctx.sourcePolicyManaged, before)
+	}
+
 	result := runLoader(t, ctx, nil, sourceArgs(ctx, ctx.sourceBaseDir, "-delete", true, true, ""))
 	mustSucceed(t, result)
 
@@ -262,6 +275,31 @@ func scenarioDeleteSyncManagedEnrich(t *testing.T, ctx *scenarioContext) {
 	doc := getDocument(t, ctx, ctx.sourceIndex, "A1")
 	assertEqual(t, nestedString(doc, "_source", "source_label"), "alpha-21")
 	assertEqual(t, nestedFloat(doc, "_source", "calculated_value"), 21)
+
+	if !containsString(listPolicyNames(t, ctx), ctx.sourcePolicyManaged) {
+		t.Fatalf("expected managed policy %q to be listed, got %v", ctx.sourcePolicyManaged, listPolicyNames(t, ctx))
+	}
+	first := enrichAliasTargets(t, ctx, ctx.sourcePolicyManaged)
+	if len(first) == 0 {
+		t.Fatalf("expected enrich alias for %s to have targets after the first execution", ctx.sourcePolicyManaged)
+	}
+
+	// Re-execute the same policy only: no data action, no redefinition.
+	rerun := runLoader(t, ctx, nil, []string{
+		"-url", ctx.env.esURL,
+		"-index", ctx.sourceIndex,
+		"-enrich=" + ctx.sourcePolicyManaged,
+		"-level", "debug",
+	})
+	mustSucceed(t, rerun)
+	mustContain(t, rerun.output, "Enrich policy task started")
+	mustContain(t, rerun.output, "Enrich policy outcome verified via backing alias")
+	mustContain(t, rerun.output, "Enrich policy execution succeeded")
+
+	second := enrichAliasTargets(t, ctx, ctx.sourcePolicyManaged)
+	if len(second) == 0 || slices.Equal(first, second) {
+		t.Fatalf("expected enrich alias for %s to move on re-execution: before=%v after=%v\n%s", ctx.sourcePolicyManaged, first, second, rerun.output)
+	}
 }
 
 // scenarioFlush centralizes this code path so package behavior stays consistent.
@@ -1030,29 +1068,41 @@ func nukeArgs(ctx *scenarioContext) []string {
 	}
 }
 
-// aliasTargets centralizes this code path so package behavior stays consistent.
+// aliasTargets returns the sorted concrete indices alias points to, or nil
+// when the alias does not exist (404). Any other status, an unreadable body,
+// or a target whose "aliases" object does not name alias fails the test with
+// the response, so a wrong-alias or partial answer cannot pass as membership.
 func aliasTargets(t *testing.T, ctx *scenarioContext, alias string) []string {
 	t.Helper()
 
 	resp := doRequest(t, ctx, http.MethodGet, "/_alias/"+alias, nil)
-	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatalf("read alias response for %s: %v", alias, err)
+	}
 	if resp.StatusCode == http.StatusNotFound {
 		return nil
 	}
-	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("get alias %s failed: status=%d body=%s", alias, resp.StatusCode, string(body))
 	}
 
-	var parsed map[string]json.RawMessage
-	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
-		t.Fatalf("decode alias response for %s: %v", alias, err)
+	var parsed map[string]struct {
+		Aliases map[string]json.RawMessage `json:"aliases"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil || parsed == nil {
+		t.Fatalf("decode alias response for %s: %v\nbody=%s", alias, err, string(body))
 	}
 
 	targets := make([]string, 0, len(parsed))
-	for index := range parsed {
+	for index, entry := range parsed {
+		if _, ok := entry.Aliases[alias]; !ok {
+			t.Fatalf("alias response for %s lists index %s without that alias\nbody=%s", alias, index, string(body))
+		}
 		targets = append(targets, index)
 	}
+	slices.Sort(targets)
 	return targets
 }
 
@@ -1369,6 +1419,15 @@ func assertEnrichBackingIndexExists(t *testing.T, ctx *scenarioContext, policy s
 		}
 	}
 	t.Fatalf("expected enrich backing index for policy %q", policy)
+}
+
+// enrichAliasTargets returns the sorted backing indices of the exact
+// .enrich-<policy> alias, or nil when it is absent. policy must be the managed
+// (hash-suffixed) name the loader executes. Alias membership, unlike
+// _cat/indices existence, is what the loader's task-404 verification reads.
+func enrichAliasTargets(t *testing.T, ctx *scenarioContext, policy string) []string {
+	t.Helper()
+	return aliasTargets(t, ctx, ".enrich-"+policy)
 }
 
 // getDocument centralizes this code path so package behavior stays consistent.

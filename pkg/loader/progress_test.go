@@ -50,6 +50,10 @@ type progressStubConfig struct {
 	bulkStatus    int         // 0 means 200
 	bulkFailItems int         // first N items of every bulk request fail
 	statsStatus   int         // 0 means 200
+	// aliasReplies answers GET _alias/.enrich-<policy>, per policy, in order,
+	// last repeats. A policy without an entry gets enrichAliasMoved: absent
+	// before kickoff, then a new backing index, as a successful execution.
+	aliasReplies map[string][]stubReply
 }
 
 // progressStubOption mutates a progressStubConfig.
@@ -77,6 +81,39 @@ func withChildren(children ...stubReply) progressStubOption {
 
 func withBulk(status, failItems int) progressStubOption {
 	return func(c *progressStubConfig) { c.bulkStatus, c.bulkFailItems = status, failItems }
+}
+
+// withEnrichAliasReplies sets the answers to policy's backing-alias reads (the
+// snapshot before kickoff, then the check after a task 404), in order, last
+// repeats. It overrides the enrichAliasMoved default for that policy only.
+func withEnrichAliasReplies(policy string, replies ...stubReply) progressStubOption {
+	return func(c *progressStubConfig) {
+		if c.aliasReplies == nil {
+			c.aliasReplies = map[string][]stubReply{}
+		}
+		c.aliasReplies[policy] = replies
+	}
+}
+
+// enrichAliasMissing is the 404 answer for a policy's absent backing alias.
+func enrichAliasMissing(policy string) stubReply {
+	return stubReply{http.StatusNotFound, fmt.Sprintf(`{"error":"alias [.enrich-%s] missing","status":404}`, policy)}
+}
+
+// enrichAliasAt is a GET _alias/.enrich-<policy> answer listing targets, each
+// carrying the requested alias under "aliases" as Elasticsearch returns it.
+func enrichAliasAt(policy string, targets ...string) stubReply {
+	entries := make([]string, 0, len(targets))
+	for _, target := range targets {
+		entries = append(entries, fmt.Sprintf(`%q:{"aliases":{%q:{}}}`, target, ".enrich-"+policy))
+	}
+	return stubReply{http.StatusOK, "{" + strings.Join(entries, ",") + "}"}
+}
+
+// enrichAliasMoved is the default alias sequence: absent before kickoff, then
+// pointing at a new backing index, which verifies a task-404 ending.
+func enrichAliasMoved(policy string) []stubReply {
+	return []stubReply{enrichAliasMissing(policy), enrichAliasAt(policy, ".enrich-"+policy+"-2")}
 }
 
 // newProgressStub serves a whole Run against progressIndex: index create, bulk,
@@ -169,6 +206,19 @@ func newProgressStub(t *testing.T, statsSequence []string, opts ...progressStubO
 	})
 	stub.Handle("POST /_enrich/policy/{name}/_execute", executePolicy)
 	stub.Handle("PUT /_enrich/policy/{name}/_execute", executePolicy)
+	// One exact backing-alias route per policy, each with its own counter, so
+	// one policy's reads never advance another's sequence.
+	for _, policy := range cfg.policies {
+		replies := cfg.aliasReplies[policy]
+		if len(replies) == 0 {
+			replies = enrichAliasMoved(policy)
+		}
+		calls := new(int)
+		stub.Handle("GET /_alias/.enrich-"+policy, rec.recorded("enrich.alias", func(w http.ResponseWriter, _ *http.Request) {
+			reply := next(replies, calls)
+			write(w, reply.status, reply.body)
+		}))
+	}
 	stub.Handle("GET /_tasks/"+progressTaskID, rec.recorded("enrich.task", func(w http.ResponseWriter, _ *http.Request) {
 		if len(cfg.tasks) == 0 {
 			t.Errorf("unexpected task poll with no task replies configured")
@@ -949,9 +999,34 @@ func TestProgressEnrichOutcomes(t *testing.T) {
 		{name: "synchronous success", opts: nil, wantSuccess: true},
 		{name: "synchronous failed phase", opts: []progressStubOption{withExecuteBody(failedPhase)}, wantFailed: true},
 		{
-			name:        "task 404 means completed",
+			// The stub's default alias sequence moves the backing alias.
+			name:        "task 404 with changed backing alias succeeds",
 			opts:        []progressStubOption{withEnrichTask(stubReply{404, fixtureText(t, "enrich-task-not-found.json")})},
 			wantSuccess: true,
+		},
+		{
+			name: "task 404 with unchanged backing alias fails",
+			opts: []progressStubOption{
+				withEnrichTask(stubReply{404, fixtureText(t, "enrich-task-not-found.json")}),
+				withEnrichAliasReplies("policy-a", enrichAliasAt("policy-a", ".enrich-policy-a-1")),
+			},
+			wantFailed: true,
+		},
+		{
+			name: "task 404 with absent backing alias fails",
+			opts: []progressStubOption{
+				withEnrichTask(stubReply{404, fixtureText(t, "enrich-task-not-found.json")}),
+				withEnrichAliasReplies("policy-a", enrichAliasMissing("policy-a")),
+			},
+			wantFailed: true,
+		},
+		{
+			name: "task 404 with unreadable backing alias fails",
+			opts: []progressStubOption{
+				withEnrichTask(stubReply{404, fixtureText(t, "enrich-task-not-found.json")}),
+				withEnrichAliasReplies("policy-a", enrichAliasMissing("policy-a"), stubReply{http.StatusForbidden, `{"error":{"type":"security_exception"},"status":403}`}),
+			},
+			wantFailed: true,
 		},
 		{
 			name:        "completed task with a failed response status",
@@ -1024,6 +1099,62 @@ func TestProgressEnrichOutcomes(t *testing.T) {
 				t.Fatalf("success line logged = %v, want %v: %v", got, tt.wantSuccess, run.lines)
 			}
 		})
+	}
+}
+
+// TestProgressEnrichAliasFailureContinues guards enrich's count-and-continue
+// contract for an unverified task 404 (FIX-ENRICH404-01): policy-a's alias
+// does not move, so it fails with one Final carrying Err; policy-b's alias
+// appears, so it still executes and succeeds; Run returns nil. Serial: it
+// swaps the loader's clock seams.
+func TestProgressEnrichAliasFailureContinues(t *testing.T) {
+	installFakeClock(t, time.Second)
+	server, ops := newProgressStub(t, nil,
+		withPolicies("policy-a", "policy-b"),
+		withEnrichTask(stubReply{404, fixtureText(t, "enrich-task-not-found.json")}),
+		withEnrichAliasReplies("policy-a", enrichAliasAt("policy-a", ".enrich-policy-a-1")),
+		withEnrichAliasReplies("policy-b", enrichAliasMissing("policy-b"), enrichAliasAt("policy-b", ".enrich-policy-b-2")),
+	)
+
+	run := runProgress(t, server, ops, zerolog.InfoLevel, withEnrich)
+	if run.err != nil {
+		t.Fatalf("Run: %v, want nil: a failed policy does not end the Run", run.err)
+	}
+
+	var executing []string
+	for _, line := range findLogs(run.lines, "Executing enrich policy") {
+		executing = append(executing, line.str("policy"))
+	}
+	if want := []string{"policy-a", "policy-b"}; !reflect.DeepEqual(executing, want) {
+		t.Fatalf("executed policies = %v, want %v", executing, want)
+	}
+	if got := operationCount(run.ops, "enrich.execute"); got != 2 {
+		t.Fatalf("enrich.execute requests = %d, want 2 (policy-b still kicked off): %v", got, run.ops)
+	}
+
+	finals := map[string][]ProgressEvent{}
+	for _, event := range run.eventsFor(ProgressStageEnrich) {
+		if event.Final {
+			finals[event.Resource] = append(finals[event.Resource], event)
+		}
+	}
+	if len(finals["policy-a"]) != 1 || finals["policy-a"][0].Err == nil {
+		t.Fatalf("policy-a finals = %+v, want exactly one with Err set", finals["policy-a"])
+	}
+	if len(finals["policy-b"]) != 1 || finals["policy-b"][0].Err != nil {
+		t.Fatalf("policy-b finals = %+v, want exactly one with Err nil", finals["policy-b"])
+	}
+	if run.result.EnrichFailed != 1 || run.result.EnrichSucceeded != 1 {
+		t.Fatalf("result = %+v, want 1 failed and 1 succeeded", run.result)
+	}
+
+	notMoved := findLogs(run.lines, "Enrich policy execution failed: the backing alias did not move")
+	if len(notMoved) != 1 || notMoved[0].str("policy") != "policy-a" || notMoved[0].str("level") != "error" {
+		t.Fatalf("alias-not-moved lines = %v, want one Error for policy-a", notMoved)
+	}
+	succeeded := findLogs(run.lines, "Enrich policy execution succeeded")
+	if len(succeeded) != 1 || succeeded[0].str("policy") != "policy-b" {
+		t.Fatalf("success lines = %v, want one for policy-b", succeeded)
 	}
 }
 

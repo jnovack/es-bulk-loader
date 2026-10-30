@@ -49,10 +49,15 @@ const (
 //   - Bulk item failures do not set Err. They are partial and are reported in
 //     Result.DocumentsFailed.
 //   - Err is set only when a resource fails and the Run continues. Today that
-//     is an enrich policy that fails. An enrich task that Elasticsearch has
-//     already discarded (HTTP 404 on the task) is counted as succeeded:
-//     Elasticsearch 9.3.1 stores no result for it, so a policy that failed
-//     between polls has Err == nil.
+//     is an enrich policy that fails. Elasticsearch 9.3.1 stores no result for
+//     an async enrich task, so its task GET usually ends with HTTP 404. The
+//     outcome is then read from the policy's .enrich-<policy> alias. The
+//     policy succeeds only if the alias moved to a new, non-empty target set
+//     since kickoff. Otherwise, or if either alias read fails (for example,
+//     the credentials cannot read alias metadata), the policy fails with Err
+//     set, and the Run continues. A concurrent execution of the same policy
+//     by another client also moves the alias; the check cannot tell them
+//     apart. See ADR 0004.
 //   - When Run returns an error, the resource that caused it gets no Final
 //     event, and no events follow. Run's error is the single authoritative
 //     failure signal. This covers a hard bulk failure, a transform wait

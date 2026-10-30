@@ -13,6 +13,7 @@ import (
 
 	"github.com/elastic/go-elasticsearch/v9"
 
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/aliasops"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/esresponse"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/progress"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/runlog"
@@ -297,10 +298,95 @@ func logResult(ctx context.Context, policy string, status *phaseStatus, startTim
 	return !isFailure
 }
 
+// enrichAlias returns the alias Elasticsearch points at the newest backing
+// index of policy. policy must be the selected policy's actual (managed,
+// hash-suffixed) name: the logical key names no alias, and a wrong name would
+// read as "absent" both times and fail every task-404 verification.
+func enrichAlias(policy string) string {
+	return ".enrich-" + policy
+}
+
+// verifyEnrichOutcome decides a policy whose task record is gone (task GET
+// answered 404), where Elasticsearch gives no status to trust. It succeeds
+// only when both alias snapshots were readable and the alias now has a
+// non-empty target set that differs from the one read before kickoff: each
+// successful execution builds a new .enrich-<policy>-<timestamp> index and
+// repoints the alias. An unchanged or absent alias, or either unreadable
+// snapshot, fails the policy at Error level; an unreadable snapshot is never
+// treated as an absent one, which would turn a lookup failure into a
+// first-execution success. A changed set shows the policy produced new output,
+// not that this task did: a concurrent execution of the same policy by another
+// client is indistinguishable. See ADR 0004.
+func verifyEnrichOutcome(
+	ctx context.Context, es *elasticsearch.Client, policy, taskID string,
+	before []string, beforeErr error, startTime time.Time,
+	now func() time.Time,
+) bool {
+	alias := enrichAlias(policy)
+	after, afterErr := aliasops.ResolveTargets(ctx, es, alias)
+	elapsed := now().Sub(startTime).Seconds()
+
+	if beforeErr != nil || afterErr != nil {
+		// ResolveTargets has already logged the HTTP status/body or decode
+		// cause; this line adds the policy and task the failure belongs to.
+		// .Err carries the first failed read; before_error/after_error carry
+		// each one, so a double failure loses neither.
+		firstErr := beforeErr
+		if firstErr == nil {
+			firstErr = afterErr
+		}
+		event := runlog.From(ctx).Error().
+			Err(firstErr).
+			Str("policy", policy).
+			Str("task", taskID).
+			Str("alias", alias).
+			Strs("before", before).
+			Strs("after", after).
+			Float64("time_taken", elapsed)
+		if beforeErr != nil {
+			event = event.Str("before_error", beforeErr.Error())
+		}
+		if afterErr != nil {
+			event = event.Str("after_error", afterErr.Error())
+		}
+		event.Msg("Enrich policy outcome could not be verified")
+		return false
+	}
+
+	// ResolveTargets sorts, so slices.Equal compares sets regardless of the
+	// order Elasticsearch listed the indices in.
+	if len(after) == 0 || slices.Equal(before, after) {
+		runlog.From(ctx).Error().
+			Str("policy", policy).
+			Str("task", taskID).
+			Str("alias", alias).
+			Strs("before", before).
+			Strs("after", after).
+			Float64("time_taken", elapsed).
+			Msg("Enrich policy execution failed: the backing alias did not move")
+		return false
+	}
+
+	runlog.From(ctx).Debug().
+		Str("policy", policy).
+		Str("task", taskID).
+		Str("alias", alias).
+		Strs("before", before).
+		Strs("after", after).
+		Msg("Enrich policy outcome verified via backing alias")
+	return logResult(ctx, policy, nil, startTime, now)
+}
+
 // executePolicy starts one policy and polls its task until it finishes.
 // It reports whether the policy succeeded; the caller owns the Final event.
 func executePolicy(ctx context.Context, es *elasticsearch.Client, policy string, cfg progress.Seams) bool {
 	startTime := cfg.Now()
+	// The backing alias is read before kickoff, never after: a fast execution
+	// could repoint it before a later read, and the task-404 check would then
+	// see no change. A failed read is kept, not returned: an explicit execution
+	// or task status stays authoritative and ignores it, while a task 404 needs
+	// both snapshots and fails on it (verifyEnrichOutcome).
+	before, beforeErr := aliasops.ResolveTargets(ctx, es, enrichAlias(policy))
 	res, err := es.EnrichExecutePolicy(
 		policy,
 		es.EnrichExecutePolicy.WithContext(ctx),
@@ -365,13 +451,16 @@ func executePolicy(ctx context.Context, es *elasticsearch.Client, policy string,
 
 		// 404 means ES has already removed the task record. On 9.3.1 an async
 		// enrich task never stores its result, so this is the normal ending, and
-		// a policy that failed between polls ends the same way: the outcome is
-		// assumed, not verified. Kept as success per the FEAT-PROGRESS-01 spec
-		// (task-404-as-success is existing behavior); changing it needs a
-		// decision on how to verify the outcome. See ADR 0004.
+		// a policy that failed between polls ends the same way. The response
+		// says nothing about the outcome, so it is verified from the backing
+		// alias instead of assumed: success only if the alias moved to a new,
+		// non-empty target set since kickoff. Reverting to "404 is success"
+		// reports failed enrichment as succeeded. See ADR 0004; guarded by
+		// TestExecutePolicyVerifiesTask404, TestProgressEnrichAliasFailureContinues
+		// and the delete_sync-managed_enrich E2E scenario.
 		if taskRes.StatusCode == http.StatusNotFound {
 			taskRes.Body.Close()
-			return logResult(ctx, policy, nil, startTime, cfg.Now)
+			return verifyEnrichOutcome(ctx, es, policy, taskID, before, beforeErr, startTime, cfg.Now)
 		}
 
 		// Any other non-2xx is a failed poll, not a task still running:

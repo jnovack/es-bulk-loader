@@ -200,7 +200,7 @@ result, err := loaderpkg.Run(ctx, loaderpkg.Options{
 | `Done`, `Total` | `bulk`: documents processed and in the file. `enrich`: documents done and total from the child reindex task during the `reindex` step, otherwise -1. `transform`: `Done` is cumulative `documents_processed`, `Total` is the current checkpoint's `total_docs`. -1 always means unknown, never an estimate |
 | `Elapsed` | Time since the loader began tracking the resource |
 | `Final` | Last event for this `(Stage, Resource)` in this Run |
-| `Err` | Set only on a Final event for a resource that failed while the Run continued (an enrich policy). An enrich task Elasticsearch has already discarded (HTTP 404) counts as succeeded, because 9.3.1 stores no result for it |
+| `Err` | Set only on a Final event for a resource that failed while the Run continued (an enrich policy). 9.3.1 stores no result for an async enrich task, so its task GET usually ends with HTTP 404; the loader then reads the policy's `.enrich-<policy>` alias, once before kickoff and once after the 404. It counts the policy as succeeded only if the alias moved to a new, non-empty target set. An unchanged or absent alias, or an alias read that fails (the credentials need alias metadata read access), sets `Err`. A concurrent execution of the same policy by another client also moves the alias and cannot be told apart. See [ADR 0004](docs/decisions/0004-progress-reporting-and-transform-wait.md) |
 
 Delivery contract:
 

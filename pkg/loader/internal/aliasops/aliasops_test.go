@@ -138,22 +138,27 @@ func TestNextAvailableTimestampedIndexNameWithCheckStopsAtCollisionLimit(t *test
 	}
 }
 
-// TestResolveTargets pins target sorting, the missing-alias nil result and the
-// failure ops of an error status and an unparseable body.
+// TestResolveTargets pins target sorting, the missing-alias nil result, the
+// empty-object empty result and the failure ops of an error status, an
+// unparseable body and a JSON null body. The null row guards against null
+// decoding to a nil map and reading as a missing alias.
 func TestResolveTargets(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name   string
-		status int
-		body   string
-		want   []string
-		wantOp string
+		name      string
+		status    int
+		body      string
+		want      []string
+		wantOp    string
+		wantCause string
 	}{
 		{name: "targets sorted", status: http.StatusOK, body: `{"cards-b":{},"cards-a":{}}`, want: []string{"cards-a", "cards-b"}},
 		{name: "missing alias is nil", status: http.StatusNotFound, body: `{"error":"alias [cards] missing"}`},
+		{name: "empty object is no targets", status: http.StatusOK, body: `{}`, want: []string{}},
 		{name: "error status fails", status: http.StatusInternalServerError, body: `{"error":{}}`, wantOp: "Failed to resolve alias targets"},
 		{name: "malformed body fails", status: http.StatusOK, body: `{`, wantOp: "Unable to parse alias response"},
+		{name: "null body fails, not absent", status: http.StatusOK, body: `null`, wantOp: "Unable to parse alias response", wantCause: "alias response was null"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -167,13 +172,19 @@ func TestResolveTargets(t *testing.T) {
 				if !errors.As(err, &opErr) || opErr.Op != tt.wantOp {
 					t.Fatalf("error = %#v, want operation error %q", err, tt.wantOp)
 				}
+				if tt.wantCause != "" && (opErr.Err == nil || opErr.Err.Error() != tt.wantCause) {
+					t.Fatalf("cause = %v, want %q", opErr.Err, tt.wantCause)
+				}
+				if got != nil {
+					t.Fatalf("targets = %v on error, want nil", got)
+				}
 				return
 			}
 			if err != nil {
 				t.Fatalf("ResolveTargets returned error: %v", err)
 			}
-			if !slices.Equal(got, tt.want) {
-				t.Fatalf("targets = %v, want %v", got, tt.want)
+			if !slices.Equal(got, tt.want) || (got == nil) != (tt.want == nil) {
+				t.Fatalf("targets = %#v, want %#v", got, tt.want)
 			}
 		})
 	}
