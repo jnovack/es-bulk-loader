@@ -215,6 +215,17 @@ Delivery contract:
 - When `Run` returns an error, the resource that caused it gets no Final event
   and no events follow. Treat "`Run` returned" as the end of the stream and do
   not count Final events.
+- Transient poll failures are retried with no new option, and a failed poll
+  creates no event. A transform `_stats` poll retries HTTP 429, 502, 503 and
+  504, network errors only when they are timeouts, and non-network transport
+  errors such as a failed response read, all within the original
+  `WaitTimeout`; a timeout error names the
+  latest failed poll. An enrich task poll retries the same four statuses, not
+  transport errors, and the third consecutive one fails the policy (`Err`
+  set, the Run continues). A decoded task poll resets that count. A task 404
+  after retries is still verified through the backing alias. Retries log a
+  Warn and do not add to `Result.Warnings`. See
+  [Waiting for transforms](#waiting-for-transforms).
 
 ### Logging levels
 
@@ -222,7 +233,8 @@ For every long wait the loader logs stage start and stage end at Info, each
 poll or batch at Debug, and an Info heartbeat at most once every 30 seconds
 while an enrich policy or transform wait is still running. At the default
 `-level info` an enrich policy therefore logs its start and task ID, each step
-change, document progress during `reindex`, and its completion.
+change, document progress during `reindex`, and its completion. A retried
+transient poll failure logs one Warn per retry.
 
 ## Testing
 
@@ -567,6 +579,19 @@ transform, in order, until the first checkpoint completes:
   the HTTP calls and the sleeps. When it is reached, or the context is
   cancelled, the run fails with an error naming the transform, its last state
   and its last known progress.
+- A transient `_stats` failure is retried, with no flag to set: HTTP 429, 502,
+  503 or 504, a network timeout, or a non-network transport error such as a
+  dropped connection's `EOF` or a failed response read. Each retry logs one
+  Warn naming the
+  transform, the poll number and the cause, and waits the normal poll
+  interval. Retries never extend the wait: the original timeout covers them,
+  and if it ends while polls are failing, the error appends
+  `last poll failed: <cause>` with the latest cause. A valid poll clears that
+  cause.
+- Everything else fails at once: any other non-2xx status (400, 404, 500),
+  a malformed `_stats` body, any network error that is not a timeout (such
+  as a connection refused or reset, or a DNS lookup failure), and a `failed`
+  state.
 
 A failure or timeout returns a `loader.ErrManagedResource` error. If no
 transforms are synced (no `-sync-managed`, or none match `-index`), the loader

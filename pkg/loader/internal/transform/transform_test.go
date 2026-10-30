@@ -1,15 +1,27 @@
 package transform
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
+
+	"github.com/rs/zerolog"
+
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/runlog"
 )
 
 const (
@@ -297,7 +309,9 @@ func TestWaitErrors(t *testing.T) {
 	t.Parallel()
 
 	failedBody := statsBody(`{"id":"t1","state":"failed","reason":"search_phase_execution_exception: boom"}`)
-	transportErr := errors.New("connection refused")
+	// A real connection-refused net.Error: it is not a timeout, so the wait
+	// fails at once. A plain errors.New would now be retried (FEAT-WAITRETRY-01).
+	transportErr := &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}
 
 	tests := []struct {
 		name       string
@@ -530,4 +544,450 @@ func TestWaitCancelAndTimeout(t *testing.T) {
 			t.Fatalf("err = %v, want DeadlineExceeded", err)
 		}
 	})
+}
+
+// retryWarnMsg is the Warn Wait logs for each retried _stats poll.
+const retryWarnMsg = "Transform _stats poll failed; retrying"
+
+// pollReply is one scripted getter result.
+type pollReply struct {
+	status int
+	body   string
+	err    error
+}
+
+// replyGetter returns replies in order, repeating the last one, and counts
+// calls. It is not safe for concurrent use; Wait polls on one goroutine.
+func replyGetter(replies ...pollReply) (Getter, *int) {
+	calls := 0
+	return func(context.Context, string) (int, []byte, error) {
+		r := replies[min(calls, len(replies)-1)]
+		calls++
+		return r.status, []byte(r.body), r.err
+	}, &calls
+}
+
+// bufferLogger attaches a JSON logger writing to the returned buffer, so a
+// test reads its own log lines without touching the zerolog global.
+func bufferLogger(ctx context.Context) (context.Context, *bytes.Buffer) {
+	var buf bytes.Buffer
+	logger := zerolog.New(&buf)
+	return runlog.WithLogger(ctx, &logger), &buf
+}
+
+// logLines decodes the JSON log lines in buf whose message is msg.
+func logLines(t *testing.T, buf *bytes.Buffer, msg string) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	sc := bufio.NewScanner(bytes.NewReader(buf.Bytes()))
+	for sc.Scan() {
+		var line map[string]any
+		if err := json.Unmarshal(sc.Bytes(), &line); err != nil {
+			t.Fatalf("decode log line %q: %v", sc.Text(), err)
+		}
+		if line["message"] == msg {
+			out = append(out, line)
+		}
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatalf("scan log lines: %v", err)
+	}
+	return out
+}
+
+// wantRetryWarn is one expected retry Warn: the 1-based poll number, the HTTP
+// status (0 for a transport failure, which logs no status_code) and text the
+// error field must contain.
+type wantRetryWarn struct {
+	attempt int
+	status  int
+	errText string
+}
+
+// checkRetryWarns asserts the retry Warns in buf match want exactly.
+func checkRetryWarns(t *testing.T, buf *bytes.Buffer, id string, want []wantRetryWarn) {
+	t.Helper()
+	lines := logLines(t, buf, retryWarnMsg)
+	if len(lines) != len(want) {
+		t.Fatalf("retry warns = %d (%v), want %d", len(lines), lines, len(want))
+	}
+	for i, w := range want {
+		line := lines[i]
+		if line["level"] != "warn" || line["transform"] != id || line["attempt"] != float64(w.attempt) {
+			t.Fatalf("retry warn %d = %v, want level warn, transform %q, attempt %d", i, line, id, w.attempt)
+		}
+		status, hasStatus := line["status_code"]
+		if w.status == 0 && hasStatus {
+			t.Fatalf("retry warn %d = %v, transport failure must not log status_code", i, line)
+		}
+		if w.status != 0 && status != float64(w.status) {
+			t.Fatalf("retry warn %d = %v, want status_code %d", i, line, w.status)
+		}
+		if text, _ := line["error"].(string); !strings.Contains(text, w.errText) {
+			t.Fatalf("retry warn %d error = %q, want it to contain %q", i, text, w.errText)
+		}
+	}
+}
+
+// TestWaitRetries pins FEAT-WAITRETRY-01's transform retry policy: a 429, 502,
+// 503 or 504, a timeout net.Error or a non-net transport error is retried on
+// the shared cadence with one Warn each and no progress observation, while
+// 400/404/500, a malformed 2xx, a decoded failed state, a non-timeout
+// net.Error and a Sleep error stay terminal. Reverting the retry fails the
+// recovery rows; widening it fails the terminal rows.
+func TestWaitRetries(t *testing.T) {
+	t.Parallel()
+
+	running := `{"count":1,"transforms":[{"id":"t1","state":"indexing"}]}`
+	done := `{"count":1,"transforms":[{"id":"t1","state":"stopped","stats":{"documents_processed":7},"checkpointing":{"last":{"checkpoint":1}}}]}`
+	failed := `{"count":1,"transforms":[{"id":"t1","state":"failed","reason":"boom"}]}`
+	timeoutErr := &net.OpError{Op: "dial", Net: "tcp", Err: os.ErrDeadlineExceeded}
+	refusedErr := &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}
+	eofErr := fmt.Errorf("reading _stats response: %w", io.ErrUnexpectedEOF)
+	sleepErr := errors.New("sleep sentinel")
+	two := 2 * time.Second
+
+	type row struct {
+		name       string
+		replies    []pollReply
+		sleepErr   error
+		wantCalls  int
+		wantSleeps []time.Duration
+		wantPolls  []int
+		wantWarns  []wantRetryWarn
+		wantErr    []string // empty means Wait must succeed with the done stats
+		wantIs     error
+	}
+	var tests []row
+	for _, tc := range []struct {
+		status int
+		body   string
+		text   string
+	}{
+		{http.StatusTooManyRequests, "  {\"error\":\"too many requests\"}\n", `_stats returned status 429: {"error":"too many requests"}`},
+		{http.StatusBadGateway, "<html><body>502 Bad Gateway</body></html>", "_stats returned status 502: <html><body>502 Bad Gateway</body></html>"},
+		{http.StatusServiceUnavailable, `{"error":"unavailable"}`, `_stats returned status 503: {"error":"unavailable"}`},
+		{http.StatusGatewayTimeout, "gateway timeout", "_stats returned status 504: gateway timeout"},
+	} {
+		fail := pollReply{status: tc.status, body: tc.body}
+		tests = append(tests, row{
+			name:       fmt.Sprintf("%d twice then done", tc.status),
+			replies:    []pollReply{fail, fail, {status: 200, body: done}},
+			wantCalls:  3,
+			wantSleeps: []time.Duration{two, two},
+			wantPolls:  []int{3},
+			wantWarns:  []wantRetryWarn{{1, tc.status, tc.text}, {2, tc.status, tc.text}},
+		})
+	}
+	unavailable := pollReply{status: http.StatusServiceUnavailable, body: "busy"}
+	tests = append(tests,
+		row{
+			name:       "timeout net.Error then done",
+			replies:    []pollReply{{err: timeoutErr}, {status: 200, body: done}},
+			wantCalls:  2,
+			wantSleeps: []time.Duration{two},
+			wantPolls:  []int{2},
+			wantWarns:  []wantRetryWarn{{1, 0, "requesting _stats: dial tcp: i/o timeout"}},
+		},
+		row{
+			name:       "response read unexpected EOF then done",
+			replies:    []pollReply{{err: eofErr}, {status: 200, body: done}},
+			wantCalls:  2,
+			wantSleeps: []time.Duration{two},
+			wantPolls:  []int{2},
+			wantWarns:  []wantRetryWarn{{1, 0, "requesting _stats: reading _stats response: unexpected EOF"}},
+		},
+		row{
+			name:       "failures keep the escalating cadence",
+			replies:    []pollReply{unavailable, unavailable, unavailable, unavailable, unavailable, unavailable, {status: 200, body: done}},
+			wantCalls:  7,
+			wantSleeps: []time.Duration{two, two, two, two, two, 5 * time.Second},
+			wantPolls:  []int{7},
+			wantWarns: []wantRetryWarn{
+				{1, 503, "busy"}, {2, 503, "busy"}, {3, 503, "busy"},
+				{4, 503, "busy"}, {5, 503, "busy"}, {6, 503, "busy"},
+			},
+		},
+		row{
+			name:       "only valid polls reach OnPoll",
+			replies:    []pollReply{unavailable, {status: 200, body: running}, unavailable, {status: 200, body: done}},
+			wantCalls:  4,
+			wantSleeps: []time.Duration{two, two, two},
+			wantPolls:  []int{2, 4},
+			wantWarns:  []wantRetryWarn{{1, 503, "busy"}, {3, 503, "busy"}},
+		},
+		row{
+			name:       "decoded failed state after a retry is terminal",
+			replies:    []pollReply{unavailable, {status: 200, body: failed}},
+			wantCalls:  2,
+			wantSleeps: []time.Duration{two},
+			wantPolls:  []int{2},
+			wantWarns:  []wantRetryWarn{{1, 503, "busy"}},
+			wantErr:    []string{`transform "t1" failed: boom`},
+		},
+		row{
+			name:       "sleep error with a live context is terminal",
+			replies:    []pollReply{unavailable},
+			sleepErr:   sleepErr,
+			wantCalls:  1,
+			wantSleeps: []time.Duration{two},
+			wantWarns:  []wantRetryWarn{{1, 503, "busy"}},
+			wantErr:    []string{`transform "t1": sleeping between polls`},
+			wantIs:     sleepErr,
+		},
+		row{
+			name:      "400 is terminal",
+			replies:   []pollReply{{status: http.StatusBadRequest, body: "bad"}},
+			wantCalls: 1,
+			wantErr:   []string{`transform "t1": _stats returned status 400: bad`},
+		},
+		row{
+			name:      "404 is terminal",
+			replies:   []pollReply{{status: http.StatusNotFound, body: `{"error":"missing"}`}},
+			wantCalls: 1,
+			wantErr:   []string{`transform "t1": _stats returned status 404: {"error":"missing"}`},
+		},
+		row{
+			name:      "500 is terminal",
+			replies:   []pollReply{{status: http.StatusInternalServerError, body: "boom"}},
+			wantCalls: 1,
+			wantErr:   []string{`transform "t1": _stats returned status 500: boom`},
+		},
+		row{
+			name:      "malformed 2xx is terminal",
+			replies:   []pollReply{{status: 200, body: "<html>ok</html>"}},
+			wantCalls: 1,
+			wantErr:   []string{`transform "t1": parsing _stats response`},
+		},
+		row{
+			name:      "connection refused net.Error is terminal",
+			replies:   []pollReply{{err: refusedErr}},
+			wantCalls: 1,
+			wantErr:   []string{`transform "t1": requesting _stats: dial tcp: connect: connection refused`},
+			wantIs:    refusedErr,
+		},
+	)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx, buf := bufferLogger(t.Context())
+			get, calls := replyGetter(tt.replies...)
+			var sleeps []time.Duration
+			sleep := func(c context.Context, d time.Duration) error {
+				sleeps = append(sleeps, d)
+				if tt.sleepErr != nil {
+					return tt.sleepErr
+				}
+				return c.Err()
+			}
+			var polls []int
+			stats, err := Wait(ctx, get, "t1", WaitConfig{
+				Timeout: time.Hour,
+				Sleep:   sleep,
+				OnPoll:  func(_ Stats, n int) { polls = append(polls, n) },
+			})
+
+			if *calls != tt.wantCalls {
+				t.Fatalf("getter calls = %d, want %d", *calls, tt.wantCalls)
+			}
+			if len(sleeps) != len(tt.wantSleeps) || (len(sleeps) > 0 && !reflect.DeepEqual(sleeps, tt.wantSleeps)) {
+				t.Fatalf("sleeps = %v, want %v", sleeps, tt.wantSleeps)
+			}
+			if len(polls) != len(tt.wantPolls) || (len(polls) > 0 && !reflect.DeepEqual(polls, tt.wantPolls)) {
+				t.Fatalf("OnPoll counts = %v, want %v", polls, tt.wantPolls)
+			}
+			checkRetryWarns(t, buf, "t1", tt.wantWarns)
+
+			if len(tt.wantErr) == 0 {
+				if err != nil {
+					t.Fatalf("Wait: %v", err)
+				}
+				if stats.State != "stopped" || stats.LastCheckpoint != 1 || stats.DocumentsProcessed != 7 {
+					t.Fatalf("final stats = %+v, want the done poll's stats", stats)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			for _, want := range tt.wantErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %q does not contain %q", err, want)
+				}
+			}
+			if tt.wantIs != nil && !errors.Is(err, tt.wantIs) {
+				t.Fatalf("error %v does not wrap %v", err, tt.wantIs)
+			}
+		})
+	}
+}
+
+// TestWaitRetryDeadline pins that retries never extend the wait: the one
+// deadline set at entry bounds every request and sleep, the final error names
+// the latest retried cause, a valid poll clears a stale cause, and a
+// cancellation during a retry sleep stops without another request. It runs in
+// a testing/synctest bubble, so fake time advances only when every goroutine
+// is blocked and the test never sleeps on the wall clock.
+func TestWaitRetryDeadline(t *testing.T) {
+	t.Parallel()
+
+	running := `{"count":1,"transforms":[{"id":"t1","state":"indexing","stats":{"documents_processed":5},"checkpointing":{"last":{"checkpoint":0}}}]}`
+	eofErr := fmt.Errorf("reading _stats response: %w", io.ErrUnexpectedEOF)
+
+	tests := []struct {
+		name          string
+		replies       []pollReply
+		timeout       time.Duration
+		cancelInSleep bool
+		wantCalls     int
+		wantSleeps    int
+		wantOnPoll    int
+		wantElapsed   time.Duration
+		wantIs        error
+		wantErr       []string
+		wantNotErr    []string
+	}{
+		{
+			// Polls at fake seconds 0/2/4/6/8; the fifth sleep is cut at 9.
+			name:        "persistent 503 ends at the original deadline",
+			replies:     []pollReply{{status: http.StatusServiceUnavailable, body: "overloaded"}},
+			timeout:     9 * time.Second,
+			wantCalls:   5,
+			wantSleeps:  5,
+			wantElapsed: 9 * time.Second,
+			wantIs:      context.DeadlineExceeded,
+			wantErr:     []string{`transform "t1" timed out after 9s`, "no _stats response received yet; last poll failed: _stats returned status 503: overloaded"},
+		},
+		{
+			name:        "persistent retryable transport cause",
+			replies:     []pollReply{{err: eofErr}},
+			timeout:     9 * time.Second,
+			wantCalls:   5,
+			wantSleeps:  5,
+			wantElapsed: 9 * time.Second,
+			wantIs:      context.DeadlineExceeded,
+			wantErr:     []string{"last poll failed: requesting _stats: reading _stats response: unexpected EOF"},
+		},
+		{
+			name:        "latest cause wins over the first",
+			replies:     []pollReply{{status: http.StatusServiceUnavailable, body: "earliest-cause"}, {status: http.StatusBadGateway, body: "latest-cause"}},
+			timeout:     9 * time.Second,
+			wantCalls:   5,
+			wantSleeps:  5,
+			wantElapsed: 9 * time.Second,
+			wantIs:      context.DeadlineExceeded,
+			wantErr:     []string{"last poll failed: _stats returned status 502: latest-cause"},
+			wantNotErr:  []string{"earliest-cause", "status 503"},
+		},
+		{
+			// 503 at 0, running at 2, second sleep cut at 3.
+			name:        "valid poll clears a stale failure",
+			replies:     []pollReply{{status: http.StatusServiceUnavailable, body: "stale"}, {status: 200, body: running}},
+			timeout:     3 * time.Second,
+			wantCalls:   2,
+			wantSleeps:  2,
+			wantOnPoll:  1,
+			wantElapsed: 3 * time.Second,
+			wantIs:      context.DeadlineExceeded,
+			wantErr:     []string{`last state "indexing", checkpoint 0, documents_processed 5`},
+			wantNotErr:  []string{"last poll failed", "stale"},
+		},
+		{
+			name:          "cancel in a retry sleep stops without another request",
+			replies:       []pollReply{{status: http.StatusServiceUnavailable, body: "busy"}},
+			timeout:       time.Hour,
+			cancelInSleep: true,
+			wantCalls:     1,
+			wantSleeps:    1,
+			wantIs:        context.Canceled,
+			wantErr:       []string{`transform "t1" cancelled`, "last poll failed: _stats returned status 503: busy"},
+			wantNotErr:    []string{"timed out"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				ctx, _ = bufferLogger(ctx)
+				start := time.Now()
+
+				// seen holds every context handed to a getter or sleep, so the
+				// test can prove they all share the entry deadline.
+				var seen []context.Context
+				calls, sleeps, onPoll := 0, 0, 0
+				get := func(c context.Context, _ string) (int, []byte, error) {
+					seen = append(seen, c)
+					calls++
+					if calls > 6 {
+						// A renewed timeout would poll forever; stop it with a
+						// terminal status so the assertions below report it.
+						return http.StatusBadRequest, []byte("guard: wait outlived its original deadline"), nil
+					}
+					r := tt.replies[min(calls-1, len(tt.replies)-1)]
+					return r.status, []byte(r.body), r.err
+				}
+				sleep := func(c context.Context, d time.Duration) error {
+					seen = append(seen, c)
+					sleeps++
+					if tt.cancelInSleep {
+						cancel()
+					}
+					timer := time.NewTimer(d)
+					defer timer.Stop()
+					select {
+					case <-timer.C:
+						return nil
+					case <-c.Done():
+						return c.Err()
+					}
+				}
+
+				stats, err := Wait(ctx, get, "t1", WaitConfig{
+					Timeout: tt.timeout,
+					Sleep:   sleep,
+					OnPoll:  func(Stats, int) { onPoll++ },
+				})
+				elapsed := time.Since(start)
+
+				if calls != tt.wantCalls || sleeps != tt.wantSleeps || onPoll != tt.wantOnPoll {
+					t.Fatalf("calls/sleeps/OnPoll = %d/%d/%d, want %d/%d/%d", calls, sleeps, onPoll, tt.wantCalls, tt.wantSleeps, tt.wantOnPoll)
+				}
+				if elapsed != tt.wantElapsed {
+					t.Fatalf("fake elapsed = %v, want %v", elapsed, tt.wantElapsed)
+				}
+				wantDeadline := start.Add(tt.timeout)
+				for i, c := range seen {
+					if c != seen[0] {
+						t.Fatalf("context %d differs from the first: retries must reuse the entry context", i)
+					}
+					if dl, ok := c.Deadline(); !ok || !dl.Equal(wantDeadline) {
+						t.Fatalf("context %d deadline = %v (set %t), want original %v", i, dl, ok, wantDeadline)
+					}
+				}
+				if err == nil {
+					t.Fatal("expected an error")
+				}
+				if !errors.Is(err, tt.wantIs) {
+					t.Fatalf("error %v does not wrap %v", err, tt.wantIs)
+				}
+				if tt.wantOnPoll == 0 && stats != (Stats{}) {
+					t.Fatalf("stats = %+v, want zero: no valid poll was seen", stats)
+				}
+				for _, want := range tt.wantErr {
+					if !strings.Contains(err.Error(), want) {
+						t.Fatalf("error %q does not contain %q", err, want)
+					}
+				}
+				for _, notWant := range tt.wantNotErr {
+					if strings.Contains(err.Error(), notWant) {
+						t.Fatalf("error %q must not contain %q", err, notWant)
+					}
+				}
+			})
+		})
+	}
 }

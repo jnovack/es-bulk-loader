@@ -21,14 +21,16 @@ commitment.
   `ProgressStage`, `TransformOptions` and `DefaultTransformWaitTimeout` live in
   `pkg/loader/progress.go`. Poll cadence, heartbeat, enrich step and child
   reindex parsing, and `_stats` parsing and done rules live in
-  `pkg/loader/internal/{progress,enrich,transform}` and do not log.
+  `pkg/loader/internal/{progress,enrich,transform}`. Those pure parsers and
+  done rules do not log; the wait and lifecycle owners that call them
+  (`transform.Wait`, `WaitForCheckpoint`, enrich's poll loop) do.
 - **Function-field callback.** `Options.Progress func(ProgressEvent)`, called
   synchronously on Run's goroutine.
 - **Grouped options.** `TransformOptions{Wait, WaitTimeout}` follows the
   `EnrichOptions` pattern.
 - **Log-level rule.** Stage start and end at Info, each poll or batch at
   Debug, plus an Info heartbeat at most every 30s during enrich polling and
-  transform waits.
+  transform waits. A retried transient poll failure logs one Warn.
 - **Final/Err rule.** Each resource that completes, or fails without failing
   the Run, gets one Final event. A resource that causes Run to return an error
   gets none, and no events follow; Run's error is authoritative.
@@ -60,8 +62,10 @@ commitment.
 - Elasticsearch fields not reported are -1, never estimated.
 - Enrich now issues best-effort child-task reads while reindexing; they never
   change a policy's outcome.
-- Task polls that return a non-2xx status, or a task `error`, now count as a
-  failed policy instead of looping or being logged as success.
+- Task polls that return a non-retryable non-2xx status, or a task `error`,
+  now count as a failed policy instead of looping or being logged as success.
+  Transient statuses are retried within a bound; see the poll-retry entry
+  below.
 - An enrich task whose record is gone (HTTP 404) is verified, not assumed.
   Elasticsearch 9.3.1 never stores the result of an async enrich task, so this
   is the normal ending, and a policy that failed between polls looks the same.
@@ -89,11 +93,41 @@ commitment.
     `TestExecutePolicyExplicitOutcomesSkipAliasCheck`,
     `TestProgressEnrichAliasFailureContinues` and
     `TestEndToEndScenarios/delete_sync-managed_enrich`.
-- A transform wait fails on the first transport error or non-2xx `_stats`
-  reply, and an enrich policy on the first non-2xx task poll. This is
-  deliberate: it fails closed and never reports a false success. Retrying
-  transient statuses (429, 502, 503, 504) within a bound is possible later
-  without changing the public API.
+- Poll failures fail closed unless they are transient.
+  - Amended 2026-10-30 (FEAT-WAITRETRY-01): before this, a transform wait failed
+    on the first transport error or non-2xx `_stats` reply, and an enrich
+    policy on the first non-2xx task poll. One 503 during a long wait, after
+    the data was loaded, forced a full rerun. Both waits now retry HTTP 429,
+    502, 503 and 504 (`esresponse.IsRetryableStatus`, the bulk set) with no
+    new option. The status alone decides: the body of such a reply is
+    diagnostic text, never parsed as stats or a task outcome.
+  - Transform `_stats` polls also retry transport errors that
+    `esresponse.IsRetryableTransportError` accepts, the bulk classifier: a
+    `net.Error` only when `Timeout()` is true, never cancellation, and any
+    other error (for example a dropped connection's `io.EOF` or a failed
+    response read). A connection refused or reset fails at once. Retries are
+    bounded only by the wait timeout: the one deadline set at entry covers
+    every request and sleep, so a persistent outage ends the wait at the
+    original deadline. The timeout error then names the latest retried
+    failure since the last valid poll; a valid poll clears it.
+  - Enrich task polls retry the transient statuses only, not transport
+    errors. The third consecutive transient status fails the policy (two
+    retries), logged at Error with its status and body. A decoded task poll
+    resets the streak, and each policy has its own. This caps a failure
+    streak, not execution time: a healthy running task still waits for
+    completion or cancellation. The kickoff, alias reads and child-task reads
+    are never retried, and a task 404 after retries is still verified
+    through the backing alias as above.
+  - Both waits keep the shared poll cadence and log one Warn per retry,
+    naming the resource, attempt and cause. These Warns do not add to
+    `Result.Warnings`. Every other status, a malformed 2xx body and a failed
+    state still fail at once, so no invalid reply can imply progress or
+    completion.
+  - Guards: `TestIsRetryableStatus`, `TestIsRetryableTransportError`,
+    `TestWaitRetries`, `TestWaitRetryDeadline`,
+    `TestWaitForCheckpointRetries`, `TestExecutePolicyPollRetries`,
+    `TestExecutePollRetriesPreserveContinuation` and
+    `TestProgressEnrichOutcomes`.
 
 ## References
 

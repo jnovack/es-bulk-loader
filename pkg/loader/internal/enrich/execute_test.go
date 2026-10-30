@@ -6,7 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
+	"os"
 	"reflect"
 	"slices"
 	"strings"
@@ -509,6 +512,525 @@ func TestExecutePolicyVerifiesTask404(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+const (
+	msgTaskPollRetry = "Enrich policy task poll failed; retrying"
+	msgTaskPollError = "Enrich policy task poll returned an error"
+	msgTaskPollFail  = "Failed to poll enrich policy task"
+	msgTaskParseFail = "Unable to parse enrich policy task response"
+	msgPollCancelled = "Context cancelled while polling enrich task"
+
+	taskRunningBody   = `{"completed":false,"task":{"status":{"phase":"RUNNING"}}}`
+	taskCompletedBody = `{"completed":true,"response":{"status":{"phase":"COMPLETE"}}}`
+)
+
+// taskStep is one GET _tasks/<id> attempt in a poll-retry test: an HTTP reply
+// served by the stub, or a transport failure the client sees instead. readErr
+// and closeErr are injected into the reply's body after its bytes are read.
+type taskStep struct {
+	status    int
+	body      string
+	transport error
+	readErr   error
+	closeErr  error
+}
+
+// trackedBody wraps a task response body: it delegates reads, replaces the
+// final io.EOF with readErr when set (so a reader gets the text and then an
+// error), and counts Close calls so a test can prove each body is closed
+// exactly once before the next poll.
+type trackedBody struct {
+	io.ReadCloser
+	readErr  error
+	closeErr error
+	closes   atomic.Int32
+}
+
+// Read implements io.Reader.
+func (b *trackedBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if errors.Is(err, io.EOF) && b.readErr != nil {
+		return n, b.readErr
+	}
+	return n, err
+}
+
+// Close implements io.Closer.
+func (b *trackedBody) Close() error {
+	b.closes.Add(1)
+	if err := b.ReadCloser.Close(); err != nil {
+		return err
+	}
+	return b.closeErr
+}
+
+// TestExecutePolicyPollRetries guards FEAT-WAITRETRY-01's enrich task-poll
+// budget: a 429/502/503/504 task read is retried on the existing loop-head
+// sleep, the third consecutive one fails the policy with an Error and no
+// further poll, a decoded poll resets the streak, a task 404 after retries is
+// still verified through the backing alias, and every other failure (400,
+// 500, malformed 2xx, a transport error, cancellation) ends on its first poll.
+// The kickoff is never repeated and each task body is closed exactly once
+// before the next sleep or return.
+func TestExecutePolicyPollRetries(t *testing.T) {
+	t.Parallel()
+
+	const (
+		aliasPath   = "/_alias/.enrich-policy-a"
+		executePath = "/_enrich/policy/policy-a/_execute"
+		taskPath    = "/_tasks/node:1"
+	)
+	absent := aliasStep{status: http.StatusNotFound, body: aliasMissingBody}
+	present := aliasStep{status: http.StatusOK, body: enrichAliasBody(".enrich-policy-a", ".enrich-policy-a-2")}
+	running := taskStep{status: http.StatusOK, body: taskRunningBody}
+	completed := taskStep{status: http.StatusOK, body: taskCompletedBody}
+	gone := taskStep{status: http.StatusNotFound, body: enrichTaskNotFoundBody}
+	unavailable := taskStep{status: http.StatusServiceUnavailable, body: `{"error":"unavailable"}`}
+	timeoutErr := &net.OpError{Op: "read", Net: "tcp", Err: os.ErrDeadlineExceeded}
+	readErr := errors.New("injected body read failure")
+	closeErr := errors.New("injected body close failure")
+
+	type warn struct {
+		attempt int
+		status  int
+		body    string
+		field   string // optional extra diagnostic field that must be present
+	}
+	type row struct {
+		name          string
+		tasks         []taskStep
+		aliases       []aliasStep // nil means one absent pre-kickoff read
+		cancelOnSleep int         // 1-based Sleep call that cancels; 0 never
+		want          bool
+		wantPolls     int // task attempts, transport failures included
+		wantSleeps    int
+		wantWarns     []warn
+		wantFinalMsg  string // the terminal Error message, "" for none
+		wantFinalCode int    // its status_code, 0 for none
+		wantFinalBody string
+		wantFinalTry  int    // its attempt field, 0 for absent
+		wantFinalErr  string // substring of its error field
+		wantVerdict   string // alias verification message for task-404 rows
+	}
+	var tests []row
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
+		fail := taskStep{status: status, body: fmt.Sprintf("<html>%d</html>", status)}
+		tests = append(tests, row{
+			name:       fmt.Sprintf("%d twice then completed", status),
+			tasks:      []taskStep{fail, fail, completed},
+			want:       true,
+			wantPolls:  3,
+			wantSleeps: 3,
+			wantWarns:  []warn{{1, status, fail.body, ""}, {2, status, fail.body, ""}},
+		})
+	}
+	tests = append(tests,
+		row{
+			name:          "third consecutive 503 fails without a fourth poll",
+			tasks:         []taskStep{unavailable, unavailable, unavailable},
+			wantPolls:     3,
+			wantSleeps:    3,
+			wantWarns:     []warn{{1, 503, unavailable.body, ""}, {2, 503, unavailable.body, ""}},
+			wantFinalMsg:  msgTaskPollError,
+			wantFinalCode: 503,
+			wantFinalBody: unavailable.body,
+			wantFinalTry:  3,
+		},
+		row{
+			name:          "mixed transient statuses report the last",
+			tasks:         []taskStep{{status: 429, body: "a"}, {status: 502, body: "b"}, {status: 504, body: "c"}},
+			wantPolls:     3,
+			wantSleeps:    3,
+			wantWarns:     []warn{{1, 429, "a", ""}, {2, 502, "b", ""}},
+			wantFinalMsg:  msgTaskPollError,
+			wantFinalCode: 504,
+			wantFinalBody: "c",
+			wantFinalTry:  3,
+		},
+		row{
+			name:       "a decoded poll resets the streak",
+			tasks:      []taskStep{unavailable, running, unavailable, unavailable, completed},
+			want:       true,
+			wantPolls:  5,
+			wantSleeps: 5,
+			wantWarns:  []warn{{1, 503, unavailable.body, ""}, {1, 503, unavailable.body, ""}, {2, 503, unavailable.body, ""}},
+		},
+		row{
+			name:       "read error body still retries by status",
+			tasks:      []taskStep{{status: 503, body: "partial-503", readErr: readErr}, completed},
+			want:       true,
+			wantPolls:  2,
+			wantSleeps: 2,
+			wantWarns:  []warn{{1, 503, "partial-503", "body_error"}},
+		},
+		row{
+			name:       "close error body still retries by status",
+			tasks:      []taskStep{{status: 503, body: "closing-503", closeErr: closeErr}, completed},
+			want:       true,
+			wantPolls:  2,
+			wantSleeps: 2,
+			wantWarns:  []warn{{1, 503, "closing-503", "body_close_error"}},
+		},
+		row{
+			name:          "400 fails on the first poll",
+			tasks:         []taskStep{{status: 400, body: "bad"}},
+			wantPolls:     1,
+			wantSleeps:    1,
+			wantFinalMsg:  msgTaskPollError,
+			wantFinalCode: 400,
+			wantFinalBody: "bad",
+		},
+		row{
+			name:          "500 fails on the first poll",
+			tasks:         []taskStep{{status: 500, body: "boom"}},
+			wantPolls:     1,
+			wantSleeps:    1,
+			wantFinalMsg:  msgTaskPollError,
+			wantFinalCode: 500,
+			wantFinalBody: "boom",
+		},
+		row{
+			name:         "malformed 2xx fails on the first poll",
+			tasks:        []taskStep{{status: 200, body: "{"}},
+			wantPolls:    1,
+			wantSleeps:   1,
+			wantFinalMsg: msgTaskParseFail,
+		},
+		row{
+			name:         "transport timeout fails on the first poll",
+			tasks:        []taskStep{{transport: timeoutErr}},
+			wantPolls:    1,
+			wantSleeps:   1,
+			wantFinalMsg: msgTaskPollFail,
+			wantFinalErr: "i/o timeout",
+		},
+		row{
+			name:          "cancel in the retry sleep stops polling",
+			tasks:         []taskStep{unavailable},
+			cancelOnSleep: 2,
+			wantPolls:     1,
+			wantSleeps:    2,
+			wantWarns:     []warn{{1, 503, unavailable.body, ""}},
+			wantFinalMsg:  msgPollCancelled,
+		},
+		row{
+			name:        "task 404 after retries verifies a moved alias",
+			tasks:       []taskStep{unavailable, unavailable, gone},
+			aliases:     []aliasStep{absent, present},
+			want:        true,
+			wantPolls:   3,
+			wantSleeps:  3,
+			wantWarns:   []warn{{1, 503, unavailable.body, ""}, {2, 503, unavailable.body, ""}},
+			wantVerdict: msgAliasVerified,
+		},
+		row{
+			name:        "task 404 after retries fails an unmoved alias",
+			tasks:       []taskStep{unavailable, unavailable, gone},
+			aliases:     []aliasStep{absent, absent},
+			wantPolls:   3,
+			wantSleeps:  3,
+			wantWarns:   []warn{{1, 503, unavailable.body, ""}, {2, 503, unavailable.body, ""}},
+			wantVerdict: msgAliasNotMoved,
+		},
+		row{
+			name:        "task 404 after retries fails an unreadable alias",
+			tasks:       []taskStep{unavailable, unavailable, gone},
+			aliases:     []aliasStep{absent, {status: http.StatusInternalServerError, body: `{"error":{"type":"boom"}}`}},
+			wantPolls:   3,
+			wantSleeps:  3,
+			wantWarns:   []warn{{1, 503, unavailable.body, ""}, {2, 503, unavailable.body, ""}},
+			wantVerdict: msgAliasUnverified,
+		},
+	)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			aliases := tt.aliases
+			if aliases == nil {
+				aliases = []aliasStep{absent}
+			}
+			var served []taskStep // task steps that reach the stub, in order
+			for _, step := range tt.tasks {
+				if step.transport == nil {
+					served = append(served, step)
+				}
+			}
+
+			stub := esstub.New(t)
+			var aliasCalls, taskCalls atomic.Int32
+			stub.Handle("GET "+aliasPath, func(w http.ResponseWriter, _ *http.Request) {
+				i := int(aliasCalls.Add(1)) - 1
+				if i >= len(aliases) {
+					t.Errorf("alias read %d, want at most %d", i+1, len(aliases))
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				w.WriteHeader(aliases[i].status)
+				_, _ = io.WriteString(w, aliases[i].body)
+			})
+			stub.Handle("PUT "+executePath, esstub.JSON(http.StatusOK, `{"task":"node:1"}`))
+			stub.Handle("GET "+taskPath, func(w http.ResponseWriter, _ *http.Request) {
+				i := int(taskCalls.Add(1)) - 1
+				if i >= len(served) {
+					t.Errorf("task poll %d reached the stub, want at most %d", i+1, len(served))
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				w.WriteHeader(served[i].status)
+				_, _ = io.WriteString(w, served[i].body)
+			})
+
+			base := &http.Transport{}
+			t.Cleanup(base.CloseIdleConnections)
+			var (
+				mu       sync.Mutex
+				attempts int
+				bodies   []*trackedBody
+			)
+			wrapper := enrichRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if r.URL.Path != taskPath {
+					return base.RoundTrip(r)
+				}
+				mu.Lock()
+				i := attempts
+				attempts++
+				mu.Unlock()
+				if i >= len(tt.tasks) {
+					return nil, fmt.Errorf("task attempt %d beyond the scripted %d", i+1, len(tt.tasks))
+				}
+				step := tt.tasks[i]
+				if step.transport != nil {
+					return nil, step.transport
+				}
+				res, err := base.RoundTrip(r)
+				if err != nil {
+					return nil, err
+				}
+				body := &trackedBody{ReadCloser: res.Body, readErr: step.readErr, closeErr: step.closeErr}
+				mu.Lock()
+				bodies = append(bodies, body)
+				mu.Unlock()
+				res.Body = body
+				return res, nil
+			})
+			es, err := elasticsearch.NewClient(elasticsearch.Config{
+				Addresses:    []string{stub.URL()},
+				Transport:    wrapper,
+				DisableRetry: true,
+				MaxRetries:   0,
+			})
+			if err != nil {
+				t.Fatalf("new elasticsearch client: %v", err)
+			}
+
+			// allClosedOnce reports whether every task body seen so far was
+			// closed exactly once.
+			allClosedOnce := func() bool {
+				mu.Lock()
+				defer mu.Unlock()
+				for _, b := range bodies {
+					if b.closes.Load() != 1 {
+						return false
+					}
+				}
+				return true
+			}
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			var buf bytes.Buffer
+			logger := zerolog.New(&buf).Level(zerolog.DebugLevel)
+			ctx = runlog.WithLogger(ctx, &logger)
+
+			sleeps := 0
+			cfg := fixedEnrichSeams()
+			cfg.Sleep = func(c context.Context, d time.Duration) error {
+				sleeps++
+				if !allClosedOnce() {
+					t.Errorf("sleep %d: a task body was not closed exactly once before the next poll", sleeps)
+				}
+				if d != progress.PollInterval(sleeps) {
+					t.Errorf("sleep %d = %v, want the shared cadence %v", sleeps, d, progress.PollInterval(sleeps))
+				}
+				if sleeps == tt.cancelOnSleep {
+					cancel()
+				}
+				return c.Err()
+			}
+
+			got := executePolicy(ctx, es, "policy-a", cfg)
+			if got != tt.want {
+				t.Fatalf("executePolicy = %v, want %v\nlogs:\n%s", got, tt.want, buf.String())
+			}
+			if !allClosedOnce() {
+				t.Fatal("a task body was not closed exactly once before return")
+			}
+			mu.Lock()
+			gotAttempts, tracked := attempts, len(bodies)
+			mu.Unlock()
+			if tracked != len(served) {
+				t.Fatalf("tracked task bodies = %d, want one per served reply (%d)", tracked, len(served))
+			}
+			if gotAttempts != tt.wantPolls || sleeps != tt.wantSleeps {
+				t.Fatalf("task polls/sleeps = %d/%d, want %d/%d\nlogs:\n%s", gotAttempts, sleeps, tt.wantPolls, tt.wantSleeps, buf.String())
+			}
+			kickoffs, aliasReads := 0, 0
+			for _, r := range stub.Requests() {
+				switch r.Path {
+				case executePath:
+					kickoffs++
+				case aliasPath:
+					aliasReads++
+				}
+			}
+			wantAliasReads := 1
+			if tt.wantVerdict != "" {
+				wantAliasReads = 2
+			}
+			if kickoffs != 1 || aliasReads != wantAliasReads {
+				t.Fatalf("kickoffs/alias reads = %d/%d, want 1/%d", kickoffs, aliasReads, wantAliasReads)
+			}
+
+			lines := enrichLogLines(t, &buf)
+			warns := enrichLogsWith(lines, msgTaskPollRetry)
+			if len(warns) != len(tt.wantWarns) {
+				t.Fatalf("retry warns = %d, want %d\nlogs:\n%s", len(warns), len(tt.wantWarns), buf.String())
+			}
+			for i, w := range tt.wantWarns {
+				line := warns[i]
+				if line["level"] != "warn" || line["policy"] != "policy-a" || line["task"] != "node:1" ||
+					line["status_code"] != float64(w.status) || line["attempt"] != float64(w.attempt) {
+					t.Fatalf("retry warn %d = %v, want policy-a/node:1, status %d, attempt %d", i, line, w.status, w.attempt)
+				}
+				if body, _ := line["body"].(string); !strings.Contains(body, w.body) {
+					t.Fatalf("retry warn %d body = %q, want it to contain %q", i, body, w.body)
+				}
+				if w.field != "" {
+					if text, _ := line[w.field].(string); text == "" {
+						t.Fatalf("retry warn %d = %v, want a %s diagnostic", i, line, w.field)
+					}
+				}
+			}
+
+			pollErrors := enrichLogsWith(lines, msgTaskPollError)
+			if tt.wantFinalMsg != msgTaskPollError && len(pollErrors) != 0 {
+				t.Fatalf("unexpected %q lines: %v", msgTaskPollError, pollErrors)
+			}
+			if tt.wantFinalMsg != "" {
+				finals := enrichLogsWith(lines, tt.wantFinalMsg)
+				if len(finals) != 1 {
+					t.Fatalf("%q lines = %d, want 1\nlogs:\n%s", tt.wantFinalMsg, len(finals), buf.String())
+				}
+				line := finals[0]
+				if tt.wantFinalMsg != msgPollCancelled && line["level"] != "error" {
+					t.Fatalf("terminal line = %v, want error level", line)
+				}
+				if tt.wantFinalCode != 0 && line["status_code"] != float64(tt.wantFinalCode) {
+					t.Fatalf("terminal line = %v, want status_code %d", line, tt.wantFinalCode)
+				}
+				if body, _ := line["body"].(string); tt.wantFinalBody != "" && body != tt.wantFinalBody {
+					t.Fatalf("terminal line body = %q, want %q", body, tt.wantFinalBody)
+				}
+				attempt, hasAttempt := line["attempt"]
+				if tt.wantFinalTry == 0 && hasAttempt {
+					t.Fatalf("terminal line = %v, a non-retryable failure must not log an attempt", line)
+				}
+				if tt.wantFinalTry != 0 && attempt != float64(tt.wantFinalTry) {
+					t.Fatalf("terminal line = %v, want attempt %d", line, tt.wantFinalTry)
+				}
+				if text, _ := line["error"].(string); !strings.Contains(text, tt.wantFinalErr) {
+					t.Fatalf("terminal line error = %q, want it to contain %q", text, tt.wantFinalErr)
+				}
+			}
+			if tt.wantVerdict != "" && len(enrichLogsWith(lines, tt.wantVerdict)) != 1 {
+				t.Fatalf("want one %q line\nlogs:\n%s", tt.wantVerdict, buf.String())
+			}
+			if succeeded := len(enrichLogsWith(lines, msgEnrichSucceeded)); succeeded != map[bool]int{true: 1, false: 0}[tt.want] {
+				t.Fatalf("success lines = %d, want them only for a successful policy\nlogs:\n%s", succeeded, buf.String())
+			}
+		})
+	}
+}
+
+// TestExecutePollRetriesPreserveContinuation drives Execute over two policies:
+// policy-a exhausts its three-failure budget and fails, then policy-b, with
+// its own budget, recovers from two 503s. The run continues past the failure,
+// counts one of each, emits one Final per policy and returns no error, and
+// neither kickoff is repeated (FEAT-WAITRETRY-01).
+func TestExecutePollRetriesPreserveContinuation(t *testing.T) {
+	t.Parallel()
+
+	stub := esstub.New(t)
+	policies := esstub.JSON(http.StatusOK, `{"policies":[{"config":{"match":{"name":"policy-a"}}},{"config":{"match":{"name":"policy-b"}}}]}`)
+	stub.Handle("GET /_enrich/policy", policies)
+	stub.Handle("GET /_enrich/policy/{$}", policies)
+	for _, name := range []string{"policy-a", "policy-b"} {
+		stub.Handle("GET /_alias/.enrich-"+name, esstub.JSON(http.StatusNotFound, aliasMissingBody))
+	}
+	stub.Handle("PUT /_enrich/policy/policy-a/_execute", esstub.JSON(http.StatusOK, `{"task":"node:a"}`))
+	stub.Handle("PUT /_enrich/policy/policy-b/_execute", esstub.JSON(http.StatusOK, `{"task":"node:b"}`))
+	stub.Handle("GET /_tasks/node:a", esstub.JSON(http.StatusServiceUnavailable, `{"error":"a unavailable"}`))
+	var bCalls atomic.Int32
+	stub.Handle("GET /_tasks/node:b", func(w http.ResponseWriter, _ *http.Request) {
+		if bCalls.Add(1) <= 2 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, `{"error":"b unavailable"}`)
+			return
+		}
+		_, _ = io.WriteString(w, taskCompletedBody)
+	})
+
+	var buf bytes.Buffer
+	logger := zerolog.New(&buf)
+	ctx := runlog.WithLogger(t.Context(), &logger)
+	cfg := fixedEnrichSeams()
+	var finals []progress.Snapshot
+	cfg.OnProgress = func(s progress.Snapshot) {
+		if s.Final {
+			finals = append(finals, s)
+		}
+	}
+
+	selection := &Selection{Enabled: true, Raw: "policy-a,policy-b"}
+	summary, err := Execute(ctx, stub.MustClient(t), selection, nil, cfg)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !slices.Equal(summary.Selected, []string{"policy-a", "policy-b"}) || summary.Failed != 1 || summary.Succeeded != 1 || len(summary.Missing) != 0 {
+		t.Fatalf("summary = %+v, want policy-a failed and policy-b succeeded", summary)
+	}
+
+	counts := map[string]int{}
+	for _, r := range stub.Requests() {
+		counts[r.Method+" "+r.Path]++
+	}
+	for _, want := range []struct {
+		route string
+		n     int
+	}{
+		{"GET /_tasks/node:a", 3},
+		{"GET /_tasks/node:b", 3},
+		{"PUT /_enrich/policy/policy-a/_execute", 1},
+		{"PUT /_enrich/policy/policy-b/_execute", 1},
+	} {
+		if counts[want.route] != want.n {
+			t.Fatalf("%s requests = %d, want %d (all: %v)", want.route, counts[want.route], want.n, counts)
+		}
+	}
+
+	if len(finals) != 2 || finals[0].Resource != "policy-a" || finals[0].Err == nil || finals[1].Resource != "policy-b" || finals[1].Err != nil {
+		t.Fatalf("finals = %+v, want policy-a failed then policy-b succeeded", finals)
+	}
+	lines := enrichLogLines(t, &buf)
+	if n := len(enrichLogsWith(lines, msgTaskPollRetry)); n != 4 {
+		t.Fatalf("retry warns = %d, want two per policy\nlogs:\n%s", n, buf.String())
+	}
+	if n := len(enrichLogsWith(lines, msgTaskPollError)); n != 1 {
+		t.Fatalf("poll error lines = %d, want one for policy-a\nlogs:\n%s", n, buf.String())
 	}
 }
 

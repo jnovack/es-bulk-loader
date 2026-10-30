@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -221,62 +220,6 @@ func TestLoadReportsBatchesAndTotals(t *testing.T) {
 			if len(snapshots) != 2 || snapshots[0].Done != 2 || snapshots[1].Done != 3 ||
 				snapshots[0].Total != 3 || snapshots[1].Total != 3 || snapshots[0].Resource != "cards" || snapshots[1].Final {
 				t.Fatalf("snapshots = %+v, want two non-final batches 2/3 then 3/3 for cards", snapshots)
-			}
-		})
-	}
-}
-
-// fakeNetError is a net.Error whose Timeout and Temporary results are set
-// directly, so the classifier table can pin every flag combination.
-type fakeNetError struct{ timeout, temporary bool }
-
-func (e fakeNetError) Error() string   { return "fake net error" }
-func (e fakeNetError) Timeout() bool   { return e.timeout }
-func (e fakeNetError) Temporary() bool { return e.temporary }
-
-// TestIsRetryableTransportError pins the retry decision for transport errors.
-// Only net.Error.Timeout() retries; Temporary() is deprecated and no longer
-// consulted, so a temporary-only error must not retry. A revert to
-// Timeout() || Temporary() fails the named row.
-func TestIsRetryableTransportError(t *testing.T) {
-	t.Parallel()
-
-	errnoOp := func(e syscall.Errno) error {
-		return &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", e)}
-	}
-	tests := []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{"nil", nil, false},
-		{"context canceled", context.Canceled, false},
-		{"wrapped context canceled", fmt.Errorf("send: %w", context.Canceled), false},
-		{"timeout is retried", fakeNetError{timeout: true}, true},
-		{"timeout with temporary is retried", fakeNetError{timeout: true, temporary: true}, true},
-		{"neither flag is not retried", fakeNetError{}, false},
-		{"temporary-only is no longer retried FIX-NETTEMP-01", fakeNetError{temporary: true}, false},
-		{"wrapped timeout is retried", fmt.Errorf("send: %w", fakeNetError{timeout: true}), true},
-		{"wrapped temporary-only is not retried", fmt.Errorf("send: %w", fakeNetError{temporary: true}), false},
-		{"context deadline exceeded is retried", context.DeadlineExceeded, true},
-		{"wrapped context deadline exceeded is retried", fmt.Errorf("send: %w", context.DeadlineExceeded), true},
-		{"temporary DNS failure is not retried", &net.DNSError{Err: "temporary lookup failure", Name: "es.invalid", IsTemporary: true}, false},
-		{"DNS timeout is retried", &net.DNSError{Err: "i/o timeout", Name: "es.invalid", IsTimeout: true}, true},
-		{"EINTR is not retried", errnoOp(syscall.EINTR), false},
-		{"EMFILE is not retried", errnoOp(syscall.EMFILE), false},
-		{"ENFILE is not retried", errnoOp(syscall.ENFILE), false},
-		{"ECONNREFUSED is not retried", errnoOp(syscall.ECONNREFUSED), false},
-		{"ECONNRESET is not retried", errnoOp(syscall.ECONNRESET), false},
-		{"io.EOF is retried", io.EOF, true},
-		{"wrapped io.EOF is retried", fmt.Errorf("read: %w", io.EOF), true},
-		{"io.ErrUnexpectedEOF is retried", io.ErrUnexpectedEOF, true},
-		{"plain error is retried", errors.New("boom"), true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			if got := isRetryableTransportError(tt.err); got != tt.want {
-				t.Fatalf("isRetryableTransportError(%v) = %v, want %v", tt.err, got, tt.want)
 			}
 		})
 	}

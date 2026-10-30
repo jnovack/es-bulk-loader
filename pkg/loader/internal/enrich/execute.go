@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/elastic/go-elasticsearch/v9"
+	"github.com/rs/zerolog"
 
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/aliasops"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/esresponse"
@@ -377,8 +378,31 @@ func verifyEnrichOutcome(
 	return logResult(ctx, policy, nil, startTime, now)
 }
 
+// maxConsecutivePollFailures is the transient task-poll failure that ends a
+// policy: the third consecutive 429/502/503/504 fails it, so a streak gets two
+// retries. Unlike the transform wait, enrich has no overall timeout to bound
+// retries, and the poll loop sleeps before every request; this cap is what
+// keeps a persistent outage from polling forever. It bounds a failure streak,
+// not total execution: a decoded task poll resets it, and a healthy running
+// task still waits for completion or the caller's cancellation.
+const maxConsecutivePollFailures = 3
+
+// withBodyErrors adds the read and close errors of a diagnostic error body
+// to event, so a failed read or close is reported rather than discarded.
+func withBodyErrors(event *zerolog.Event, readErr, closeErr error) *zerolog.Event {
+	if readErr != nil {
+		event = event.Str("body_error", readErr.Error())
+	}
+	if closeErr != nil {
+		event = event.Str("body_close_error", closeErr.Error())
+	}
+	return event
+}
+
 // executePolicy starts one policy and polls its task until it finishes.
 // It reports whether the policy succeeded; the caller owns the Final event.
+// Transient task-poll statuses are retried up to maxConsecutivePollFailures;
+// a task 404 is still decided by verifyEnrichOutcome.
 func executePolicy(ctx context.Context, es *elasticsearch.Client, policy string, cfg progress.Seams) bool {
 	startTime := cfg.Now()
 	// The backing alias is read before kickoff, never after: a fast execution
@@ -437,6 +461,9 @@ func executePolicy(ctx context.Context, es *elasticsearch.Client, policy string,
 
 	hb := progress.NewHeartbeat(progress.HeartbeatInterval, cfg.Now)
 	lastStep := ""
+	// failures counts consecutive transient task-poll failures for this policy
+	// only; see maxConsecutivePollFailures.
+	failures := 0
 	for pollCount := 1; ; pollCount++ {
 		if err := cfg.Sleep(ctx, progress.PollInterval(pollCount)); err != nil {
 			runlog.From(ctx).Warn().Err(err).Str("policy", policy).Msg("Context cancelled while polling enrich task")
@@ -463,17 +490,41 @@ func executePolicy(ctx context.Context, es *elasticsearch.Client, policy string,
 			return verifyEnrichOutcome(ctx, es, policy, taskID, before, beforeErr, startTime, cfg.Now)
 		}
 
-		// Any other non-2xx is a failed poll, not a task still running:
-		// retrying would repeat the same answer and hide the cause.
+		// Any other non-2xx is a failed poll, not a task still running. Only a
+		// transient status (429/502/503/504) is retried, and only this
+		// idempotent task read: the kickoff, alias reads and child-task reads
+		// are never repeated. The body is diagnostic text read and closed once
+		// here; the status alone decides retry, and the body is never parsed as
+		// a task outcome. Every other status fails at once, since retrying it
+		// would repeat the same answer and hide the cause.
 		if taskRes.IsError() {
-			body, _ := io.ReadAll(taskRes.Body)
-			taskRes.Body.Close()
-			runlog.From(ctx).Error().
+			body, readErr := io.ReadAll(taskRes.Body)
+			closeErr := taskRes.Body.Close()
+			retryable := esresponse.IsRetryableStatus(taskRes.StatusCode)
+			if retryable {
+				failures++
+			}
+			if retryable && failures < maxConsecutivePollFailures {
+				warn := runlog.From(ctx).Warn().
+					Str("policy", policy).
+					Str("task", taskID).
+					Int("status_code", taskRes.StatusCode).
+					Str("body", string(body)).
+					Int("attempt", failures)
+				warn = withBodyErrors(warn, readErr, closeErr)
+				warn.Msg("Enrich policy task poll failed; retrying")
+				continue
+			}
+			event := runlog.From(ctx).Error().
 				Str("policy", policy).
 				Str("task", taskID).
 				Int("status_code", taskRes.StatusCode).
-				Str("body", string(body)).
-				Msg("Enrich policy task poll returned an error")
+				Str("body", string(body))
+			if retryable {
+				event = event.Int("attempt", failures)
+			}
+			event = withBodyErrors(event, readErr, closeErr)
+			event.Msg("Enrich policy task poll returned an error")
 			return false
 		}
 
@@ -484,6 +535,9 @@ func executePolicy(ctx context.Context, es *elasticsearch.Client, policy string,
 			runlog.From(ctx).Error().Err(decodeErr).Str("policy", policy).Str("task", taskID).Msg("Unable to parse enrich policy task response")
 			return false
 		}
+		// A decoded task document ends the failure streak: the budget caps
+		// consecutive transient failures, not total polls.
+		failures = 0
 
 		// A task that ended with an error is reported next to completed:true;
 		// without this check it would be logged as a success.

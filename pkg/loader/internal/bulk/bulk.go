@@ -10,11 +10,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
-	"net"
-	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -22,6 +19,7 @@ import (
 	"github.com/elastic/go-elasticsearch/v9"
 	"github.com/elastic/go-elasticsearch/v9/esapi"
 
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/esresponse"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/progress"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/runlog"
 )
@@ -476,44 +474,14 @@ func bulkInsert(
 	return bulkInsertResult{Succeeded: succeeded, Failed: failed}, nil
 }
 
-// shouldRetryBulkRequest centralizes retryability checks for bulk request failures.
+// shouldRetryBulkRequest centralizes retryability checks for bulk request
+// failures, using the shared esresponse classifiers (status first). bulkInsert
+// separately stops once its request context has ended, whatever this returns.
 func shouldRetryBulkRequest(statusCode int, err error) bool {
-	if isRetryableBulkStatus(statusCode) {
+	if esresponse.IsRetryableStatus(statusCode) {
 		return true
 	}
-	return isRetryableTransportError(err)
-}
-
-// isRetryableBulkStatus centralizes retryable bulk HTTP status classification.
-func isRetryableBulkStatus(statusCode int) bool {
-	switch statusCode {
-	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-		return true
-	default:
-		return false
-	}
-}
-
-// isRetryableTransportError classifies a failed bulk transport call for retry.
-// Among net.Error values (wrapped or not) only Timeout() errors retry. Temporary()
-// is deprecated and ill-defined, so it is never consulted: a temporary-only
-// error, such as a temporary DNS failure or, on Unix, EINTR/EMFILE/ENFILE, fails
-// on its first attempt. Cancellation (including wrapped context.Canceled) never
-// retries. Errors that are not net.Error, such as io.EOF from a dropped
-// connection, retry. bulkInsert separately stops once its request context has
-// ended, whatever this returns.
-func isRetryableTransportError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, context.Canceled) {
-		return false
-	}
-	var netErr net.Error
-	if errors.As(err, &netErr) {
-		return netErr.Timeout()
-	}
-	return true
+	return esresponse.IsRetryableTransportError(err)
 }
 
 // computeExponentialBackoff centralizes capped exponential retry delays.

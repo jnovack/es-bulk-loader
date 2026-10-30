@@ -986,16 +986,40 @@ func TestProgressEnrichWithoutStepField(t *testing.T) {
 
 // TestProgressEnrichOutcomes pins the truthful outcome and exactly one Final
 // event per policy for every way a policy can end, under the existing
-// count-and-continue policy.
+// count-and-continue policy. The retry rows pin FEAT-WAITRETRY-01 through the
+// public Run: two transient task polls are retried with one Warn each and no
+// extra kickoff, the third consecutive one fails the policy, and neither adds
+// to Result.Warnings.
 func TestProgressEnrichOutcomes(t *testing.T) {
 	failedPhase := `{"status":{"phase":"FAILED"}}`
+	unavailable := stubReply{http.StatusServiceUnavailable, `{"error":"unavailable"}`}
 	tests := []struct {
 		name        string
 		opts        []progressStubOption
 		cancel      bool
 		wantFailed  bool
 		wantSuccess bool // the success line is logged
+		// Retry rows only (wantTaskPolls > 0): task polls, retry Warns and
+		// the terminal poll Error's attempt (0 for none).
+		wantTaskPolls    int
+		wantRetryWarns   int
+		wantErrorAttempt int
 	}{
+		{
+			name:           "transient task polls then completed recovers",
+			opts:           []progressStubOption{withEnrichTask(unavailable, unavailable, stubReply{200, `{"completed":true,"response":{"status":{"phase":"COMPLETE"}}}`})},
+			wantSuccess:    true,
+			wantTaskPolls:  3,
+			wantRetryWarns: 2,
+		},
+		{
+			name:             "third consecutive transient task poll fails the policy",
+			opts:             []progressStubOption{withEnrichTask(unavailable)},
+			wantFailed:       true,
+			wantTaskPolls:    3,
+			wantRetryWarns:   2,
+			wantErrorAttempt: 3,
+		},
 		{name: "synchronous success", opts: nil, wantSuccess: true},
 		{name: "synchronous failed phase", opts: []progressStubOption{withExecuteBody(failedPhase)}, wantFailed: true},
 		{
@@ -1097,6 +1121,47 @@ func TestProgressEnrichOutcomes(t *testing.T) {
 			}
 			if got := len(findLogs(run.lines, "Enrich policy execution succeeded")) == 1; got != tt.wantSuccess {
 				t.Fatalf("success line logged = %v, want %v: %v", got, tt.wantSuccess, run.lines)
+			}
+			if tt.wantTaskPolls == 0 {
+				return
+			}
+
+			if got := operationCount(run.ops, "enrich.task"); got != tt.wantTaskPolls {
+				t.Fatalf("enrich.task requests = %d, want %d: %v", got, tt.wantTaskPolls, run.ops)
+			}
+			if got := operationCount(run.ops, "enrich.execute"); got != 1 {
+				t.Fatalf("enrich.execute requests = %d, want 1: a retry never repeats the kickoff: %v", got, run.ops)
+			}
+			warns := findLogs(run.lines, "Enrich policy task poll failed; retrying")
+			if len(warns) != tt.wantRetryWarns {
+				t.Fatalf("retry warns = %d, want %d: %v", len(warns), tt.wantRetryWarns, run.lines)
+			}
+			for i, line := range warns {
+				status, _ := line.num("status_code")
+				attempt, _ := line.num("attempt")
+				if line.str("level") != "warn" || line.str("policy") != "policy-a" || line.str("task") != progressTaskID ||
+					status != http.StatusServiceUnavailable || attempt != float64(i+1) {
+					t.Fatalf("retry warn %d = %v, want policy-a, task %s, status 503, attempt %d", i, line, progressTaskID, i+1)
+				}
+			}
+			pollErrors := findLogs(run.lines, "Enrich policy task poll returned an error")
+			if tt.wantErrorAttempt == 0 {
+				if len(pollErrors) != 0 {
+					t.Fatalf("poll error lines = %v, want none after a recovery", pollErrors)
+				}
+			} else {
+				if len(pollErrors) != 1 {
+					t.Fatalf("poll error lines = %v, want exactly one", pollErrors)
+				}
+				status, _ := pollErrors[0].num("status_code")
+				attempt, _ := pollErrors[0].num("attempt")
+				if pollErrors[0].str("level") != "error" || status != http.StatusServiceUnavailable || attempt != float64(tt.wantErrorAttempt) {
+					t.Fatalf("poll error line = %v, want error level, status 503, attempt %d", pollErrors[0], tt.wantErrorAttempt)
+				}
+			}
+			// A retry Warn is a log line only; it must never reach Result.Warnings.
+			if len(run.result.Warnings) != 0 {
+				t.Fatalf("Warnings = %v, want none for this run", run.result.Warnings)
 			}
 		})
 	}
