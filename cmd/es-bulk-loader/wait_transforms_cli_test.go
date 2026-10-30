@@ -2,12 +2,13 @@ package main
 
 import (
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/jnovack/es-bulk-loader/internal/testutil/esstub"
 )
 
 // Untagged for the same reason as replicas_cli_test.go: the flag/env wiring
@@ -18,27 +19,11 @@ const (
 	statsRunning = `{"count":1,"transforms":[{"id":"tx1","state":"indexing","checkpointing":{"last":{"checkpoint":0},"next":{"checkpoint":1}}}]}`
 )
 
-// transformStatsHandler serves _stats with body and delegates everything else
-// to cliStub, which records it.
-func transformStatsHandler(stub *cliStub, body string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet && r.URL.Path == "/_transform/tx1/_stats" {
-			stub.mu.Lock()
-			stub.requests = append(stub.requests, r.Method+" "+r.URL.Path)
-			stub.mu.Unlock()
-			w.Header().Set("X-Elastic-Product", "Elasticsearch")
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(body))
-			return
-		}
-		stub.handler(w, r)
-	}
-}
-
 // TestCLIWaitTransformsReachesLoader proves -wait-transforms, WAIT_TRANSFORMS
 // and -wait-transforms-timeout travel from main() into loader.Options: with
 // the wait off no _stats request is made, with it on one is, and a timeout
-// shorter than the first poll interval fails the run.
+// shorter than the time the transform needs (the first stats poll is
+// immediate, then the deadline interrupts the wait) fails the run.
 func TestCLIWaitTransformsReachesLoader(t *testing.T) {
 	// Not parallel: builds one binary shared by every row.
 	bin := filepath.Join(t.TempDir(), "es-bulk-loader")
@@ -93,14 +78,25 @@ func TestCLIWaitTransformsReachesLoader(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			stub := &cliStub{}
-			server := httptest.NewServer(transformStatsHandler(stub, tt.stats))
-			t.Cleanup(server.Close)
+			stub := newCLIStub(t)
+			// Plain -delete removes the declared transform before the index
+			// exists; the later existence check reports it absent so
+			// CreateOrUpdate does not send a second DELETE.
+			stub.Handle("DELETE /_transform/tx1", esstub.JSON(http.StatusOK, `{"acknowledged":true}`))
+			stub.Handle("POST /idx/_refresh", esstub.JSON(http.StatusOK, `{"acknowledged":true}`))
+			stub.Handle("POST /_transform/tx1/_stop", esstub.JSON(http.StatusOK, `{"acknowledged":true}`))
+			stub.Handle("GET /_transform/tx1", esstub.JSON(http.StatusOK, `{"count":0,"transforms":[]}`))
+			stub.Handle("PUT /_transform/tx1", esstub.JSON(http.StatusOK, `{"acknowledged":true}`))
+			stub.Handle("POST /_transform/tx1/_start", esstub.JSON(http.StatusOK, `{"acknowledged":true}`))
+			// Registered even when waiting is off so an unwanted poll is
+			// caught by the sawStats assertion, not by an unrouted request.
+			stub.Handle("GET /_transform/tx1/_stats", esstub.JSON(http.StatusOK, tt.stats))
 
-			args := append([]string{"-url", server.URL, "-index", "idx", "-delete", "-sync-managed", "-data", dataFile, "-transforms", transformsFile}, tt.args...)
+			args := append([]string{"-url", stub.URL(), "-index", "idx", "-delete", "-sync-managed", "-data", dataFile, "-transforms", transformsFile}, tt.args...)
 			cmd := exec.CommandContext(t.Context(), bin, args...)
 			cmd.Env = append([]string{"HOME=" + t.TempDir()}, tt.env...)
 			out, err := cmd.CombinedOutput()
+			requests := stub.Requests()
 
 			if tt.wantFail == "" && err != nil {
 				t.Fatalf("run failed: %v\n%s", err, out)
@@ -111,16 +107,17 @@ func TestCLIWaitTransformsReachesLoader(t *testing.T) {
 				}
 			}
 
-			stub.mu.Lock()
-			defer stub.mu.Unlock()
+			if tt.wantFail == "invalid -wait-transforms-timeout" && len(requests) != 0 {
+				t.Fatalf("invalid timeout reached Elasticsearch: %v", requests)
+			}
 			sawStats := false
-			for _, req := range stub.requests {
-				if req == "GET /_transform/tx1/_stats" {
+			for _, req := range requests {
+				if req.Method == http.MethodGet && req.Path == "/_transform/tx1/_stats" {
 					sawStats = true
 				}
 			}
 			if sawStats != tt.wantStats {
-				t.Fatalf("_stats requested = %t, want %t (%v)", sawStats, tt.wantStats, stub.requests)
+				t.Fatalf("_stats requested = %t, want %t (%v)", sawStats, tt.wantStats, requests)
 			}
 		})
 	}

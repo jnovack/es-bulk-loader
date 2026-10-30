@@ -2,64 +2,50 @@ package main
 
 import (
 	"encoding/json"
-	"io"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sync"
+	"sync/atomic"
 	"testing"
+
+	"github.com/jnovack/es-bulk-loader/internal/testutil/esstub"
 )
 
 // This file is deliberately untagged: it runs under plain `go test ./...`.
-// It builds the real binary and starts a loopback httptest listener, which the
+// It builds the real binary and talks to a loopback esstub listener, which the
 // template's Go testing rules would put behind a build tag, but this repo's
 // project override defers to its own E2E layout, and pkg/loader already runs
-// httptest listeners untagged. Tagging it would drop the -replicas flag/env
+// httptest-backed stubs untagged. Tagging it would drop the -replicas flag/env
 // wiring (including "invalid value exits before any ES request") from the
 // default gate, leaving only the Docker E2E to catch a broken flag.
 
-// cliStub is a minimal Elasticsearch that records every request path and the
-// body of each create-index PUT. Every unknown request is acknowledged so the
-// loader can run a -delete workflow to completion.
-type cliStub struct {
-	mu          sync.Mutex
-	requests    []string
-	createBodys []string
-}
+// newCLIStub returns a strict esstub with exactly the routes a
+// `-delete -data` run sends. Any other request fails the test; do not add a
+// catch-all. HEAD /idx must answer 404 until the create PUT and 200 after,
+// because the loader verifies the index is visible once created; a fixed reply
+// would either skip creation or fail that verification. That is why the PUT
+// and HEAD handlers share the created flag.
+func newCLIStub(t *testing.T) *esstub.Stub {
+	t.Helper()
+	stub := esstub.New(t)
+	var created atomic.Bool
+	ack := esstub.JSON(http.StatusOK, `{"acknowledged":true}`)
 
-func (s *cliStub) handler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("X-Elastic-Product", "Elasticsearch")
-	w.Header().Set("Content-Type", "application/json")
-	s.mu.Lock()
-	s.requests = append(s.requests, r.Method+" "+r.URL.Path)
-	s.mu.Unlock()
-
-	switch {
-	case r.Method == http.MethodHead:
-		// Absent until the create PUT, then visible, as the loader verifies.
-		s.mu.Lock()
-		created := len(s.createBodys) > 0
-		s.mu.Unlock()
-		if created {
+	stub.Handle("HEAD /idx", func(w http.ResponseWriter, _ *http.Request) {
+		if created.Load() {
 			w.WriteHeader(http.StatusOK)
-		} else {
-			w.WriteHeader(http.StatusNotFound)
+			return
 		}
-	case r.Method == http.MethodGet && r.URL.Path == "/_nodes":
-		_, _ = w.Write([]byte(`{"nodes":{"n1":{},"n2":{},"n3":{}}}`))
-	case r.Method == http.MethodPut && r.URL.Path == "/idx":
-		body, _ := io.ReadAll(r.Body)
-		s.mu.Lock()
-		s.createBodys = append(s.createBodys, string(body))
-		s.mu.Unlock()
-		_, _ = w.Write([]byte(`{"acknowledged":true}`))
-	case r.Method == http.MethodPost && r.URL.Path == "/_bulk":
-		_, _ = w.Write([]byte(`{"errors":false,"items":[{"index":{"_index":"idx","_id":"1","status":201}}]}`))
-	default:
-		_, _ = w.Write([]byte(`{"acknowledged":true}`))
-	}
+		w.WriteHeader(http.StatusNotFound)
+	})
+	stub.Handle("GET /_nodes", esstub.JSON(http.StatusOK, `{"nodes":{"n1":{},"n2":{},"n3":{}}}`))
+	stub.Handle("PUT /idx", func(w http.ResponseWriter, r *http.Request) {
+		created.Store(true)
+		ack(w, r)
+	})
+	stub.Handle("POST /_bulk", esstub.JSON(http.StatusOK, `{"errors":false,"items":[{"index":{"_index":"idx","_id":"1","status":201}}]}`))
+	return stub
 }
 
 // TestCLIReplicasReachCreateIndexBody builds the real binary and proves that
@@ -98,23 +84,22 @@ func TestCLIReplicasReachCreateIndexBody(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			stub := &cliStub{}
-			server := httptest.NewServer(http.HandlerFunc(stub.handler))
-			t.Cleanup(server.Close)
+			stub := newCLIStub(t)
 
-			args := append([]string{"-url", server.URL, "-index", "idx", "-delete", "-data", dataFile}, tt.args...)
+			args := append([]string{"-url", stub.URL(), "-index", "idx", "-delete", "-data", dataFile}, tt.args...)
 			cmd := exec.CommandContext(t.Context(), bin, args...)
 			// Explicit minimal env: no inherited REPLICAS or other loader
 			// variables, and a private HOME so no user config is picked up.
 			cmd.Env = append([]string{"HOME=" + t.TempDir()}, tt.env...)
 			out, err := cmd.CombinedOutput()
+			requests := stub.Requests()
 
 			if tt.wantFail {
 				if err == nil {
 					t.Fatalf("expected nonzero exit, got success:\n%s", out)
 				}
-				if len(stub.requests) != 0 {
-					t.Fatalf("invalid replicas reached Elasticsearch: %v", stub.requests)
+				if len(requests) != 0 {
+					t.Fatalf("invalid replicas reached Elasticsearch: %v", requests)
 				}
 				return
 			}
@@ -122,28 +107,30 @@ func TestCLIReplicasReachCreateIndexBody(t *testing.T) {
 				t.Fatalf("run failed: %v\n%s", err, out)
 			}
 
-			stub.mu.Lock()
-			defer stub.mu.Unlock()
-			if len(stub.createBodys) != 1 {
-				t.Fatalf("create bodies = %d, want 1; requests %v\n%s", len(stub.createBodys), stub.requests, out)
+			var creates []esstub.Request
+			sawNodes := false
+			for _, req := range requests {
+				if req.Method == http.MethodPut && req.Path == "/idx" {
+					creates = append(creates, req)
+				}
+				if req.Method == http.MethodGet && req.Path == "/_nodes" {
+					sawNodes = true
+				}
+			}
+			if len(creates) != 1 {
+				t.Fatalf("create bodies = %d, want 1; requests %v\n%s", len(creates), requests, out)
 			}
 			var body struct {
 				Settings map[string]any `json:"settings"`
 			}
-			if err := json.Unmarshal([]byte(stub.createBodys[0]), &body); err != nil {
+			if err := json.Unmarshal(creates[0].Body, &body); err != nil {
 				t.Fatalf("parse create body: %v", err)
 			}
 			if got := body.Settings["number_of_replicas"]; got != tt.wantReplicas {
 				t.Fatalf("number_of_replicas = %v, want %v", got, tt.wantReplicas)
 			}
-			sawNodes := false
-			for _, req := range stub.requests {
-				if req == "GET /_nodes" {
-					sawNodes = true
-				}
-			}
 			if sawNodes != tt.wantNodes {
-				t.Fatalf("/_nodes queried = %t, want %t (%v)", sawNodes, tt.wantNodes, stub.requests)
+				t.Fatalf("/_nodes queried = %t, want %t (%v)", sawNodes, tt.wantNodes, requests)
 			}
 		})
 	}
