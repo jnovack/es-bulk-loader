@@ -513,8 +513,8 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 	// at create/load time, after -nuke, -delete or -flush had already run,
 	// leaving the cluster half-reset. Check them here, using the create step's
 	// own parsers. The scope is conservative: whether an index will be created
-	// is unknown until after the destructive step. The data check covers only
-	// open and first non-whitespace byte; an unknown format or invalid JSON
+	// is unknown until after the destructive step. The data check covers
+	// open, first non-whitespace byte and format ('[' or '{'); invalid JSON
 	// later in the file can still fail inside bulk.Load. For data actions the
 	// mappings file is parsed again here after BuildMappingPlan; that is
 	// deliberate, so the settings and no-data sync-managed paths share this one

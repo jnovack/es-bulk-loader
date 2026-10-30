@@ -530,23 +530,29 @@ type Totals struct {
 	Elapsed   time.Duration
 }
 
-// peekDataFile is peekFirstByte with the "Cannot read data file" operation
-// error, shared by Load and CheckDataFile so both fail identically.
-func peekDataFile(ctx context.Context, path string) (byte, error) {
+// detectDataFormat returns the data file's format byte, '[' (JSON array)
+// or '{' (NDJSON), per ADR 0003. It is the only format check: Run's
+// preflight (CheckDataFile) and Load both call it, so unchanged input
+// uses the same acceptance rule and failure Ops before and after mutation.
+// Load rechecks because the file may change after preflight.
+func detectDataFormat(ctx context.Context, path string) (byte, error) {
 	first, err := peekFirstByte(path)
 	if err != nil {
 		return 0, runlog.Fail(runlog.FailureEvent(ctx), "Cannot read data file", err)
 	}
+	if first != '[' && first != '{' {
+		return 0, runlog.Fail(runlog.FailureEvent(ctx), fmt.Sprintf("Data file first byte %q is neither '[' (JSON array) nor '{' (NDJSON)", first), nil)
+	}
 	return first, nil
 }
 
-// CheckDataFile verifies path can be opened and has a first non-whitespace
-// byte, then closes it. Run calls it before destructive steps so an unreadable
-// or empty data file cannot half-reset the cluster. It does not validate the
-// format or the JSON: an unknown first byte or later invalid JSON still fails
-// inside Load.
+// CheckDataFile verifies path can be opened and that its first non-whitespace
+// byte is '[' or '{', then closes it. Run calls it before destructive steps so
+// an unreadable, empty or wrong-format data file cannot half-reset the
+// cluster. It does not decode the documents: invalid JSON after an accepted
+// first byte still fails inside Load.
 func CheckDataFile(ctx context.Context, path string) error {
-	_, err := peekDataFile(ctx, path)
+	_, err := detectDataFormat(ctx, path)
 	return err
 }
 
@@ -556,7 +562,7 @@ func CheckDataFile(ctx context.Context, path string) error {
 // counted in Totals, not returned. A hard failure returns an operation error
 // and zero Totals: the caller must not report partial counts.
 func Load(ctx context.Context, es *elasticsearch.Client, cfg Config, seams progress.Seams) (Totals, error) {
-	first, err := peekDataFile(ctx, cfg.DataFile)
+	first, err := detectDataFormat(ctx, cfg.DataFile)
 	if err != nil {
 		return Totals{}, err
 	}
@@ -566,6 +572,8 @@ func Load(ctx context.Context, es *elasticsearch.Client, cfg Config, seams progr
 	failedTotal := 0
 	processed := 0
 
+	// detectDataFormat returned only '[' or '{'. Load still calls it itself
+	// because the file can change between preflight and load.
 	switch first {
 	case '[':
 		err = loadJSONArray(
@@ -599,8 +607,6 @@ func Load(ctx context.Context, es *elasticsearch.Client, cfg Config, seams progr
 			&processed,
 			seams,
 		)
-	default:
-		err = runlog.Fail(runlog.FailureEvent(ctx), fmt.Sprintf("Data file first byte %q is neither '[' (JSON array) nor '{' (NDJSON)", first), nil)
 	}
 	if err != nil {
 		return Totals{}, err

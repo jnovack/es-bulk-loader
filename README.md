@@ -637,14 +637,14 @@ assumed one for `-delete -alias`), the `-settings` and `-mappings` files must
 exist and parse as JSON before the first `-nuke`, `-delete` or `-flush`
 request. This also applies to `-add`/`-flush` against an existing index and to
 sync-managed-only runs, even when no index ends up being created. When there is
-a data action, the `-data` file must open and have a first non-whitespace
-byte. Enrich-only and nuke-only runs without managed sync do not inspect these
-files.
+a data action, the `-data` file must open and its first non-whitespace byte
+must be `[` (JSON array) or `{` (NDJSON). Enrich-only and nuke-only runs
+without managed sync do not inspect these files.
 
-This is not full validation. An unknown data format, invalid JSON later in the
-data file, Elasticsearch rejecting a settings or mappings body, and a file or
-environment value that changes after the check can still fail after the
-cluster has been modified.
+This is not full validation. Invalid JSON later in the data file,
+Elasticsearch rejecting a settings or mappings body, and a file or environment
+value that changes after the check can still fail after the cluster has been
+modified.
 
 ## JSON Formats
 

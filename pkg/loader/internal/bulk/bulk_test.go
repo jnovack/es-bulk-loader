@@ -404,8 +404,9 @@ func TestBulkInsertTransportRetryPolicy(t *testing.T) {
 	}
 }
 
-// TestCheckDataFile pins the bounded preflight: open and first
-// non-whitespace byte only, with Load's own failure Op.
+// TestCheckDataFile pins the bounded preflight: open, first non-whitespace
+// byte and format ('[' or '{'), using Load's own failure Ops. It must not
+// decode the file, so invalid JSON after an accepted first byte passes.
 func TestCheckDataFile(t *testing.T) {
 	t.Parallel()
 
@@ -417,19 +418,24 @@ func TestCheckDataFile(t *testing.T) {
 		}
 		return path
 	}
+	const unreadable = "Cannot read data file"
 	tests := []struct {
 		name      string
 		path      string
 		wantFail  bool
+		wantOp    string
 		wantCause error
 	}{
-		{"missing", filepath.Join(dir, "missing.json"), true, os.ErrNotExist},
-		{"directory", dir, true, nil},
-		{"empty", write("empty.json", ""), true, io.EOF},
-		{"whitespace only", write("ws.json", " \r\n\t\r\n"), true, io.EOF},
-		{"array", write("array.json", `[{"id":1}]`), false, nil},
-		{"ndjson with leading whitespace", write("nd.json", "\r\n  {\"id\":1}\r\n"), false, nil},
-		{"unknown first byte is left to Load", write("x.json", "x"), false, nil},
+		{"missing", filepath.Join(dir, "missing.json"), true, unreadable, os.ErrNotExist},
+		{"directory", dir, true, unreadable, nil},
+		{"empty", write("empty.json", ""), true, unreadable, io.EOF},
+		{"whitespace only", write("ws.json", " \r\n\t\r\n"), true, unreadable, io.EOF},
+		{"array", write("array.json", `[{"id":1}]`), false, "", nil},
+		{"ndjson with leading whitespace", write("nd.json", "\r\n  {\"id\":1}\r\n"), false, "", nil},
+		{"invalid JSON after array byte", write("bad-array.json", `[not json`), false, "", nil},
+		{"invalid JSON after object byte", write("bad-object.json", `{not json`), false, "", nil},
+		{"unknown first byte", write("x.json", "x"), true, `Data file first byte 'x' is neither '[' (JSON array) nor '{' (NDJSON)`, nil},
+		{"unknown first byte after CRLF whitespace", write("crlf-csv.json", "\r\n\r\nid,name\r\n"), true, `Data file first byte 'i' is neither '[' (JSON array) nor '{' (NDJSON)`, nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -442,14 +448,76 @@ func TestCheckDataFile(t *testing.T) {
 				return
 			}
 			var opErr *failure.Error
-			if !errors.As(err, &opErr) || opErr.Op != "Cannot read data file" {
-				t.Fatalf("error = %#v, want operation error %q", err, "Cannot read data file")
+			if !errors.As(err, &opErr) || opErr.Op != tt.wantOp {
+				t.Fatalf("error = %#v, want operation error %q", err, tt.wantOp)
 			}
 			if opErr.Err == nil {
 				t.Fatal("want non-nil cause")
 			}
 			if tt.wantCause != nil && !errors.Is(err, tt.wantCause) {
 				t.Fatalf("error = %v, want cause %v", err, tt.wantCause)
+			}
+		})
+	}
+}
+
+// TestLoadRechecksFormatAfterPreflight pins that Load detects the format
+// itself: a file that passed CheckDataFile and then changed to an unknown
+// format is rejected before any bulk request (time-of-check/time-of-use).
+func TestLoadRechecksFormatAfterPreflight(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		initial string
+		changed string
+	}{
+		{"array replaced by x", `[{"id":"1"}]`, "x"},
+		{"ndjson replaced by CRLF CSV", "{\"id\":\"1\"}\n", "\r\n\r\nid,name\r\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			path := filepath.Join(t.TempDir(), "data.json")
+			if err := os.WriteFile(path, []byte(tt.initial), 0o644); err != nil {
+				t.Fatalf("write fixture: %v", err)
+			}
+			if err := CheckDataFile(t.Context(), path); err != nil {
+				t.Fatalf("CheckDataFile on accepted format: %v", err)
+			}
+			if err := os.WriteFile(path, []byte(tt.changed), 0o644); err != nil {
+				t.Fatalf("rewrite fixture: %v", err)
+			}
+
+			stub := esstub.New(t) // no routes: any request fails the test
+			var progressCalls atomic.Int32
+			seams := progress.Seams{
+				Now:        time.Now,
+				OnProgress: func(progress.Snapshot) { progressCalls.Add(1) },
+			}
+			totals, err := Load(t.Context(), stub.MustClient(t), Config{DataFile: path, Index: "cards", BatchSize: 1}, seams)
+
+			first := []byte(tt.changed)
+			for len(first) > 0 && (first[0] == '\r' || first[0] == '\n') {
+				first = first[1:]
+			}
+			wantOp := fmt.Sprintf("Data file first byte %q is neither '[' (JSON array) nor '{' (NDJSON)", first[0])
+			var opErr *failure.Error
+			if !errors.As(err, &opErr) || opErr.Op != wantOp {
+				t.Fatalf("Load error = %#v, want operation error %q", err, wantOp)
+			}
+			if opErr.Err == nil {
+				t.Fatal("want non-nil substituted cause")
+			}
+			if totals != (Totals{}) {
+				t.Fatalf("totals = %+v, want zero Totals", totals)
+			}
+			if got := progressCalls.Load(); got != 0 {
+				t.Fatalf("progress callbacks = %d, want 0", got)
+			}
+			if got := len(stub.Requests()); got != 0 {
+				t.Fatalf("request count = %d, want 0", got)
 			}
 		})
 	}

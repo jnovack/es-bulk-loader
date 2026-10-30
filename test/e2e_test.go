@@ -220,6 +220,13 @@ func TestEndToEndScenarios(t *testing.T) {
 			checks: "fails with the settings parse error before -delete; the seeded index and its two documents remain",
 			run:    scenarioSettingsMalformedFailsBeforeDelete,
 		},
+		{
+			// Appended last: the slice index sets each scenario's e2e-NN prefix.
+			name:   "data_format_unknown_fails_before_delete",
+			flags:  "-delete (data file that is neither a JSON array nor NDJSON)",
+			checks: "fails with the data format error before -delete; the seeded index and its two documents remain",
+			run:    scenarioDataFormatUnknownFailsBeforeDelete,
+		},
 	}
 
 	for i, sc := range scenarios {
@@ -615,17 +622,9 @@ func scenarioUnresolvedTemplateVariableFailsSafely(t *testing.T, ctx *scenarioCo
 	mustSucceed(t, runLoader(t, ctx, nil, sourceArgs(ctx, ctx.sourceBaseDir, "-delete", true, false, "")))
 	assertDocCount(t, ctx, ctx.sourceIndex, 2)
 
-	unresolvedDir := filepath.Join(filepath.Dir(ctx.sourceBaseDir), "source-unresolved")
-	files := map[string]string{}
-	for _, name := range []string{"mappings.json", "pipelines.json", "policies.json", "data.json"} {
-		content, err := os.ReadFile(filepath.Join(ctx.sourceBaseDir, name))
-		if err != nil {
-			t.Fatalf("read base fixture %s: %v", name, err)
-		}
-		files[name] = strings.TrimSpace(string(content))
-	}
-	files["settings.json"] = `{"settings":{"index":{"refresh_interval":"${NOT_SET_ANYWHERE}"}}}`
-	writeFixtureDir(t, unresolvedDir, files)
+	unresolvedDir := writeSourceVariant(t, ctx, "source-unresolved", map[string]string{
+		"settings.json": `{"settings":{"index":{"refresh_interval":"${NOT_SET_ANYWHERE}"}}}`,
+	})
 
 	result := runLoader(t, ctx, nil, sourceArgs(ctx, unresolvedDir, "-delete", true, false, ""))
 	mustFailWith(t, result, "${NOT_SET_ANYWHERE}")
@@ -641,20 +640,29 @@ func scenarioSettingsMalformedFailsBeforeDelete(t *testing.T, ctx *scenarioConte
 	mustSucceed(t, runLoader(t, ctx, nil, sourceArgs(ctx, ctx.sourceBaseDir, "-delete", true, false, "")))
 	assertDocCount(t, ctx, ctx.sourceIndex, 2)
 
-	badDir := filepath.Join(filepath.Dir(ctx.sourceBaseDir), "source-bad-settings")
-	files := map[string]string{}
-	for _, name := range []string{"mappings.json", "pipelines.json", "policies.json", "data.json"} {
-		content, err := os.ReadFile(filepath.Join(ctx.sourceBaseDir, name))
-		if err != nil {
-			t.Fatalf("read base fixture %s: %v", name, err)
-		}
-		files[name] = strings.TrimSpace(string(content))
-	}
-	files["settings.json"] = `{"settings":`
-	writeFixtureDir(t, badDir, files)
+	badDir := writeSourceVariant(t, ctx, "source-bad-settings", map[string]string{
+		"settings.json": `{"settings":`,
+	})
 
 	result := runLoader(t, ctx, nil, sourceArgs(ctx, badDir, "-delete", true, false, ""))
 	mustFailWith(t, result, "Parsing settings file")
+
+	assertIndexExists(t, ctx, ctx.sourceIndex)
+	assertDocCount(t, ctx, ctx.sourceIndex, 2)
+}
+
+// scenarioDataFormatUnknownFailsBeforeDelete guards that a data file whose
+// first byte is neither '[' nor '{' fails the run before -delete removes the
+// index, rather than after it (FIX-DATAFMT-01).
+func scenarioDataFormatUnknownFailsBeforeDelete(t *testing.T, ctx *scenarioContext) {
+	mustSucceed(t, runLoader(t, ctx, nil, sourceArgs(ctx, ctx.sourceBaseDir, "-delete", true, false, "")))
+	assertDocCount(t, ctx, ctx.sourceIndex, 2)
+
+	badDir := writeSourceVariant(t, ctx, "source-bad-data-format", map[string]string{
+		"data.json": "lookup_id,name\nA,Alice\nB,Bob",
+	})
+	result := runLoader(t, ctx, nil, sourceArgs(ctx, badDir, "-delete", true, false, ""))
+	mustFailWith(t, result, "is neither '[' (JSON array) nor '{' (NDJSON)")
 
 	assertIndexExists(t, ctx, ctx.sourceIndex)
 	assertDocCount(t, ctx, ctx.sourceIndex, 2)
@@ -935,6 +943,28 @@ func (ctx *scenarioContext) cleanup(t *testing.T) {
 	deleteManagedPoliciesForLogical(t, ctx, ctx.sourcePolicy)
 	deletePolicyIfExists(t, ctx, ctx.altSourcePolicy)
 	deletePolicyIfExists(t, ctx, ctx.sourcePolicy)
+}
+
+// writeSourceVariant writes a copy of the scenario's source fixtures into
+// a sibling directory named dirName, with overrides replacing whole files,
+// and returns that directory. Fail-safe scenarios use it to change one
+// input while keeping the rest identical to the seeded run.
+func writeSourceVariant(t *testing.T, ctx *scenarioContext, dirName string, overrides map[string]string) string {
+	t.Helper()
+	files := map[string]string{}
+	for _, name := range []string{"settings.json", "mappings.json", "pipelines.json", "policies.json", "data.json"} {
+		content, err := os.ReadFile(filepath.Join(ctx.sourceBaseDir, name))
+		if err != nil {
+			t.Fatalf("read base fixture %s: %v", name, err)
+		}
+		files[name] = strings.TrimSpace(string(content))
+	}
+	for name, content := range overrides {
+		files[name] = content
+	}
+	dir := filepath.Join(filepath.Dir(ctx.sourceBaseDir), dirName)
+	writeFixtureDir(t, dir, files)
+	return dir
 }
 
 // writeFixtureDir centralizes this code path so package behavior stays consistent.

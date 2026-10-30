@@ -275,6 +275,22 @@ func TestRunErrorContract(t *testing.T) {
 		wantResult: &Result{},
 	})
 
+	// FIX-DATAFMT-01 boundary: plain -delete with an unknown-format file keeps
+	// the duplicated "op: op" message and a zero Result (no warnings apply).
+	tests = append(tests, runErrorCase{
+		name: "unknown data format preflight",
+		setup: func(t *testing.T) Options {
+			return Options{
+				URL: esstub.New(t).URL(), Index: "cards", DeleteIndex: true,
+				DataFile: writeInputFile(t, "data.json", "id,name\n1,Alice\n"),
+			}
+		},
+		wantKind:   ErrLoaderExecution,
+		wantOp:     unknownDataFormatOp,
+		wantMsg:    unknownDataFormatOp + ": " + unknownDataFormatOp,
+		wantResult: &Result{},
+	})
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
@@ -1411,6 +1427,19 @@ func TestRunStopsAfterResolutionFailure(t *testing.T) {
 			wantRequests: []string{},
 		},
 		{
+			// Run's bulk.CheckDataFile return for a readable file of unknown
+			// format: it must fail before -delete, not inside bulk.Load after it
+			// (FIX-DATAFMT-01).
+			name: "data file unknown format preflight failure",
+			setup: func(t *testing.T, _ *opRecorder) (*esstub.Stub, Options) {
+				return empty(t, Options{Index: "cards", DeleteIndex: true,
+					DataFile: fixture.WriteTempJSON(t, t.TempDir(), "id,name\n1,Alice\n")})
+			},
+			wantKind:     ErrLoaderExecution,
+			wantOp:       `Data file first byte 'i' is neither '[' (JSON array) nor '{' (NDJSON)`,
+			wantRequests: []string{},
+		},
+		{
 			// Run's aliasops.ResolveTargets return: a 500 from the alias read.
 			name: "alias resolution failure",
 			setup: func(t *testing.T, _ *opRecorder) (*esstub.Stub, Options) {
@@ -1870,6 +1899,66 @@ func TestRunRejectsBadInputBeforeAnyMutation(t *testing.T) {
 				t.Fatalf("result = %+v, want no selected index", result)
 			}
 		})
+	}
+}
+
+// unknownDataFormatOp is the Op bulk.detectDataFormat gives a CSV whose first
+// byte is 'i'.
+const unknownDataFormatOp = `Data file first byte 'i' is neither '[' (JSON array) nor '{' (NDJSON)`
+
+// TestRunRejectsUnknownDataFormatBeforeMutation guards FIX-DATAFMT-01: a
+// readable data file whose first byte is neither '[' nor '{' must fail in
+// Run's preflight, before any request, for every data action with alias and
+// nuke on or off. Moving format detection back into bulk.Load (after -delete
+// or -flush) makes these runs send requests and fail here. Warnings Run
+// appends before preflight (alias-delete) are kept, so no zero Result is
+// required.
+func TestRunRejectsUnknownDataFormatBeforeMutation(t *testing.T) {
+	t.Parallel()
+
+	actions := []struct {
+		name string
+		set  func(o *Options)
+	}{
+		{"add", func(o *Options) { o.AddToIndex = true }},
+		{"flush", func(o *Options) { o.FlushIndex = true }},
+		{"delete", func(o *Options) { o.DeleteIndex = true }},
+	}
+	for _, action := range actions {
+		for _, alias := range []bool{false, true} {
+			for _, nuke := range []bool{false, true} {
+				name := fmt.Sprintf("%s/alias=%t/nuke=%t", action.name, alias, nuke)
+				t.Run(name, func(t *testing.T) {
+					t.Parallel()
+
+					stub := inputPreflightStub(t)
+					opts := Options{
+						URL:       stub.URL(),
+						Index:     "cards",
+						DataFile:  writeInputFile(t, "data.json", "id,name\n1,Alice\n"),
+						AliasMode: alias,
+						Nuke:      nuke,
+					}
+					action.set(&opts)
+
+					result, err := Run(t.Context(), opts)
+					if err == nil {
+						t.Fatal("expected Run to fail")
+					}
+					assertRunError(t, err, ErrLoaderExecution, unknownDataFormatOp)
+					var runErr *RunError
+					if !errors.As(err, &runErr) || runErr.Err.Error() != unknownDataFormatOp {
+						t.Fatalf("cause = %v, want text %q", err, unknownDataFormatOp)
+					}
+					if got := stub.Requests(); len(got) != 0 {
+						t.Fatalf("requests = %v, want none", got)
+					}
+					if result.WriteIndex != "" || result.CreatedIndex != "" || result.ResolvedAliasTarget != "" {
+						t.Fatalf("result = %+v, want no selected index", result)
+					}
+				})
+			}
+		}
 	}
 }
 
