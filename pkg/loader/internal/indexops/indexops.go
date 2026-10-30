@@ -43,18 +43,64 @@ const (
 // separators so the indices stay distinct from the "; " between fields. A
 // concrete-index request keeps the plain single-index message. A mapping fetch
 // failure is returned as-is, because it is not a mismatch.
-func VerifyMappings(ctx context.Context, es *elasticsearch.Client, index string, plan config.MappingPlan) error {
+//
+// expected, when non-empty, is the set of concrete indices the caller will go
+// on to mutate (alias -flush empties each one). The response key set must
+// equal it, checked before any field check: the caller resolves targets with
+// a separate alias read, so trusting only the response entries would leave a
+// target the response omitted flushed unverified (FIX-ALIASSET-01). Order and
+// duplicates in expected do not matter and the slice is not mutated. Nil or
+// empty skips the cross-check (non-alias and post-create callers).
+func VerifyMappings(ctx context.Context, es *elasticsearch.Client, index string, plan config.MappingPlan, expected []string) error {
 	byIndex, err := fetchIndexMappings(es, index)
 	if err != nil {
 		return err
 	}
-	_, concrete := byIndex[index]
 
 	targets := make([]string, 0, len(byIndex))
 	for target := range byIndex {
 		targets = append(targets, target)
 	}
 	slices.Sort(targets)
+
+	if len(expected) > 0 {
+		want := make(map[string]struct{}, len(expected))
+		for _, name := range expected {
+			want[name] = struct{}{}
+		}
+		var missing, unexpected []string
+		for name := range want {
+			if _, ok := byIndex[name]; !ok {
+				missing = append(missing, name)
+			}
+		}
+		for _, name := range targets {
+			if _, ok := want[name]; !ok {
+				unexpected = append(unexpected, name)
+			}
+		}
+		if len(missing) > 0 || len(unexpected) > 0 {
+			slices.Sort(missing)
+			var groups []string
+			if len(missing) > 0 {
+				groups = append(groups, "missing "+strings.Join(missing, ", "))
+			}
+			if len(unexpected) > 0 {
+				groups = append(groups, "unexpected "+strings.Join(unexpected, ", "))
+			}
+			return fmt.Errorf("alias %q: mappings response does not match the alias targets: %s", index, strings.Join(groups, "; "))
+		}
+	}
+
+	if len(targets) == 0 {
+		return fmt.Errorf("mappings response for index %q was empty", index)
+	}
+	_, concrete := byIndex[index]
+	if concrete && len(targets) > 1 {
+		// A concrete-index request returns exactly its own entry; anything more
+		// is an unexpected response and must not be checked under the wrong label.
+		return fmt.Errorf("mappings response for index %q included other indices: %s", index, strings.Join(targets, ", "))
+	}
 
 	var failures []string
 	for _, target := range targets {
@@ -122,7 +168,9 @@ func mappingMismatches(mappings map[string]any, plan config.MappingPlan) []strin
 // response by concrete index, so an alias name is never a key; the old
 // first-entry fallback checked one arbitrary target of a multi-target alias
 // and let the others go unverified (FIX-ALIASPRE-01). Returning every entry
-// lets the caller check them all.
+// lets the caller check them all. It owns transport, status, decoding and
+// per-entry shape failures (including JSON null); judging the key set (empty,
+// concrete-plus-other, expected targets) belongs to VerifyMappings.
 func fetchIndexMappings(es *elasticsearch.Client, name string) (map[string]map[string]any, error) {
 	res, err := es.Indices.GetMapping(es.Indices.GetMapping.WithIndex(name))
 	if err != nil {
@@ -142,7 +190,9 @@ func fetchIndexMappings(es *elasticsearch.Client, name string) (map[string]map[s
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, fmt.Errorf("decoding mappings response for index %q: %w", name, err)
 	}
-	if len(payload) == 0 {
+	// JSON null decodes to a nil map and is never a valid response. A decoded
+	// "{}" is returned as an empty map: VerifyMappings owns set-shape judgement.
+	if payload == nil {
 		return nil, fmt.Errorf("mappings response for index %q was empty", name)
 	}
 
@@ -163,12 +213,6 @@ func fetchIndexMappings(es *elasticsearch.Client, name string) (map[string]map[s
 			return nil, fmt.Errorf("mappings response for index %q did not include a mappings object", key)
 		}
 		result[key] = mappings
-	}
-
-	// A concrete-index request returns exactly its own entry; anything more is
-	// an unexpected response and must not be checked under the wrong label.
-	if _, ok := payload[name]; ok && len(payload) > 1 {
-		return nil, fmt.Errorf("mappings response for index %q included other indices: %s", name, strings.Join(keys, ", "))
 	}
 	return result, nil
 }

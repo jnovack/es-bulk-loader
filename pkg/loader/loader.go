@@ -604,7 +604,7 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 	// failed run. Read `exists` here: the switch below rewrites it.
 	preflightExistingIndex := exists && (action == dataActionFlush || action == dataActionAdd)
 	if preflightExistingIndex {
-		if err := requireMappingPreflight(ctx, es, *index, preflightPlan); err != nil {
+		if err := requireMappingPreflight(ctx, es, *index, preflightPlan, aliasTargets); err != nil {
 			return result, runFailure(err)
 		}
 	}
@@ -752,7 +752,7 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 		// file, so verify it now. The existing-index path was verified before
 		// the data action and is not checked twice.
 		if !preflightExistingIndex {
-			if err := requireMappingPreflight(ctx, es, writeIndex, preflightPlan); err != nil {
+			if err := requireMappingPreflight(ctx, es, writeIndex, preflightPlan, nil); err != nil {
 				return result, runFailure(err)
 			}
 		}
@@ -929,11 +929,17 @@ func displayManagedAsset(path string) string {
 // classifyRunErrorKind, which matches "bulk" first, so a preflight failure is
 // classified as ErrBulkFailure. TestRunExistingIndexMappingMismatchFailsBeforeMutation
 // pins that kind; changing it is a deliberate decision, not a rename.
-func requireMappingPreflight(ctx context.Context, es *elasticsearch.Client, index string, plan config.MappingPlan) error {
+//
+// expected is the concrete-index set the run will mutate (aliasTargets in
+// alias mode, nil otherwise, and nil for the post-create check). A non-empty
+// set must equal the mappings response's key set, so a flushed target cannot
+// go unverified (FIX-ALIASSET-01). With no mapping expectations the check is
+// skipped entirely, including the set comparison.
+func requireMappingPreflight(ctx context.Context, es *elasticsearch.Client, index string, plan config.MappingPlan, expected []string) error {
 	if !plan.HasExpectations() {
 		return nil
 	}
-	if err := indexops.VerifyMappings(ctx, es, index, plan); err != nil {
+	if err := indexops.VerifyMappings(ctx, es, index, plan, expected); err != nil {
 		return runlog.Fail(runlog.FailureEvent(ctx).Str("index", index), "Mapping preflight failed before bulk insert", err)
 	}
 	return nil

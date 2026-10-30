@@ -919,3 +919,155 @@ func TestRunInputPreflightLogsOnlyAtCreate(t *testing.T) {
 		})
 	}
 }
+
+// TestRunAliasPreflightRejectsDifferentTargetSets guards FIX-ALIASSET-01:
+// alias -flush and -add verify exactly the set of indices the run goes on to
+// mutate. The alias read and the mapping read are separate snapshots, so a
+// response omitting a resolved target (or adding one) must stop the run before
+// any flush, bulk or managed upsert. The strict stub registers no write
+// routes: a mutation, or losing the early return, fails the test. The error
+// kind stays ErrBulkFailure because the wrapper Op text is unchanged.
+func TestRunAliasPreflightRejectsDifferentTargetSets(t *testing.T) {
+	t.Parallel()
+
+	const good = `{"mappings":{"properties":{"id":{"type":"keyword"}}}}`
+	const prefix = `alias "cards": mappings response does not match the alias targets: `
+	aliasBody := `{"cards-a":{},"cards-b":{}}`
+	onlyA := `{"cards-a":` + good + `}`
+	extraC := `{"cards-a":` + good + `,"cards-b":` + good + `,"cards-c":` + good + `}`
+
+	type action struct {
+		name string
+		set  func(*Options)
+	}
+	actions := []action{
+		{"flush", func(o *Options) { o.FlushIndex = true }},
+		{"add", func(o *Options) { o.AddToIndex = true }},
+	}
+	tests := []struct {
+		name         string
+		aliasStatus  int
+		aliasBody    string
+		fallback     bool
+		mappingsBody string
+		syncManaged  bool
+		want         string
+	}{
+		{name: "missing one", aliasStatus: http.StatusOK, aliasBody: aliasBody, mappingsBody: onlyA, want: prefix + "missing cards-b"},
+		{name: "unexpected one", aliasStatus: http.StatusOK, aliasBody: aliasBody, mappingsBody: extraC, want: prefix + "unexpected cards-c"},
+		{name: "empty object", aliasStatus: http.StatusOK, aliasBody: aliasBody, mappingsBody: `{}`, want: prefix + "missing cards-a, cards-b"},
+		{name: "missing one sync-managed", aliasStatus: http.StatusOK, aliasBody: aliasBody, mappingsBody: onlyA, syncManaged: true, want: prefix + "missing cards-b"},
+	}
+	fallbackRows := []struct {
+		name         string
+		mappingsBody string
+		want         string
+	}{
+		{"fallback only other", `{"cards-x":` + good + `}`, prefix + "missing cards; unexpected cards-x"},
+		{"fallback with extra", `{"cards":` + good + `,"cards-x":` + good + `}`, prefix + "unexpected cards-x"},
+	}
+
+	run := func(t *testing.T, act action, aliasStatus int, aliasJSON string, fallback bool, mappingsBody string, syncManaged bool, want string) {
+		t.Helper()
+
+		stub := esstub.New(t)
+		stub.Handle("GET /_alias/cards", esstub.JSON(aliasStatus, aliasJSON))
+		if fallback {
+			stub.Handle("HEAD /cards", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+		}
+		stub.Handle("GET /cards/_mapping", esstub.JSON(http.StatusOK, mappingsBody))
+
+		opts := Options{
+			URL: stub.URL(), Index: "cards", AliasMode: true,
+			DataFile:     writeBulkDataFixture(t),
+			MappingsFile: fixture.WriteTempJSON(t, t.TempDir(), `{"properties":{"id":{"type":"keyword"}}}`),
+		}
+		if syncManaged {
+			opts.SyncManaged = true
+			opts.PipelinesFile = fixture.WriteTempJSON(t, t.TempDir(), `{"p":{"processors":[]}}`)
+		}
+		act.set(&opts)
+
+		result, err := Run(t.Context(), opts)
+		assertRunError(t, err, ErrBulkFailure, "Mapping preflight failed before bulk insert")
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %v, want containing %q", err, want)
+		}
+		if result.DocumentsProcessed != 0 || result.DocumentsSucceeded != 0 {
+			t.Fatalf("result = %+v, want no documents loaded", result)
+		}
+
+		var got []string
+		for _, r := range stub.Requests() {
+			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				t.Fatalf("unexpected mutating request %s %s", r.Method, r.Path)
+			}
+			got = append(got, r.Method+" "+r.Path)
+		}
+		wantSeq := []string{"GET /_alias/cards", "GET /cards/_mapping"}
+		if fallback {
+			wantSeq = []string{"GET /_alias/cards", "HEAD /cards", "GET /cards/_mapping"}
+		}
+		if !slices.Equal(got, wantSeq) {
+			t.Fatalf("requests = %v, want %v", got, wantSeq)
+		}
+	}
+
+	for _, act := range actions {
+		for _, tt := range tests {
+			t.Run(act.name+"/"+tt.name, func(t *testing.T) {
+				t.Parallel()
+				run(t, act, tt.aliasStatus, tt.aliasBody, false, tt.mappingsBody, tt.syncManaged, tt.want)
+			})
+		}
+	}
+	for _, tt := range fallbackRows {
+		t.Run("flush/"+tt.name, func(t *testing.T) {
+			t.Parallel()
+			run(t, actions[0], http.StatusNotFound, `{}`, true, tt.mappingsBody, false, tt.want)
+		})
+	}
+}
+
+// TestRunAliasPreflightSkipsEmptyMappingPlan pins the intentional
+// HasExpectations bypass: without mapping expectations (no file, or a file
+// containing {}) no mapping request is made, so the set cross-check is
+// skipped too.
+func TestRunAliasPreflightSkipsEmptyMappingPlan(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		mappingsFile func(t *testing.T) string
+	}{
+		{"no file", func(*testing.T) string { return "" }},
+		{"empty object file", func(t *testing.T) string { return fixture.WriteTempJSON(t, t.TempDir(), `{}`) }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			stub := esstub.New(t)
+			stub.Handle("GET /_alias/cards", esstub.JSON(http.StatusOK, `{"cards-a":{},"cards-b":{}}`))
+			stub.Handle("POST /_bulk", esstub.JSON(http.StatusOK, bulkOKBody("cards")))
+
+			result, err := Run(t.Context(), Options{
+				URL: stub.URL(), Index: "cards", AliasMode: true, AddToIndex: true,
+				DataFile: writeBulkDataFixture(t), MappingsFile: tt.mappingsFile(t),
+			})
+			if err != nil {
+				t.Fatalf("Run returned error: %v", err)
+			}
+			if result.DocumentsSucceeded != 1 {
+				t.Fatalf("DocumentsSucceeded = %d, want 1", result.DocumentsSucceeded)
+			}
+			var got []string
+			for _, r := range stub.Requests() {
+				got = append(got, r.Method+" "+r.Path)
+			}
+			if want := []string{"GET /_alias/cards", "POST /_bulk"}; !slices.Equal(got, want) {
+				t.Fatalf("requests = %v, want %v", got, want)
+			}
+		})
+	}
+}

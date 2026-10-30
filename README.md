@@ -312,6 +312,18 @@ When the plan runs depends on whether the index already exists:
   With `-alias`, every concrete index behind the alias is verified, because
   `-flush` empties each of them. The error names the alias and each failing
   index, in sorted order, separated by ` | `.
+  The loader resolves the alias targets and reads their mappings in two
+  separate requests, and the index names in the two answers must be the same
+  set. If the mappings response omits a resolved target, or contains an index
+  that is not a resolved target, the run fails before any flush, bulk load or
+  managed upsert with `alias "<name>": mappings response does not match the
+  alias targets: missing <names>; unexpected <names>` (names sorted, empty
+  groups omitted). A concrete index that shares the alias name is compared the
+  same way. This compares two snapshots; it does not stop another writer from
+  changing the alias or mappings after they were read, so avoid concurrent
+  lifecycle changes. Without mapping expectations (no `-mappings`, or a file
+  declaring no fields or `date_detection`) no mappings are read and nothing
+  is compared.
 - **Created index** (`-delete`, or `-add`/`-flush` with no existing index or
   alias target): the check runs once, after the index is created and before
   the bulk load. Managed-resource setup for index creation can happen between
