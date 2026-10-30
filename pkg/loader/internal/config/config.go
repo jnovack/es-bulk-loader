@@ -95,25 +95,30 @@ func BuildCreateIndexBody(ctx context.Context, replicas int, replicasSource, set
 	return fmt.Sprintf(`{"settings": %s, "mappings": %s}`, settings, mappings), nil
 }
 
-// NormalizeIndexSettings centralizes this code path so package behavior stays consistent.
-func NormalizeIndexSettings(ctx context.Context, path, defaultPipeline string, replicas int, replicasSource string, variables template.Variables) (string, error) {
+// ParseSettingsFile reads and normalizes the settings file into a key/value
+// map (raw or wrapped JSON, nested "index" object, "index." key prefixes). It
+// is the single settings parser: preflight calls it to fail on a bad file
+// before any destructive step, without the create-time logging or the
+// cluster-derived replica value that NormalizeIndexSettings adds. An empty
+// path yields an empty, non-nil map.
+func ParseSettingsFile(ctx context.Context, path string, variables template.Variables) (map[string]json.RawMessage, error) {
 	settings := make(map[string]json.RawMessage)
 	if path != "" {
 		content, err := template.ReadFile(path, variables)
 		if err != nil {
-			return "", runlog.Fail(runlog.FailureEvent(ctx).Str("path", path), "Reading settings file", err)
+			return nil, runlog.Fail(runlog.FailureEvent(ctx).Str("path", path), "Reading settings file", err)
 		}
 
 		var raw map[string]json.RawMessage
 		if err := json.Unmarshal(content, &raw); err != nil {
-			return "", runlog.Fail(runlog.FailureEvent(ctx).Str("path", path), "Parsing settings file", err)
+			return nil, runlog.Fail(runlog.FailureEvent(ctx).Str("path", path), "Parsing settings file", err)
 		}
 
 		source := raw
 		if nested, ok := raw["settings"]; ok {
 			source = nil
 			if err := json.Unmarshal(nested, &source); err != nil {
-				return "", runlog.Fail(runlog.FailureEvent(ctx).Str("path", path), "Parsing nested settings file", err)
+				return nil, runlog.Fail(runlog.FailureEvent(ctx).Str("path", path), "Parsing nested settings file", err)
 			}
 		}
 
@@ -134,6 +139,30 @@ func NormalizeIndexSettings(ctx context.Context, path, defaultPipeline string, r
 
 			settings[normalizeSettingKey(key)] = value
 		}
+	}
+	return settings, nil
+}
+
+// PreflightIndexInputs parses the settings and mappings files with the same
+// parsers the create step uses, so a missing, unreadable or malformed file
+// fails before Run's first destructive request. It only parses: it logs
+// nothing, contacts no cluster and applies no semantic validation. The first
+// error is returned unchanged; empty paths succeed.
+func PreflightIndexInputs(ctx context.Context, settingsFile, mappingsFile string, variables template.Variables) error {
+	if _, err := ParseSettingsFile(ctx, settingsFile, variables); err != nil {
+		return err
+	}
+	if _, err := NormalizeIndexSection(ctx, mappingsFile, "mappings", variables); err != nil {
+		return err
+	}
+	return nil
+}
+
+// NormalizeIndexSettings centralizes this code path so package behavior stays consistent.
+func NormalizeIndexSettings(ctx context.Context, path, defaultPipeline string, replicas int, replicasSource string, variables template.Variables) (string, error) {
+	settings, err := ParseSettingsFile(ctx, path, variables)
+	if err != nil {
+		return "", err
 	}
 
 	if defaultPipeline != "" {

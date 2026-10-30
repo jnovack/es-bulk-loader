@@ -213,6 +213,13 @@ func TestEndToEndScenarios(t *testing.T) {
 			checks: "loader returns only after the batch transform completes; destination index holds its documents at exit with no retry",
 			run:    scenarioDeleteSyncManagedWaitTransforms,
 		},
+		{
+			// Appended last: the slice index sets each scenario's e2e-NN prefix.
+			name:   "settings_malformed_fails_before_delete",
+			flags:  "-delete (malformed settings file)",
+			checks: "fails with the settings parse error before -delete; the seeded index and its two documents remain",
+			run:    scenarioSettingsMalformedFailsBeforeDelete,
+		},
 	}
 
 	for i, sc := range scenarios {
@@ -584,6 +591,32 @@ func scenarioUnresolvedTemplateVariableFailsSafely(t *testing.T, ctx *scenarioCo
 
 	result := runLoader(t, ctx, nil, sourceArgs(ctx, unresolvedDir, "-delete", true, false, ""))
 	mustFailWith(t, result, "${NOT_SET_ANYWHERE}")
+
+	assertIndexExists(t, ctx, ctx.sourceIndex)
+	assertDocCount(t, ctx, ctx.sourceIndex, 2)
+}
+
+// scenarioSettingsMalformedFailsBeforeDelete guards that a malformed settings
+// file fails the run before -delete removes the index, rather than leaving the
+// cluster half-reset (FIX-SETTINGSPRE-01).
+func scenarioSettingsMalformedFailsBeforeDelete(t *testing.T, ctx *scenarioContext) {
+	mustSucceed(t, runLoader(t, ctx, nil, sourceArgs(ctx, ctx.sourceBaseDir, "-delete", true, false, "")))
+	assertDocCount(t, ctx, ctx.sourceIndex, 2)
+
+	badDir := filepath.Join(filepath.Dir(ctx.sourceBaseDir), "source-bad-settings")
+	files := map[string]string{}
+	for _, name := range []string{"mappings.json", "pipelines.json", "policies.json", "data.json"} {
+		content, err := os.ReadFile(filepath.Join(ctx.sourceBaseDir, name))
+		if err != nil {
+			t.Fatalf("read base fixture %s: %v", name, err)
+		}
+		files[name] = strings.TrimSpace(string(content))
+	}
+	files["settings.json"] = `{"settings":`
+	writeFixtureDir(t, badDir, files)
+
+	result := runLoader(t, ctx, nil, sourceArgs(ctx, badDir, "-delete", true, false, ""))
+	mustFailWith(t, result, "Parsing settings file")
 
 	assertIndexExists(t, ctx, ctx.sourceIndex)
 	assertDocCount(t, ctx, ctx.sourceIndex, 2)

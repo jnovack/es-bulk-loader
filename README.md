@@ -591,6 +591,21 @@ every supplied template file (settings, mappings, pipelines, policies and
 transforms), including one this run would not otherwise read, so a typo in an
 unused `-settings` file still fails a `-sync-managed`-only run.
 
+Read and parse failures are checked early too. When the run has a data action
+(`-delete`, `-flush`, `-add`) or effective `-sync-managed` (including the
+assumed one for `-delete -alias`), the `-settings` and `-mappings` files must
+exist and parse as JSON before the first `-nuke`, `-delete` or `-flush`
+request. This also applies to `-add`/`-flush` against an existing index and to
+sync-managed-only runs, even when no index ends up being created. When there is
+a data action, the `-data` file must open and have a first non-whitespace
+byte. Enrich-only and nuke-only runs without managed sync do not inspect these
+files.
+
+This is not full validation. An unknown data format, invalid JSON later in the
+data file, Elasticsearch rejecting a settings or mappings body, and a file or
+environment value that changes after the check can still fail after the
+cluster has been modified.
+
 ## JSON Formats
 
 ### `data.json`

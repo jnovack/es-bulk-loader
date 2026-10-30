@@ -1,8 +1,10 @@
 package loader
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -103,11 +105,9 @@ func TestRunErrorContract(t *testing.T) {
 			wantOp:   "Parsing mappings file",
 		},
 		{
-			name: "missing settings file at create time",
+			name: "missing settings file fails before any request",
 			setup: func(t *testing.T) Options {
-				stub := esstub.New(t)
-				stub.Handle("HEAD /cards", esstub.JSON(http.StatusNotFound, ""))
-				stub.Handle("GET /_nodes", esstub.JSON(http.StatusOK, nodesBody))
+				stub := esstub.New(t) // no routes: any request fails the test
 				return Options{
 					URL:          stub.URL(),
 					Index:        "cards",
@@ -119,7 +119,7 @@ func TestRunErrorContract(t *testing.T) {
 			wantKind:   ErrLoaderExecution,
 			wantOp:     "Reading settings file",
 			wantCause:  os.ErrNotExist,
-			wantResult: &Result{WriteIndex: "cards"},
+			wantResult: &Result{},
 		},
 		{
 			name: "index existence transport failure",
@@ -630,5 +630,292 @@ func TestPublicTypeIdentity(t *testing.T) {
 		if typ.PkgPath() != pkgPath || typ.Name() != tt.name {
 			t.Fatalf("type %v declared as %s.%s, want %s.%s", typ, typ.PkgPath(), typ.Name(), pkgPath, tt.name)
 		}
+	}
+}
+
+// inputPreflightStub serves only read requests for index "cards": any write
+// reaches no route and fails the test.
+func inputPreflightStub(t *testing.T) *esstub.Stub {
+	t.Helper()
+	stub := esstub.New(t)
+	stub.Handle("HEAD /cards", esstub.JSON(http.StatusOK, ""))
+	stub.Handle("GET /_nodes", esstub.JSON(http.StatusOK, nodesBody))
+	stub.Handle("GET /_alias/cards", esstub.JSON(http.StatusNotFound, ""))
+	return stub
+}
+
+func writeInputFile(t *testing.T, name, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", name, err)
+	}
+	return path
+}
+
+// TestRunRejectsBadInputBeforeAnyMutation guards FIX-SETTINGSPRE-01: a bad
+// settings, mappings or data file must fail before the first -nuke, -delete
+// or -flush request. Moving the preflight after the destructive step makes
+// the stub see a DELETE/POST and fails this test.
+func TestRunRejectsBadInputBeforeAnyMutation(t *testing.T) {
+	t.Parallel()
+
+	type modeFn func(o *Options)
+	modes := []struct {
+		name string
+		set  modeFn
+	}{
+		{"delete", func(o *Options) { o.DeleteIndex = true }},
+		{"flush", func(o *Options) { o.FlushIndex = true }},
+		{"nuke sync-managed", func(o *Options) { o.Nuke = true; o.SyncManaged = true }},
+		{"nuke delete", func(o *Options) { o.Nuke = true; o.DeleteIndex = true }},
+		{"delete alias", func(o *Options) { o.DeleteIndex = true; o.AliasMode = true }},
+	}
+	dataModes := []struct {
+		name string
+		set  modeFn
+	}{
+		{"delete", func(o *Options) { o.DeleteIndex = true }},
+		{"flush", func(o *Options) { o.FlushIndex = true }},
+		{"nuke delete", func(o *Options) { o.Nuke = true; o.DeleteIndex = true }},
+		{"delete alias", func(o *Options) { o.DeleteIndex = true; o.AliasMode = true }},
+	}
+
+	type row struct {
+		name      string
+		opts      func(t *testing.T, stub *esstub.Stub) Options
+		wantOp    string
+		wantCause error
+	}
+	var rows []row
+	missing := func(t *testing.T) string { return filepath.Join(t.TempDir(), "missing.json") }
+	dirPath := func(t *testing.T) string { return t.TempDir() }
+
+	base := func(t *testing.T, stub *esstub.Stub) Options {
+		return Options{
+			URL:          stub.URL(),
+			Index:        "cards",
+			DataFile:     writeBulkDataFixture(t),
+			SettingsFile: writeInputFile(t, "settings.json", `{}`),
+			MappingsFile: writeInputFile(t, "mappings.json", `{}`),
+		}
+	}
+
+	for _, m := range modes {
+		rows = append(rows,
+			row{m.name + "/missing settings", func(t *testing.T, stub *esstub.Stub) Options {
+				o := base(t, stub)
+				m.set(&o)
+				o.SettingsFile = missing(t)
+				return o
+			}, "Reading settings file", os.ErrNotExist},
+			row{m.name + "/malformed settings", func(t *testing.T, stub *esstub.Stub) Options {
+				o := base(t, stub)
+				m.set(&o)
+				o.SettingsFile = writeInputFile(t, "settings.json", `{"settings":`)
+				return o
+			}, "Parsing settings file", nil},
+		)
+	}
+	rows = append(rows,
+		row{"delete/directory settings", func(t *testing.T, stub *esstub.Stub) Options {
+			o := base(t, stub)
+			o.DeleteIndex = true
+			o.SettingsFile = dirPath(t)
+			return o
+		}, "Reading settings file", nil},
+		row{"delete/nested settings wrong type", func(t *testing.T, stub *esstub.Stub) Options {
+			o := base(t, stub)
+			o.DeleteIndex = true
+			o.SettingsFile = writeInputFile(t, "settings.json", `{"settings":[]}`)
+			return o
+		}, "Parsing nested settings file", nil},
+	)
+
+	// Mappings on a nuke run with no data action are otherwise parsed only at
+	// create time.
+	for name, mk := range map[string]struct {
+		path func(t *testing.T) string
+		op   string
+		is   error
+	}{
+		"missing":   {missing, "Reading mappings file", os.ErrNotExist},
+		"directory": {dirPath, "Reading mappings file", nil},
+		"malformed": {func(t *testing.T) string { return writeInputFile(t, "mappings.json", `{"mappings":`) }, "Parsing mappings file", nil},
+	} {
+		rows = append(rows, row{"nuke sync-managed/" + name + " mappings", func(t *testing.T, stub *esstub.Stub) Options {
+			o := base(t, stub)
+			o.DataFile = ""
+			o.Nuke = true
+			o.SyncManaged = true
+			o.MappingsFile = mk.path(t)
+			return o
+		}, mk.op, mk.is})
+	}
+
+	for _, m := range dataModes {
+		for name, mk := range map[string]struct {
+			path func(t *testing.T) string
+			is   error
+		}{
+			"missing":    {missing, os.ErrNotExist},
+			"directory":  {dirPath, nil},
+			"empty":      {func(t *testing.T) string { return writeInputFile(t, "d.json", "") }, io.EOF},
+			"whitespace": {func(t *testing.T) string { return writeInputFile(t, "d.json", " \r\n\t") }, io.EOF},
+		} {
+			rows = append(rows, row{m.name + "/" + name + " data", func(t *testing.T, stub *esstub.Stub) Options {
+				o := base(t, stub)
+				m.set(&o)
+				o.DataFile = mk.path(t)
+				return o
+			}, "Cannot read data file", mk.is})
+		}
+	}
+
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			t.Parallel()
+			stub := inputPreflightStub(t)
+			opts := r.opts(t, stub)
+			result, err := Run(t.Context(), opts)
+			if err == nil {
+				t.Fatal("expected Run to fail")
+			}
+			for _, req := range stub.Requests() {
+				if req.Method != http.MethodHead && req.Method != http.MethodGet {
+					t.Fatalf("mutating request %s %s before input failure", req.Method, req.Path)
+				}
+			}
+			assertRunError(t, err, ErrLoaderExecution, r.wantOp)
+			if r.wantCause != nil && !errors.Is(err, r.wantCause) {
+				t.Fatalf("error = %v, want cause %v", err, r.wantCause)
+			}
+			if result.WriteIndex != "" || result.CreatedIndex != "" || result.ResolvedAliasTarget != "" {
+				t.Fatalf("result = %+v, want no selected index", result)
+			}
+		})
+	}
+}
+
+// TestRunSkipsUnusedInputPreflight pins the preflight scope: only runs that
+// can use settings/mappings (data action or effective sync-managed) check
+// them, and the conservative potential-create predicate still checks them for
+// -add and sync-managed-only runs against an existing index.
+func TestRunSkipsUnusedInputPreflight(t *testing.T) {
+	t.Parallel()
+
+	unused := func(t *testing.T) (settings, mappings string) {
+		return filepath.Join(t.TempDir(), "missing.json"), filepath.Join(t.TempDir(), "missing.json")
+	}
+	malformed := func(t *testing.T) (settings, mappings string) {
+		return writeInputFile(t, "s.json", `{"settings":`), writeInputFile(t, "m.json", `{"mappings":`)
+	}
+	inputs := map[string]func(t *testing.T) (string, string){"missing": unused, "malformed": malformed}
+
+	for name, mk := range inputs {
+		t.Run("enrich-only/"+name, func(t *testing.T) {
+			t.Parallel()
+			stub := esstub.New(t)
+			stub.Handle("HEAD /cards", esstub.JSON(http.StatusOK, ""))
+			stub.Handle("POST /cards/_refresh", esstub.JSON(http.StatusOK, refreshBody))
+			listing := esstub.JSON(http.StatusInternalServerError, `{"error":{"type":"stub_failure"}}`)
+			stub.Handle("GET /_enrich/policy", listing)
+			stub.Handle("GET /_enrich/policy/{$}", listing)
+			s, m := mk(t)
+			_, err := Run(t.Context(), Options{
+				URL: stub.URL(), Index: "cards",
+				SettingsFile: s, MappingsFile: m,
+				DataFile: filepath.Join(t.TempDir(), "unused.json"),
+				Enrich:   EnrichOptions{Enabled: true, All: true},
+			})
+			if err == nil {
+				t.Fatal("expected the enrich listing failure")
+			}
+			assertRunError(t, err, ErrEnrichExecution, "Failed to get enrich policies")
+		})
+		t.Run("nuke-only/"+name, func(t *testing.T) {
+			t.Parallel()
+			stub := esstub.New(t)
+			stub.Handle("HEAD /cards", esstub.JSON(http.StatusNotFound, ""))
+			s, m := mk(t)
+			_, err := Run(t.Context(), Options{
+				URL: stub.URL(), Index: "cards", Nuke: true,
+				SettingsFile: s, MappingsFile: m,
+				DataFile: filepath.Join(t.TempDir(), "unused.json"),
+			})
+			if err != nil {
+				t.Fatalf("nuke-only run must not inspect unused inputs: %v", err)
+			}
+		})
+	}
+
+	t.Run("add to existing index still preflights settings", func(t *testing.T) {
+		t.Parallel()
+		stub := esstub.New(t)
+		stub.Handle("HEAD /cards", esstub.JSON(http.StatusOK, ""))
+		stub.Handle("GET /_nodes", esstub.JSON(http.StatusOK, nodesBody))
+		_, err := Run(t.Context(), Options{
+			URL: stub.URL(), Index: "cards", AddToIndex: true,
+			DataFile:     writeBulkDataFixture(t),
+			SettingsFile: writeInputFile(t, "s.json", `{"settings":`),
+		})
+		if err == nil {
+			t.Fatal("expected settings failure")
+		}
+		assertRunError(t, err, ErrLoaderExecution, "Parsing settings file")
+	})
+	t.Run("sync-managed only still preflights settings", func(t *testing.T) {
+		t.Parallel()
+		stub := esstub.New(t)
+		stub.Handle("HEAD /cards", esstub.JSON(http.StatusOK, ""))
+		stub.Handle("GET /_nodes", esstub.JSON(http.StatusOK, nodesBody))
+		_, err := Run(t.Context(), Options{
+			URL: stub.URL(), Index: "cards", SyncManaged: true,
+			SettingsFile: writeInputFile(t, "s.json", `{"settings":`),
+		})
+		if err == nil {
+			t.Fatal("expected settings failure")
+		}
+		assertRunError(t, err, ErrLoaderExecution, "Parsing settings file")
+	})
+}
+
+// TestRunInputPreflightLogsOnlyAtCreate guards that preflight neither selects
+// a replica count nor logs it: the Info line appears once, at create time.
+// The stub has no managed pipelines, so this pins only the replica log at Run
+// level; the "Using first declared pipeline" injection and the explicit-default
+// override are pinned in config's TestPreflightIndexInputsPreservesCreateBodyAndLogs.
+func TestRunInputPreflightLogsOnlyAtCreate(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name     string
+		settings string
+	}{
+		{"no default pipeline", `{"number_of_shards":1}`},
+		{"explicit default pipeline", `{"default_pipeline":"p"}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			stub := newLifecycleStub(t, lifecycleConfig{index: "cards", indexExists: true})
+			var buf bytes.Buffer
+			logger := zerolog.New(&buf)
+			_, err := Run(t.Context(), Options{
+				URL: stub.URL(), Index: "cards", DeleteIndex: true,
+				DataFile:     writeBulkDataFixture(t),
+				SettingsFile: writeInputFile(t, "s.json", tt.settings),
+				Logger:       &logger,
+			})
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			logs := buf.String()
+			if got := strings.Count(logs, "Setting index replica count"); got != 1 {
+				t.Fatalf("replica count logged %d times, want 1:\n%s", got, logs)
+			}
+			if strings.Contains(logs, "Using first declared pipeline") {
+				t.Fatalf("no managed pipelines exist; injection log must be absent:\n%s", logs)
+			}
+		})
 	}
 }

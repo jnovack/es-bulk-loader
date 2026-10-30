@@ -426,11 +426,10 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 
 	variables := template.BuildVariables(*index, *templateVariables)
 
-	// Validate every supplied template file before any create, delete, flush or
-	// put. Settings are otherwise templated only at index-create time, after
-	// -delete has already removed the index (mappings are templated at create
-	// time too, apart from the earlier preflight-plan read), so a typo there
-	// would leave the cluster half-reset. Fail closed here instead.
+	// Validate every supplied template file for unresolved variables before
+	// any create, delete, flush or put, so a typo cannot leave the cluster
+	// half-reset. Read and parse failures of settings, mappings and the data
+	// file are preflighted separately below. Fail closed here instead.
 	//
 	// The classification is explicit, not runFailure: classifying this Op by
 	// substring would turn an invalid input into ErrLoaderExecution.
@@ -501,6 +500,27 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 			return result, runFailure(planErr)
 		}
 		preflightPlan = plan
+	}
+
+	// Settings/mappings parsing and data-file readability used to surface only
+	// at create/load time, after -nuke, -delete or -flush had already run,
+	// leaving the cluster half-reset. Check them here, using the create step's
+	// own parsers. The scope is conservative: whether an index will be created
+	// is unknown until after the destructive step. The data check covers only
+	// open and first non-whitespace byte; an unknown format or invalid JSON
+	// later in the file can still fail inside bulk.Load. For data actions the
+	// mappings file is parsed again here after BuildMappingPlan; that is
+	// deliberate, so the settings and no-data sync-managed paths share this one
+	// call. Do not split the settings half out of it.
+	if action.requiresDataFile() || effectiveSyncManaged {
+		if err := config.PreflightIndexInputs(ctx, *settingsFile, *mappingsFile, variables); err != nil {
+			return result, runFailure(err)
+		}
+	}
+	if action.requiresDataFile() {
+		if err := bulk.CheckDataFile(ctx, *dataFile); err != nil {
+			return result, runFailure(err)
+		}
 	}
 
 	aliasTargets := []string(nil)

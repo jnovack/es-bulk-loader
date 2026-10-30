@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -216,6 +217,57 @@ func TestLoadReportsBatchesAndTotals(t *testing.T) {
 			if len(snapshots) != 2 || snapshots[0].Done != 2 || snapshots[1].Done != 3 ||
 				snapshots[0].Total != 3 || snapshots[1].Total != 3 || snapshots[0].Resource != "cards" || snapshots[1].Final {
 				t.Fatalf("snapshots = %+v, want two non-final batches 2/3 then 3/3 for cards", snapshots)
+			}
+		})
+	}
+}
+
+// TestCheckDataFile pins the bounded preflight: open and first
+// non-whitespace byte only, with Load's own failure Op.
+func TestCheckDataFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	write := func(name, content string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatalf("write fixture: %v", err)
+		}
+		return path
+	}
+	tests := []struct {
+		name      string
+		path      string
+		wantFail  bool
+		wantCause error
+	}{
+		{"missing", filepath.Join(dir, "missing.json"), true, os.ErrNotExist},
+		{"directory", dir, true, nil},
+		{"empty", write("empty.json", ""), true, io.EOF},
+		{"whitespace only", write("ws.json", " \r\n\t\r\n"), true, io.EOF},
+		{"array", write("array.json", `[{"id":1}]`), false, nil},
+		{"ndjson with leading whitespace", write("nd.json", "\r\n  {\"id\":1}\r\n"), false, nil},
+		{"unknown first byte is left to Load", write("x.json", "x"), false, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := CheckDataFile(t.Context(), tt.path)
+			if !tt.wantFail {
+				if err != nil {
+					t.Fatalf("CheckDataFile: %v", err)
+				}
+				return
+			}
+			var opErr *failure.Error
+			if !errors.As(err, &opErr) || opErr.Op != "Cannot read data file" {
+				t.Fatalf("error = %#v, want operation error %q", err, "Cannot read data file")
+			}
+			if opErr.Err == nil {
+				t.Fatal("want non-nil cause")
+			}
+			if tt.wantCause != nil && !errors.Is(err, tt.wantCause) {
+				t.Fatalf("error = %v, want cause %v", err, tt.wantCause)
 			}
 		})
 	}

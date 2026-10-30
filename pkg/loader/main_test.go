@@ -180,9 +180,9 @@ func TestRunWarningLogIncludesTimestamp(t *testing.T) {
 }
 
 // TestUnresolvedTemplateVariableFailsRunBeforeClusterChanges guards the
-// fail-before-delete decision: settings and mappings are otherwise templated
-// only at index-create time, after -delete, so without the preflight a typo
-// would leave the cluster half-reset.
+// fail-before-delete decision: the strict template check aggregates every
+// unresolved name across all supplied files before any other parsing, so a
+// typo cannot leave the cluster half-reset.
 func TestUnresolvedTemplateVariableFailsRunBeforeClusterChanges(t *testing.T) {
 	t.Parallel()
 	const typoJSON = `{"v":"${TYPO_%s}"}`
@@ -308,12 +308,9 @@ func TestMissingTemplateFileKeepsReadSiteClassification(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			// The run reaches the cluster before the read site fails for
-			// settings and mappings, so the delete path is served.
+			// Every missing file now fails before cluster access for this
+			// delete/sync run, so no routes are registered.
 			stub := esstub.New(t)
-			stub.Handle("HEAD /products", esstub.JSON(http.StatusOK, ""))
-			stub.Handle("DELETE /products", esstub.JSON(http.StatusOK, ackBody))
-			stub.Handle("GET /_nodes", esstub.JSON(http.StatusOK, nodesBody))
 			dir := t.TempDir()
 			missing := filepath.Join(dir, "missing-"+tt.name+".json")
 
@@ -329,6 +326,9 @@ func TestMissingTemplateFileKeepsReadSiteClassification(t *testing.T) {
 			_, err := Run(t.Context(), opts)
 			if err == nil {
 				t.Fatalf("expected an error for a missing %s file", tt.name)
+			}
+			if n := len(stub.Requests()); n != 0 {
+				t.Fatalf("missing %s file reached the cluster with %d requests", tt.name, n)
 			}
 			if errors.Is(err, ErrInvalidOptions) {
 				t.Fatalf("err = %v: a missing file must not be reclassified as ErrInvalidOptions by the template preflight", err)

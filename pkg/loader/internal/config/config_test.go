@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"os"
@@ -8,8 +9,11 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/rs/zerolog"
+
 	"github.com/jnovack/es-bulk-loader/internal/testutil/fixture"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/failure"
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/runlog"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/template"
 )
 
@@ -399,6 +403,233 @@ func TestReadersReturnTheirOwnOperationErrors(t *testing.T) {
 			}
 			if tt.wantCause != nil && !errors.Is(err, tt.wantCause) {
 				t.Fatalf("error = %v, want cause %v", err, tt.wantCause)
+			}
+		})
+	}
+}
+
+func writeConfigFixture(t *testing.T, name, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	return path
+}
+
+func assertOpError(t *testing.T, err error, wantOp string) *failure.Error {
+	t.Helper()
+	var opErr *failure.Error
+	if !errors.As(err, &opErr) {
+		t.Fatalf("error = %T %v, want *failure.Error", err, err)
+	}
+	if opErr.Op != wantOp {
+		t.Fatalf("Op = %q, want %q", opErr.Op, wantOp)
+	}
+	return opErr
+}
+
+// TestParseSettingsFile pins the single settings parser shared by preflight
+// and NormalizeIndexSettings: accepted shapes and the exact failure Ops.
+func TestParseSettingsFile(t *testing.T) {
+	// Not parallel: the unresolved-variable subtest mutates the environment.
+	tests := []struct {
+		name    string
+		content string
+		want    map[string]string
+	}{
+		{"raw", `{"number_of_shards":1}`, map[string]string{"number_of_shards": "1"}},
+		{"wrapped", `{"settings":{"number_of_shards":2}}`, map[string]string{"number_of_shards": "2"}},
+		{"nested index object", "{\"settings\":{\"index\":{\"index.refresh_interval\":\"1s\"}}}\r\n", map[string]string{"refresh_interval": `"1s"`}},
+		{"dotted keys", `{"index.number_of_shards":3}`, map[string]string{"number_of_shards": "3"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseSettingsFile(t.Context(), writeConfigFixture(t, "s.json", tt.content), nil)
+			if err != nil {
+				t.Fatalf("ParseSettingsFile: %v", err)
+			}
+			if len(got) != len(tt.want) {
+				t.Fatalf("settings = %v, want %v", got, tt.want)
+			}
+			for k, v := range tt.want {
+				if string(got[k]) != v {
+					t.Fatalf("settings[%q] = %s, want %s", k, got[k], v)
+				}
+			}
+		})
+	}
+
+	t.Run("empty path", func(t *testing.T) {
+		got, err := ParseSettingsFile(t.Context(), "", nil)
+		if err != nil || got == nil || len(got) != 0 {
+			t.Fatalf("got %v, %v; want non-nil empty map and nil error", got, err)
+		}
+	})
+
+	t.Run("missing file", func(t *testing.T) {
+		_, err := ParseSettingsFile(t.Context(), filepath.Join(t.TempDir(), "nope.json"), nil)
+		assertOpError(t, err, "Reading settings file")
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("error = %v, want os.ErrNotExist", err)
+		}
+	})
+	t.Run("directory path", func(t *testing.T) {
+		_, err := ParseSettingsFile(t.Context(), t.TempDir(), nil)
+		if opErr := assertOpError(t, err, "Reading settings file"); opErr.Err == nil {
+			t.Fatal("want non-nil cause")
+		}
+	})
+	t.Run("malformed JSON", func(t *testing.T) {
+		_, err := ParseSettingsFile(t.Context(), writeConfigFixture(t, "s.json", `{"settings":`), nil)
+		assertOpError(t, err, "Parsing settings file")
+		var syn *json.SyntaxError
+		if !errors.As(err, &syn) {
+			t.Fatalf("error = %v, want *json.SyntaxError", err)
+		}
+	})
+	t.Run("nested settings wrong type", func(t *testing.T) {
+		_, err := ParseSettingsFile(t.Context(), writeConfigFixture(t, "s.json", `{"settings":[]}`), nil)
+		assertOpError(t, err, "Parsing nested settings file")
+		var typ *json.UnmarshalTypeError
+		if !errors.As(err, &typ) {
+			t.Fatalf("error = %v, want *json.UnmarshalTypeError", err)
+		}
+	})
+	t.Run("unresolved variable", func(t *testing.T) {
+		t.Setenv("FIX_SETTINGSPRE_UNSET", "")
+		if err := os.Unsetenv("FIX_SETTINGSPRE_UNSET"); err != nil {
+			t.Fatalf("unsetenv: %v", err)
+		}
+		_, err := ParseSettingsFile(t.Context(), writeConfigFixture(t, "s.json", `{"number_of_shards":"${FIX_SETTINGSPRE_UNSET}"}`), template.Variables{})
+		assertOpError(t, err, "Reading settings file")
+		var unresolved *template.UnresolvedError
+		if !errors.As(err, &unresolved) {
+			t.Fatalf("error = %v, want *template.UnresolvedError", err)
+		}
+	})
+}
+
+// TestPreflightIndexInputs pins which file failures preflight reports and in
+// which order, using the create step's own Ops.
+func TestPreflightIndexInputs(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	write := func(name, content string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatalf("write fixture: %v", err)
+		}
+		return path
+	}
+	goodSettings := write("good-settings.json", "{\"settings\":{\"number_of_shards\":1}}\r\n")
+	goodMappings := write("good-mappings.json", "{\"properties\":{}}\r\n")
+	badSettings := write("bad-settings.json", `{"settings":`)
+	badMappings := write("bad-mappings.json", `{"mappings":`)
+	missing := filepath.Join(dir, "missing.json")
+
+	tests := []struct {
+		name     string
+		settings string
+		mappings string
+		wantOp   string
+	}{
+		{"valid", goodSettings, goodMappings, ""},
+		{"both empty", "", "", ""},
+		{"bad settings", badSettings, goodMappings, "Parsing settings file"},
+		{"settings error first", missing, missing, "Reading settings file"},
+		{"malformed mappings", goodSettings, badMappings, "Parsing mappings file"},
+		{"missing mappings", goodSettings, missing, "Reading mappings file"},
+		{"directory mappings", goodSettings, dir, "Reading mappings file"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := PreflightIndexInputs(t.Context(), tt.settings, tt.mappings, nil)
+			if tt.wantOp == "" {
+				if err != nil {
+					t.Fatalf("PreflightIndexInputs: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("want %q failure, got nil", tt.wantOp)
+			}
+			assertOpError(t, err, tt.wantOp)
+		})
+	}
+}
+
+// TestPreflightIndexInputsPreservesCreateBodyAndLogs guards that preflight is
+// silent and that the create body (and its two Info logs) are unchanged and
+// still produced only at create time.
+func TestPreflightIndexInputsPreservesCreateBodyAndLogs(t *testing.T) {
+	t.Parallel()
+
+	const mappings = `{"properties":{"id":{"type":"keyword"}}}`
+	tests := []struct {
+		name         string
+		settings     string
+		wantBody     string
+		wantInjected bool
+	}{
+		{"wrapped nested", `{"settings":{"index":{"number_of_shards":1}}}`,
+			`{"settings": {"default_pipeline":"p","number_of_replicas":1,"number_of_shards":1}, "mappings": ` + mappings + `}`, true},
+		{"raw", `{"number_of_shards":1}`,
+			`{"settings": {"default_pipeline":"p","number_of_replicas":1,"number_of_shards":1}, "mappings": ` + mappings + `}`, true},
+		{"dotted", `{"index.number_of_shards":1}`,
+			`{"settings": {"default_pipeline":"p","number_of_replicas":1,"number_of_shards":1}, "mappings": ` + mappings + `}`, true},
+		{"explicit default wins", `{"default_pipeline":"q","number_of_shards":1}`,
+			`{"settings": {"default_pipeline":"q","number_of_replicas":1,"number_of_shards":1}, "mappings": ` + mappings + `}`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			settingsPath := writeConfigFixture(t, "s.json", tt.settings)
+			mappingsPath := writeConfigFixture(t, "m.json", mappings)
+
+			var buf bytes.Buffer
+			logger := zerolog.New(&buf)
+			ctx := runlog.WithLogger(t.Context(), &logger)
+
+			if err := PreflightIndexInputs(ctx, settingsPath, mappingsPath, nil); err != nil {
+				t.Fatalf("PreflightIndexInputs: %v", err)
+			}
+			if buf.Len() != 0 {
+				t.Fatalf("preflight logged: %s", buf.String())
+			}
+
+			body, err := BuildCreateIndexBody(ctx, 1, "explicit", settingsPath, mappingsPath, "p", nil)
+			if err != nil {
+				t.Fatalf("BuildCreateIndexBody: %v", err)
+			}
+			if body != tt.wantBody {
+				t.Fatalf("body = %s\nwant   %s", body, tt.wantBody)
+			}
+
+			counts := map[string]int{}
+			for _, line := range bytes.Split(bytes.TrimSpace(buf.Bytes()), []byte("\n")) {
+				var ev struct {
+					Level   string `json:"level"`
+					Message string `json:"message"`
+				}
+				if err := json.Unmarshal(line, &ev); err != nil {
+					t.Fatalf("decode log %q: %v", line, err)
+				}
+				if ev.Level == "info" {
+					counts[ev.Message]++
+				}
+			}
+			if counts["Setting index replica count"] != 1 {
+				t.Fatalf("replica logs = %d, want 1 (%v)", counts["Setting index replica count"], counts)
+			}
+			wantInjected := 0
+			if tt.wantInjected {
+				wantInjected = 1
+			}
+			if got := counts["Using first declared pipeline as index.default_pipeline"]; got != wantInjected {
+				t.Fatalf("injection logs = %d, want %d", got, wantInjected)
 			}
 		})
 	}

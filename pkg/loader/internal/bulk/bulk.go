@@ -555,15 +555,35 @@ type Totals struct {
 	Elapsed   time.Duration
 }
 
+// peekDataFile is peekFirstByte with the "Cannot read data file" operation
+// error, shared by Load and CheckDataFile so both fail identically.
+func peekDataFile(ctx context.Context, path string) (byte, error) {
+	first, err := peekFirstByte(path)
+	if err != nil {
+		return 0, runlog.Fail(runlog.FailureEvent(ctx), "Cannot read data file", err)
+	}
+	return first, nil
+}
+
+// CheckDataFile verifies path can be opened and has a first non-whitespace
+// byte, then closes it. Run calls it before destructive steps so an unreadable
+// or empty data file cannot half-reset the cluster. It does not validate the
+// format or the JSON: an unknown first byte or later invalid JSON still fails
+// inside Load.
+func CheckDataFile(ctx context.Context, path string) error {
+	_, err := peekDataFile(ctx, path)
+	return err
+}
+
 // Load detects the data file's format from its first non-whitespace byte
 // (ADR 0003) and loads it into cfg.Index. Batch progress goes to
 // seams.OnProgress; retries wait with seams.Sleep. Bulk item failures are
 // counted in Totals, not returned. A hard failure returns an operation error
 // and zero Totals: the caller must not report partial counts.
 func Load(ctx context.Context, es *elasticsearch.Client, cfg Config, seams progress.Seams) (Totals, error) {
-	first, err := peekFirstByte(cfg.DataFile)
+	first, err := peekDataFile(ctx, cfg.DataFile)
 	if err != nil {
-		return Totals{}, runlog.Fail(runlog.FailureEvent(ctx), "Cannot read data file", err)
+		return Totals{}, err
 	}
 
 	overallStart := seams.Now()
