@@ -225,7 +225,14 @@ func enrichFromOptions(options EnrichOptions) *enrich.Selection {
 	return selection
 }
 
-// classifyRunErrorKind centralizes this code path so package behavior stays consistent.
+// classifyRunErrorKind maps an internal operation error's Op to the public
+// RunError.Kind by case-insensitive substring. The first match wins, in the
+// order: bulk, enrich, managed-resource nouns (pipeline, policy, transform,
+// managed), index/indices/alias, otherwise ErrLoaderExecution.
+// "indices" is listed because it does not contain "index"; without it the
+// timestamped-generation listing Ops in aliasops fell through to
+// ErrLoaderExecution (FIX-LISTKIND-01). Order matters: an Op naming both a
+// managed resource and indices (the nuke pipeline-delete Op) stays managed.
 func classifyRunErrorKind(op string) error {
 	lowered := strings.ToLower(op)
 	switch {
@@ -235,7 +242,7 @@ func classifyRunErrorKind(op string) error {
 		return ErrEnrichExecution
 	case strings.Contains(lowered, "pipeline"), strings.Contains(lowered, "policy"), strings.Contains(lowered, "transform"), strings.Contains(lowered, "managed"):
 		return ErrManagedResource
-	case strings.Contains(lowered, "index"), strings.Contains(lowered, "alias"):
+	case strings.Contains(lowered, "index"), strings.Contains(lowered, "indices"), strings.Contains(lowered, "alias"):
 		return ErrIndexOperation
 	default:
 		return ErrLoaderExecution

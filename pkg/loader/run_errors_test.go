@@ -604,11 +604,51 @@ func TestOperationKindsOfMovedHelpers(t *testing.T) {
 		{"Transform wait failed", ErrManagedResource},
 		{"Reading settings file", ErrLoaderExecution},
 		{"Reading pipeline definitions file", ErrManagedResource},
+		{"listing timestamped indices", ErrIndexOperation},
+		{"Failed to list timestamped indices", ErrIndexOperation},
+		{"Failed to delete pipeline; nuke mode could not find indices using it as default pipeline", ErrManagedResource},
 	}
 	for _, tt := range tests {
 		t.Run(tt.op, func(t *testing.T) {
 			t.Parallel()
 			assertRunError(t, runFailure(failure.New(tt.op, errors.New("cause"))), tt.want, tt.op)
+		})
+	}
+}
+
+// TestTimestampedListingErrorBoundaryPreservesCause guards that correcting the
+// Kind of the generation-listing failures leaves Op, cause and message intact.
+func TestTimestampedListingErrorBoundaryPreservesCause(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		op    string
+		cause error
+	}{
+		{"listing timestamped indices", errors.New("unique transport cause")},
+		{"Failed to list timestamped indices", errors.New("unique status cause")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.op, func(t *testing.T) {
+			t.Parallel()
+
+			got := runFailure(failure.New(tt.op, tt.cause))
+			var runErr *RunError
+			if !errors.As(got, &runErr) {
+				t.Fatalf("runFailure = %T %v, want *RunError", got, got)
+			}
+			if !errors.Is(got, ErrIndexOperation) {
+				t.Fatalf("Kind = %v, want ErrIndexOperation", runErr.Kind)
+			}
+			if runErr.Op != tt.op {
+				t.Fatalf("Op = %q, want %q", runErr.Op, tt.op)
+			}
+			if runErr.Err != tt.cause || !errors.Is(got, tt.cause) {
+				t.Fatalf("Err = %v, want exact cause %v", runErr.Err, tt.cause)
+			}
+			if want := tt.op + ": " + tt.cause.Error(); got.Error() != want {
+				t.Fatalf("message = %q, want %q", got.Error(), want)
+			}
 		})
 	}
 }
@@ -839,10 +879,8 @@ func TestRunStopsAfterDestructiveFailure(t *testing.T) {
 					PipelinesFile: fixture.WriteTempJSON(t, t.TempDir(), stopPipelines),
 				}
 			},
-			// "indices" contains neither "index" nor "alias", so this Op has
-			// always classified as ErrLoaderExecution; pinned, not endorsed.
-			// Tracked as FIX-LISTKIND-01, which flips this to ErrIndexOperation.
-			wantKind:     ErrLoaderExecution,
+			// Generation listing is an index operation: classifyRunErrorKind matches "indices" (FIX-LISTKIND-01).
+			wantKind:     ErrIndexOperation,
 			wantOp:       "Failed to list timestamped indices",
 			wantRequests: []string{"GET /_alias/cards", "DELETE /cards-a", "GET /cards-*"},
 		},
@@ -1170,6 +1208,26 @@ func TestRunStopsAfterLifecycleFailure(t *testing.T) {
 			wantKind:     ErrIndexOperation,
 			wantOp:       "Failed to delete index",
 			wantRequests: []string{"GET /_alias/cards", "GET /cards-*", "DELETE /cards-20260101000000"},
+		},
+		{
+			// Run's aliasops.Prune return when listing <alias>-* fails: no
+			// generation is deleted and the enrich stage after prune must not run.
+			name: "alias prune listing failure stops before generation delete and enrich",
+			setup: func(t *testing.T, _ *opRecorder) (*esstub.Stub, Options) {
+				stub := newRouteStub(t, map[string]http.HandlerFunc{
+					"GET /_alias/cards":            esstub.JSON(http.StatusOK, `{"cards-20260102000000":{}}`),
+					"GET /cards-*":                 replyFail,
+					"DELETE /cards-20260101000000": replyAck,
+					"POST /cards/_refresh":         esstub.JSON(http.StatusOK, refreshBody),
+				}, policyListRoutes(emptyPolicies))
+				return stub, Options{
+					URL: stub.URL(), Index: "cards", AliasMode: true, KeepLast: 1,
+					Enrich: EnrichOptions{Enabled: true, All: true},
+				}
+			},
+			wantKind:     ErrIndexOperation,
+			wantOp:       "Failed to list timestamped indices",
+			wantRequests: []string{"GET /_alias/cards", "GET /cards-*"},
 		},
 		{
 			// Run's post-create requireMappingPreflight return (expected == nil).
