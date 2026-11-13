@@ -180,9 +180,12 @@ type Options struct {
 	FlushIndex bool
 	// SyncManaged upserts the declared pipelines, policies and transforms, and
 	// garbage-collects unreferenced policy versions. Both run only when the
-	// index or alias target exists or this run creates it: a sync-only run
-	// against a missing index with no settings or mappings file creates,
-	// upserts and deletes nothing, and still succeeds. Alias -delete implies
+	// index or alias target exists or this run creates it. A sync-only run
+	// (no data action, no Nuke) whose index or alias resolves to nothing and
+	// that has neither SettingsFile nor MappingsFile fails with
+	// ErrIndexOperation before any cluster write, naming the resources it
+	// would have synced; supply a settings or mappings file, or a data action.
+	// A Nuke run is not rejected by this rule. Alias -delete implies
 	// SyncManaged, with a warning, when it is not set.
 	SyncManaged bool
 	// AliasMode treats Index as an alias. Creating or recreating the index makes
@@ -699,6 +702,19 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 		}
 	}
 
+	// FIX-SYNCNOOP-01: a sync-only run with no target and no settings/mappings
+	// to create one used to skip every managed upsert and report success. Fail
+	// here, before any write (create, upsert, nuke, prune, enrich), so a typo
+	// or an uncreated alias cannot look like a completed sync. Nuke runs are a
+	// separate reset-only case and are excluded.
+	if effectiveSyncManaged && action == dataActionNone && !*nuke && !exists && *settingsFile == "" && *mappingsFile == "" {
+		return result, &RunError{
+			Kind: ErrIndexOperation,
+			Op:   "checking index for sync-only run",
+			Err:  syncTargetMissingError(*aliasMode, *index, pipelineNames, policyPlan.LogicalNames, transformNames),
+		}
+	}
+
 	if *nuke {
 		if *aliasMode {
 			if len(aliasTargets) > 0 {
@@ -1010,10 +1026,11 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 
 // SyncManaged runs Run with every data action and Nuke cleared and SyncManaged
 // set. It loads no documents. It creates the index only when it is missing and
-// settings or mappings are supplied. It upserts managed resources and
-// garbage-collects unreferenced policy versions only when the index exists or
-// is created (see Options.SyncManaged). With AliasMode and KeepLast > 0 it
-// still prunes older generations.
+// settings or mappings are supplied; a missing index or alias without either
+// fails with ErrIndexOperation before any write (see Options.SyncManaged). It
+// upserts managed resources and garbage-collects unreferenced policy versions
+// when the index exists or is created. With AliasMode and KeepLast > 0 it
+// still prunes older generations after a successful sync.
 func SyncManaged(ctx context.Context, opts Options) (Result, error) {
 	opts.AddToIndex = false
 	opts.FlushIndex = false
@@ -1039,8 +1056,9 @@ func LoadData(ctx context.Context, opts Options) (Result, error) {
 // EnrichOptions precedence applies: a non-empty Policies wins, then All, then
 // Raw. SyncManaged passes through unchanged, so when set it still upserts
 // managed resources and garbage-collects policy versions (see
-// Options.SyncManaged), and AliasMode with KeepLast > 0 still prunes older
-// generations.
+// Options.SyncManaged, including its failure when the target is missing and no
+// settings or mappings can create it), and AliasMode with KeepLast > 0 still
+// prunes older generations.
 func ExecuteEnrich(ctx context.Context, opts Options) (Result, error) {
 	opts.AddToIndex = false
 	opts.FlushIndex = false
@@ -1076,6 +1094,20 @@ func logEffectiveManagedAssets(ctx context.Context, index, settingsFile, mapping
 		Int("transforms_declared", len(logicalTransformNames)).
 		Int("transforms_selected", len(selectedTransformNames)).
 		Msg("Effective managed assets resolved")
+}
+
+// syncTargetMissingError builds the cause for a sync-only run whose target is
+// absent and which has no settings or mappings to create it. The names stay in
+// the cause, not the Op, so resource names cannot change the error Kind.
+func syncTargetMissingError(aliasMode bool, index string, pipelines, policies, transforms []string) error {
+	target := fmt.Sprintf("index %q does not exist", index)
+	if aliasMode {
+		target = fmt.Sprintf("alias %q resolves to no index and no concrete index has that name", index)
+	}
+	return fmt.Errorf("-sync-managed without a data action cannot sync because %s; nothing was synced (%s); "+
+		"supply -settings or -mappings so the index can be created, or choose a data action "+
+		"(-add, -flush or -delete, which also requires -data)",
+		target, managed.DescribeDeclared(pipelines, policies, transforms))
 }
 
 // displayManagedAsset returns the trimmed file path for logs, or "none" when the option is unset.

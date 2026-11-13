@@ -13,7 +13,9 @@
 //  2. Read and template-expand every input file, resolve managed policy names,
 //     and preflight the settings, mappings and data file.
 //
-//  3. Look up the alias targets or the index.
+//  3. Look up the alias targets or the index. A sync-only run (no data action, no
+//     -nuke) whose target is missing and that has no -settings or -mappings
+//     fails here with ErrIndexOperation, naming the resources it would have synced.
 //
 //  4. -nuke: delete the alias targets and timestamped generations, or the index,
 //     then the declared managed resources.

@@ -227,6 +227,13 @@ func TestEndToEndScenarios(t *testing.T) {
 			checks: "fails with the data format error before -delete; the seeded index and its two documents remain",
 			run:    scenarioDataFormatUnknownFailsBeforeDelete,
 		},
+		{
+			// Appended last: the slice index sets each scenario's e2e-NN prefix.
+			name:   "sync-managed_missing_index_fails",
+			flags:  "-sync-managed (absent index, no data action, settings or mappings)",
+			checks: "fails naming the index, declared resources and the remedy; no index, pipelines or policy versions are created",
+			run:    scenarioSyncManagedMissingIndexFails,
+		},
 	}
 
 	for i, sc := range scenarios {
@@ -666,6 +673,37 @@ func scenarioDataFormatUnknownFailsBeforeDelete(t *testing.T, ctx *scenarioConte
 
 	assertIndexExists(t, ctx, ctx.sourceIndex)
 	assertDocCount(t, ctx, ctx.sourceIndex, 2)
+}
+
+// scenarioSyncManagedMissingIndexFails guards FIX-SYNCNOOP-01: a sync-only run
+// against an absent index with no settings or mappings must fail with a
+// diagnostic instead of reporting a sync that upserted nothing, and must leave
+// the cluster untouched.
+func scenarioSyncManagedMissingIndexFails(t *testing.T, ctx *scenarioContext) {
+	assertIndexMissing(t, ctx, ctx.sourceIndex)
+	assertPipelineMissing(t, ctx, ctx.sourcePipelinePrimary)
+	assertPipelineMissing(t, ctx, ctx.sourcePipelineSecondary)
+	assertPolicyMissing(t, ctx, ctx.sourcePolicy)
+
+	// Not sourceArgs: it always supplies settings, mappings and data.
+	result := runLoader(t, ctx, nil, []string{
+		"-url", ctx.env.esURL,
+		"-index", ctx.sourceIndex,
+		"-pipelines", filepath.Join(ctx.sourceBaseDir, "pipelines.json"),
+		"-policies", filepath.Join(ctx.sourceBaseDir, "policies.json"),
+		"-sync-managed",
+	})
+	mustFailWith(t, result, "-sync-managed without a data action cannot sync because index")
+	mustContain(t, result.output, ctx.sourceIndex)
+	mustContain(t, result.output, ctx.sourcePipelinePrimary)
+	mustContain(t, result.output, ctx.sourcePipelineSecondary)
+	mustContain(t, result.output, ctx.sourcePolicy)
+	mustContain(t, result.output, "-settings or -mappings")
+
+	assertIndexMissing(t, ctx, ctx.sourceIndex)
+	assertPipelineMissing(t, ctx, ctx.sourcePipelinePrimary)
+	assertPipelineMissing(t, ctx, ctx.sourcePipelineSecondary)
+	assertPolicyMissing(t, ctx, ctx.sourcePolicy)
 }
 
 // scenarioAliasFlushStaleTargetFailsBeforeFlush guards that every target of a

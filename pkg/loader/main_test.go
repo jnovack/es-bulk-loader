@@ -1017,6 +1017,467 @@ func TestRunCreatesPipelinesBeforeIndexWhenDefaultPipelineIsConfigured(t *testin
 	assertOperationOrder(t, stub.operations(), "pipeline.put", "index.create")
 }
 
+// syncOnlyPolicies is a keyed policy file wrapping stopPolicyBody under the
+// logical name "pol".
+const syncOnlyPolicies = `{"pol":` + stopPolicyBody + `}`
+
+// syncOnlyTransforms adds a transform for another source index to
+// stopTransforms, to prove only transforms selected for "cards" are listed.
+var syncOnlyTransforms = strings.TrimSuffix(stopTransforms, "}") +
+	`,"tx-other":{"source_index":"other","body":{"source":{"index":"other"},"dest":{"index":"dest"},"pivot":{}}}}`
+
+// syncOnlyDeclared writes the pipelines, policies and transforms fixtures and
+// sets them on opts.
+func syncOnlyDeclared(t *testing.T, opts Options, pipelines, policies, transforms string) Options {
+	t.Helper()
+	dir := t.TempDir()
+	if pipelines != "" {
+		opts.PipelinesFile = fixture.WriteTempJSON(t, dir, pipelines)
+	}
+	if policies != "" {
+		opts.PoliciesFile = fixture.WriteTempJSON(t, dir, policies)
+	}
+	if transforms != "" {
+		opts.TransformsFile = fixture.WriteTempJSON(t, dir, transforms)
+	}
+	return opts
+}
+
+// assertReadOnlyTrace fails unless the trace is non-empty, holds only GET and
+// HEAD requests, and contains every wanted "METHOD /path" read.
+func assertReadOnlyTrace(t *testing.T, stub *esstub.Stub, wantReads ...string) {
+	t.Helper()
+	requests := stub.Requests()
+	if len(requests) == 0 {
+		t.Fatal("no requests reached the stub; the target lookup was not exercised")
+	}
+	seen := make([]string, 0, len(requests))
+	for _, r := range requests {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			t.Errorf("write request before the sync-only failure: %s %s", r.Method, r.Path)
+		}
+		seen = append(seen, r.Method+" "+r.Path)
+	}
+	for _, want := range wantReads {
+		if !slices.Contains(seen, want) {
+			t.Errorf("missing read %q in trace %q", want, seen)
+		}
+	}
+}
+
+// TestRunSyncOnlyMissingTargetFails guards FIX-SYNCNOOP-01: a sync-only,
+// no-nuke run whose index or alias is absent and that has no settings or
+// mappings used to skip every managed upsert and report success. It must fail
+// with ErrIndexOperation under a fixed Op before any write. Resource names stay
+// in the cause, so a name containing a classifier keyword cannot change Kind.
+func TestRunSyncOnlyMissingTargetFails(t *testing.T) {
+	t.Parallel()
+
+	const wantOp = "checking index for sync-only run"
+	remedy := []string{"nothing was synced", "-settings or -mappings", "-add, -flush or -delete", "-data"}
+	plainReads := []string{"HEAD /cards"}
+	aliasReads := []string{"GET /_alias/cards", "HEAD /cards"}
+	allDeclared := func(t *testing.T, opts Options) Options {
+		return syncOnlyDeclared(t, opts, stopPipelines, syncOnlyPolicies, syncOnlyTransforms)
+	}
+	missingStub := func(t *testing.T) *esstub.Stub {
+		return newPreflightRunStub(t, preflightStubConfig{}).Stub
+	}
+
+	tests := []struct {
+		name         string
+		entry        func(context.Context, Options) (Result, error)
+		stub         func(t *testing.T) *esstub.Stub
+		opts         func(t *testing.T, url string) Options
+		wantReads    []string
+		wantExact    []string
+		wantContains []string
+		wantAbsent   []string
+	}{
+		{
+			name: "plain missing index",
+			stub: missingStub,
+			opts: func(t *testing.T, url string) Options {
+				return syncOnlyDeclared(t, Options{URL: url, Index: "cards", SyncManaged: true}, stopPipelines, syncOnlyPolicies, "")
+			},
+			wantReads:    plainReads,
+			wantContains: append([]string{`index "cards"`, "pipelines [p1, p2]", "policies [pol]", "no transforms"}, remedy...),
+		},
+		{
+			name: "missing alias",
+			stub: missingStub,
+			opts: func(t *testing.T, url string) Options {
+				return syncOnlyDeclared(t, Options{URL: url, Index: "cards", AliasMode: true, SyncManaged: true}, stopPipelines, syncOnlyPolicies, "")
+			},
+			wantReads:    aliasReads,
+			wantContains: append([]string{`alias "cards" resolves to no index and no concrete index has that name`, "pipelines [p1, p2]"}, remedy...),
+		},
+		{
+			name: "all resource kinds list selected transforms and logical policy",
+			stub: missingStub,
+			opts: func(t *testing.T, url string) Options {
+				return allDeclared(t, Options{URL: url, Index: "cards", SyncManaged: true})
+			},
+			wantReads:    plainReads,
+			wantContains: []string{"pipelines [p1, p2]", "policies [pol]", "transforms [tx1, tx2]"},
+			wantAbsent:   []string{"tx-other", managedPolicyName(t, "pol", stopPolicyBody)},
+		},
+		{
+			name: "no declarations",
+			stub: missingStub,
+			opts: func(_ *testing.T, url string) Options {
+				return Options{URL: url, Index: "cards", SyncManaged: true}
+			},
+			wantReads:    plainReads,
+			wantContains: []string{"no pipelines, policies or transforms are declared for this run"},
+		},
+		{
+			name: "sync plus enrich fails before refresh",
+			stub: missingStub,
+			opts: func(t *testing.T, url string) Options {
+				return syncOnlyDeclared(t, Options{URL: url, Index: "cards", SyncManaged: true, Enrich: EnrichOptions{Enabled: true, All: true}}, stopPipelines, syncOnlyPolicies, "")
+			},
+			wantReads:    plainReads,
+			wantContains: []string{`index "cards"`},
+		},
+		{
+			name:  "SyncManaged wrapper clears seeded actions and nuke",
+			entry: SyncManaged,
+			stub:  missingStub,
+			opts: func(t *testing.T, url string) Options {
+				return syncOnlyDeclared(t, Options{URL: url, Index: "cards", AddToIndex: true, Nuke: true}, stopPipelines, "", "")
+			},
+			wantReads:    plainReads,
+			wantContains: []string{`index "cards"`, "pipelines [p1, p2]"},
+		},
+		{
+			name:  "ExecuteEnrich wrapper with sync enabled",
+			entry: ExecuteEnrich,
+			stub:  missingStub,
+			opts: func(t *testing.T, url string) Options {
+				return syncOnlyDeclared(t, Options{URL: url, Index: "cards", SyncManaged: true}, stopPipelines, syncOnlyPolicies, "")
+			},
+			wantReads:    plainReads,
+			wantContains: []string{`index "cards"`, "policies [pol]"},
+		},
+		{
+			name: "missing alias with retention never prunes",
+			stub: func(t *testing.T) *esstub.Stub {
+				return newRouteStub(t, map[string]http.HandlerFunc{
+					"GET /_alias/cards":            esstub.JSON(http.StatusNotFound, `{"error":{"type":"aliases_not_found_exception"},"status":404}`),
+					"HEAD /cards":                  replyHeadMissing,
+					"GET /cards-*":                 esstub.JSON(http.StatusOK, `{"cards-20260101000000":{},"cards-20260102000000":{}}`),
+					"DELETE /cards-20260101000000": replyAck,
+					"DELETE /cards-20260102000000": replyAck,
+				})
+			},
+			opts: func(_ *testing.T, url string) Options {
+				return Options{URL: url, Index: "cards", AliasMode: true, SyncManaged: true, KeepLast: 1}
+			},
+			wantExact:    aliasReads,
+			wantContains: []string{`alias "cards"`},
+		},
+		{
+			name: "resource names containing classifier keywords keep the fixed Op",
+			stub: missingStub,
+			opts: func(t *testing.T, url string) Options {
+				return syncOnlyDeclared(t, Options{URL: url, Index: "cards", SyncManaged: true}, `{"bulk-enrich-managed":{"processors":[]}}`, "", "")
+			},
+			wantReads:    plainReads,
+			wantContains: []string{"pipelines [bulk-enrich-managed]"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			stub := tt.stub(t)
+			entry := tt.entry
+			if entry == nil {
+				entry = Run
+			}
+			nop := zerolog.Nop()
+			opts := tt.opts(t, stub.URL())
+			opts.Logger = &nop
+
+			_, err := entry(t.Context(), opts)
+			if err == nil {
+				t.Fatal("expected a sync-only missing-target error, got nil")
+			}
+			if !errors.Is(err, ErrIndexOperation) {
+				t.Fatalf("errors.Is(err, ErrIndexOperation) = false for %v", err)
+			}
+			var runErr *RunError
+			if !errors.As(err, &runErr) {
+				t.Fatalf("error %T is not a *RunError", err)
+			}
+			if runErr.Kind != ErrIndexOperation || runErr.Op != wantOp {
+				t.Fatalf("Kind/Op = %v/%q, want %v/%q", runErr.Kind, runErr.Op, ErrIndexOperation, wantOp)
+			}
+			if runErr.Err == nil {
+				t.Fatal("RunError.Err is nil; the diagnostic must live in the cause")
+			}
+			msg := runErr.Err.Error()
+			for _, want := range tt.wantContains {
+				if !strings.Contains(msg, want) {
+					t.Errorf("cause %q does not contain %q", msg, want)
+				}
+			}
+			for _, absent := range tt.wantAbsent {
+				if strings.Contains(msg, absent) {
+					t.Errorf("cause %q must not contain %q", msg, absent)
+				}
+			}
+			assertReadOnlyTrace(t, stub, tt.wantReads...)
+			if tt.wantExact != nil {
+				var got []string
+				for _, r := range stub.Requests() {
+					got = append(got, r.Method+" "+r.Path)
+				}
+				if !slices.Equal(got, tt.wantExact) {
+					t.Fatalf("trace = %q, want exactly %q", got, tt.wantExact)
+				}
+			}
+		})
+	}
+}
+
+// TestRunSyncOnlyLookupErrorsKeepOriginalOp guards that the new check sits
+// after the lookup: a failed lookup must surface its own Op, not masquerade as
+// an absent target.
+func TestRunSyncOnlyLookupErrorsKeepOriginalOp(t *testing.T) {
+	t.Parallel()
+
+	notFound := esstub.JSON(http.StatusNotFound, `{"error":{"type":"aliases_not_found_exception"},"status":404}`)
+	tests := []struct {
+		name      string
+		alias     bool
+		routes    map[string]http.HandlerFunc
+		wantOp    string
+		wantReads []string
+	}{
+		{"plain HEAD 500", false, map[string]http.HandlerFunc{"HEAD /cards": replyFail}, "checking if index exists", []string{"HEAD /cards"}},
+		{"alias GET 500", true, map[string]http.HandlerFunc{"GET /_alias/cards": replyFail}, "Failed to resolve alias targets", []string{"GET /_alias/cards"}},
+		{"alias 404 then fallback HEAD 500", true, map[string]http.HandlerFunc{"GET /_alias/cards": notFound, "HEAD /cards": replyFail}, "checking if index exists", []string{"GET /_alias/cards", "HEAD /cards"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			stub := newRouteStub(t, tt.routes)
+			nop := zerolog.Nop()
+			_, err := Run(t.Context(), Options{URL: stub.URL(), Index: "cards", AliasMode: tt.alias, SyncManaged: true, Logger: &nop})
+			var runErr *RunError
+			if !errors.As(err, &runErr) {
+				t.Fatalf("expected *RunError, got %v", err)
+			}
+			if runErr.Kind != ErrIndexOperation {
+				t.Fatalf("Kind = %v, want ErrIndexOperation", runErr.Kind)
+			}
+			if runErr.Op == "checking index for sync-only run" {
+				t.Fatalf("lookup failure reported as a missing target: %v", err)
+			}
+			if runErr.Op != tt.wantOp {
+				t.Fatalf("Op = %q, want %q", runErr.Op, tt.wantOp)
+			}
+			assertReadOnlyTrace(t, stub, tt.wantReads...)
+		})
+	}
+}
+
+// TestRunSyncOnlyBoundariesStillSucceed guards the edges of the FIX-SYNCNOOP-01
+// rule: an existing target, a creating input, a data action, or -nuke must not
+// be rejected.
+func TestRunSyncOnlyBoundariesStillSucceed(t *testing.T) {
+	t.Parallel()
+
+	const pipelinesOnly = `{"p1":{"processors":[]}}`
+	mappings := `{"mappings":{"properties":{"id":{"type":"keyword"}}}}`
+	settings := `{"settings":{"number_of_shards":1}}`
+	hasOp := func(ops []string, op string) bool { return slices.Contains(ops, op) }
+
+	tests := []struct {
+		name  string
+		cfg   lifecycleConfig
+		opts  func(t *testing.T, url string) Options
+		entry func(context.Context, Options) (Result, error)
+		check func(t *testing.T, s *lifecycleStub)
+	}{
+		{
+			name: "existing index with pipelines",
+			cfg:  lifecycleConfig{index: "cards", indexExists: true},
+			opts: func(t *testing.T, url string) Options {
+				return syncOnlyDeclared(t, Options{URL: url, Index: "cards", SyncManaged: true}, pipelinesOnly, "", "")
+			},
+			check: func(t *testing.T, s *lifecycleStub) {
+				if ops := s.operations(); !hasOp(ops, "pipeline.put") || hasOp(ops, "index.create") {
+					t.Fatalf("operations = %q, want pipeline.put without index.create", ops)
+				}
+			},
+		},
+		{
+			name: "existing alias targets",
+			cfg:  lifecycleConfig{index: "cards", aliasTargets: []string{"cards-20260101000000"}},
+			opts: func(t *testing.T, url string) Options {
+				return syncOnlyDeclared(t, Options{URL: url, Index: "cards", AliasMode: true, SyncManaged: true}, pipelinesOnly, "", "")
+			},
+			check: func(t *testing.T, s *lifecycleStub) {
+				if ops := s.operations(); !hasOp(ops, "pipeline.put") || hasOp(ops, "index.create") {
+					t.Fatalf("operations = %q, want pipeline.put without index.create", ops)
+				}
+			},
+		},
+		{
+			name: "concrete index with the alias name",
+			cfg:  lifecycleConfig{index: "cards", indexExists: true},
+			opts: func(t *testing.T, url string) Options {
+				return syncOnlyDeclared(t, Options{URL: url, Index: "cards", AliasMode: true, SyncManaged: true}, pipelinesOnly, "", "")
+			},
+			check: func(t *testing.T, s *lifecycleStub) {
+				if ops := s.operations(); !hasOp(ops, "pipeline.put") || hasOp(ops, "index.create") {
+					t.Fatalf("operations = %q, want pipeline.put without index.create", ops)
+				}
+			},
+		},
+		{
+			name: "missing index with mappings creates it",
+			cfg:  lifecycleConfig{index: "cards"},
+			opts: func(t *testing.T, url string) Options {
+				o := syncOnlyDeclared(t, Options{URL: url, Index: "cards", SyncManaged: true}, pipelinesOnly, "", "")
+				o.MappingsFile = fixture.WriteTempJSON(t, t.TempDir(), mappings)
+				return o
+			},
+			check: func(t *testing.T, s *lifecycleStub) {
+				if got := s.createdIndices(); !slices.Equal(got, []string{"cards"}) {
+					t.Fatalf("created = %q, want [cards]", got)
+				}
+				if !hasOp(s.operations(), "pipeline.put") {
+					t.Fatalf("operations = %q, want pipeline.put", s.operations())
+				}
+			},
+		},
+		{
+			name: "missing index with settings creates it",
+			cfg:  lifecycleConfig{index: "cards"},
+			opts: func(t *testing.T, url string) Options {
+				o := syncOnlyDeclared(t, Options{URL: url, Index: "cards", SyncManaged: true}, pipelinesOnly, "", "")
+				o.SettingsFile = fixture.WriteTempJSON(t, t.TempDir(), settings)
+				return o
+			},
+			check: func(t *testing.T, s *lifecycleStub) {
+				if got := s.createdIndices(); !slices.Equal(got, []string{"cards"}) {
+					t.Fatalf("created = %q, want [cards]", got)
+				}
+				if !hasOp(s.operations(), "pipeline.put") {
+					t.Fatalf("operations = %q, want pipeline.put", s.operations())
+				}
+			},
+		},
+		{
+			name: "missing alias with mappings creates a generation and repoints",
+			cfg:  lifecycleConfig{index: "cards"},
+			opts: func(t *testing.T, url string) Options {
+				o := syncOnlyDeclared(t, Options{URL: url, Index: "cards", AliasMode: true, SyncManaged: true}, pipelinesOnly, "", "")
+				o.MappingsFile = fixture.WriteTempJSON(t, t.TempDir(), mappings)
+				return o
+			},
+			check: func(t *testing.T, s *lifecycleStub) {
+				created := s.createdIndices()
+				if len(created) != 1 || !strings.HasPrefix(created[0], "cards-") {
+					t.Fatalf("created = %q, want one cards-<timestamp> generation", created)
+				}
+				assertOperationOrder(t, s.operations(), "pipeline.put", "index.create", "alias.update")
+			},
+		},
+		{
+			name: "-add with sync creates and loads",
+			cfg:  lifecycleConfig{index: "cards"},
+			opts: func(t *testing.T, url string) Options {
+				return Options{URL: url, Index: "cards", SyncManaged: true, AddToIndex: true, DataFile: writeBulkDataFixture(t)}
+			},
+			check: assertCreatedAndLoaded,
+		},
+		{
+			name: "-flush with sync creates and loads",
+			cfg:  lifecycleConfig{index: "cards"},
+			opts: func(t *testing.T, url string) Options {
+				return Options{URL: url, Index: "cards", SyncManaged: true, FlushIndex: true, DataFile: writeBulkDataFixture(t)}
+			},
+			check: assertCreatedAndLoaded,
+		},
+		{
+			name: "-delete with sync creates and loads",
+			cfg:  lifecycleConfig{index: "cards"},
+			opts: func(t *testing.T, url string) Options {
+				return Options{URL: url, Index: "cards", SyncManaged: true, DeleteIndex: true, DataFile: writeBulkDataFixture(t)}
+			},
+			check: assertCreatedAndLoaded,
+		},
+		{
+			name:  "LoadData with sync selects add",
+			cfg:   lifecycleConfig{index: "cards"},
+			entry: LoadData,
+			opts: func(t *testing.T, url string) Options {
+				return Options{URL: url, Index: "cards", SyncManaged: true, DataFile: writeBulkDataFixture(t)}
+			},
+			check: assertCreatedAndLoaded,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			stub := newLifecycleStub(t, tt.cfg)
+			entry := tt.entry
+			if entry == nil {
+				entry = Run
+			}
+			nop := zerolog.Nop()
+			opts := tt.opts(t, stub.URL())
+			opts.Logger = &nop
+			if _, err := entry(t.Context(), opts); err != nil {
+				t.Fatalf("run returned error: %v", err)
+			}
+			tt.check(t, stub)
+		})
+	}
+
+	t.Run("nuke with sync and no data or index inputs still resets", func(t *testing.T) {
+		t.Parallel()
+		stub := newRouteStub(t, map[string]http.HandlerFunc{
+			"HEAD /cards":                     replyHeadMissing,
+			"DELETE /_ingest/pipeline/{name}": replyAck,
+		})
+		nop := zerolog.Nop()
+		opts := syncOnlyDeclared(t, Options{URL: stub.URL(), Index: "cards", SyncManaged: true, Nuke: true, Logger: &nop}, stopPipelines, "", "")
+		if _, err := Run(t.Context(), opts); err != nil {
+			t.Fatalf("run returned error: %v", err)
+		}
+		var deleted []string
+		for _, r := range stub.Requests() {
+			switch r.Method {
+			case http.MethodDelete:
+				deleted = append(deleted, r.Path)
+			case http.MethodPut, http.MethodPost:
+				t.Errorf("unexpected write after nuke reset: %s %s", r.Method, r.Path)
+			}
+		}
+		slices.Sort(deleted)
+		if want := []string{"/_ingest/pipeline/p1", "/_ingest/pipeline/p2"}; !slices.Equal(deleted, want) {
+			t.Fatalf("deleted = %q, want %q", deleted, want)
+		}
+	})
+}
+
+// assertCreatedAndLoaded checks that the run created the index and loaded data.
+func assertCreatedAndLoaded(t *testing.T, s *lifecycleStub) {
+	t.Helper()
+	ops := s.operations()
+	if !slices.Contains(ops, "index.create") || !slices.Contains(ops, "bulk") {
+		t.Fatalf("operations = %q, want index.create and bulk", ops)
+	}
+}
+
 // TestRunRetriesBulkOnRetryableStatus guards that a retryable HTTP status on a bulk request is retried.
 func TestRunRetriesBulkOnRetryableStatus(t *testing.T) {
 	t.Parallel()

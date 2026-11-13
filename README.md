@@ -287,8 +287,9 @@ The loader now separates three concerns:
 1. `-nuke` removes the current index and declared managed resources first.
 2. One optional data action, exactly one of `-add`, `-flush`, or `-delete`,
    controls how documents are handled.
-3. `-sync-managed` independently creates or updates declared pipelines,
-   policies, and transforms.
+3. `-sync-managed` creates or updates declared pipelines, policies, and
+   transforms. Without a data action or `-nuke`, it needs an existing index or
+   alias, or `-settings`/`-mappings` that let it create one.
 
 When combined, the execution order is:
 
@@ -403,7 +404,7 @@ Settings can be loaded from a configuration file (e.g.
 | `-add` | Append data to an existing index, or create the index and load data if it does not exist |
 | `-flush` | Remove existing documents, keep the existing index structure, then load replacement data |
 | `-delete` | Recreate data target and reload data: concrete index is deleted/recreated in normal mode; alias mode creates a new timestamped index and repoints alias |
-| `-sync-managed` | Create or update declared pipelines, policies, and transforms without changing document data by itself |
+| `-sync-managed` | Create or update declared pipelines, policies, and transforms without changing document data by itself. With no data action and no `-nuke`, a missing index or alias and no `-settings`/`-mappings` fails with `ErrIndexOperation` before any write; supply `-settings` or `-mappings`, or choose `-add`, `-flush` or `-delete` (with `-data`) |
 | `-nuke` | Remove the current index and declared managed resources first; if combined with another action, that action runs afterward |
 | `-alias` | Treat `-index` as an alias and use timestamped concrete index names (`<alias>-YYYYMMDDHHMMSS`) when a new index is created |
 | `-keep-last` | With `-alias`, prune older timestamped concrete indices after the run and keep only the newest N by parsed timestamp suffix |

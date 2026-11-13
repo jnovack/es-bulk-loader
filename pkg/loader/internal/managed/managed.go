@@ -360,6 +360,27 @@ func RemapEnrichSelection(ctx context.Context, selection *enrich.Selection, logi
 	return &cloned
 }
 
+// DescribeDeclared renders the resources a sync would have applied, for
+// operator-facing errors: "pipelines [a, b]; no policies; transforms [t]", or
+// one sentence when all three are empty. Input order is kept and the slices are
+// not modified. Names only: no bodies or other configuration.
+func DescribeDeclared(pipelines, policies, transforms []string) string {
+	if len(pipelines) == 0 && len(policies) == 0 && len(transforms) == 0 {
+		return "no pipelines, policies or transforms are declared for this run"
+	}
+	describe := func(kind string, names []string) string {
+		if len(names) == 0 {
+			return "no " + kind
+		}
+		return kind + " [" + strings.Join(names, ", ") + "]"
+	}
+	return strings.Join([]string{
+		describe("pipelines", pipelines),
+		describe("policies", policies),
+		describe("transforms", transforms),
+	}, "; ")
+}
+
 // GarbageCollectPolicies deletes, best effort, managed generations of the
 // declared policies that are not desired and no pipeline references.
 func GarbageCollectPolicies(ctx context.Context, es *elasticsearch.Client, logicalNames []string, desiredSet map[string]struct{}) error {

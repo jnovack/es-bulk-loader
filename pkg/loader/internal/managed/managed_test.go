@@ -444,3 +444,31 @@ func TestAmbiguousPolicyOpExcludesCandidates(t *testing.T) {
 		t.Fatalf("error = %#v, want Op %q exactly", err, "Ambiguous policy reference")
 	}
 }
+
+// TestDescribeDeclared pins the operator-facing resource list used by the
+// sync-only missing-target error (FIX-SYNCNOOP-01): category order, input
+// order, and an explicit statement when nothing is declared.
+func TestDescribeDeclared(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name                            string
+		pipelines, policies, transforms []string
+		want                            string
+	}{
+		{"nil", nil, nil, nil, "no pipelines, policies or transforms are declared for this run"},
+		{"empty non-nil", []string{}, []string{}, []string{}, "no pipelines, policies or transforms are declared for this run"},
+		{"pipelines only", []string{"p1"}, nil, nil, "pipelines [p1]; no policies; no transforms"},
+		{"policies only", nil, []string{"pol"}, nil, "no pipelines; policies [pol]; no transforms"},
+		{"transforms only", nil, nil, []string{"tx"}, "no pipelines; no policies; transforms [tx]"},
+		{"all populated", []string{"p1", "p2"}, []string{"pol"}, []string{"tx1", "tx2"}, "pipelines [p1, p2]; policies [pol]; transforms [tx1, tx2]"},
+		{"declaration order kept", []string{"zeta", "alpha"}, nil, nil, "pipelines [zeta, alpha]; no policies; no transforms"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := DescribeDeclared(tt.pipelines, tt.policies, tt.transforms); got != tt.want {
+				t.Fatalf("DescribeDeclared() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
