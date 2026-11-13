@@ -3,6 +3,7 @@ package loader
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1312,6 +1313,54 @@ func TestSelectedDataAction(t *testing.T) {
 			}
 			if got != tt.want {
 				t.Fatalf("selectedDataAction(%t, %t, %t) = %q, want %q", tt.addToIndex, tt.flushIndex, tt.deleteIndex, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestRunBasicAuthHeader pins what Run sends on the wire for each auth mode.
+// Credentials must reach the client verbatim (no trimming or escaping), and
+// an anonymous run must send no Authorization header at all. Stub URLs carry
+// no userinfo, so these rows say nothing about URL-embedded credentials.
+func TestRunBasicAuthHeader(t *testing.T) {
+	t.Parallel()
+	basic := func(creds string) string { return "Basic " + base64.StdEncoding.EncodeToString([]byte(creds)) }
+	tests := []struct {
+		name       string
+		user, pass string
+		apiKey     string
+		want       string // expected Authorization header; empty means absent
+	}{
+		{name: "basic", user: "u", pass: "p", want: basic("u:p")},
+		{name: "anonymous", want: ""},
+		{name: "api key only", apiKey: "k", want: "APIKey k"},
+		{name: "verbatim spaces and colon", user: "us er", pass: "p:a ss", want: basic("us er:p:a ss")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			stub := esstub.New(t)
+			stub.Handle("HEAD /cards", esstub.JSON(http.StatusOK, ""))
+			_, err := Run(t.Context(), Options{
+				URL: stub.URL(), Index: "cards", SyncManaged: true,
+				User: tt.user, Pass: tt.pass, APIKey: tt.apiKey,
+			})
+			if err != nil {
+				t.Fatalf("Run returned error: %v", err)
+			}
+			requests := stub.Requests()
+			if len(requests) != 1 {
+				t.Fatalf("requests = %v, want exactly one", requests)
+			}
+			values := requests[0].Header.Values("Authorization")
+			if tt.want == "" {
+				if len(values) != 0 {
+					t.Fatalf("Authorization = %v, want absent", values)
+				}
+				return
+			}
+			if len(values) != 1 || values[0] != tt.want {
+				t.Fatalf("Authorization = %v, want [%q]", values, tt.want)
 			}
 		})
 	}

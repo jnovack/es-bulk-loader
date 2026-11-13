@@ -214,8 +214,9 @@ type Options struct {
 	// BulkRetryBackoffMax caps exponential bulk retry waits. A value below
 	// BulkRetryBackoffBase is raised to it.
 	BulkRetryBackoffMax time.Duration
-	// User and Pass enable basic auth together; both must be non-empty. A lone
-	// User or Pass is currently ignored rather than rejected.
+	// User and Pass enable basic auth together; both must be non-empty. Setting
+	// exactly one of them fails Run with ErrInvalidOptions before any request;
+	// leaving both empty allows anonymous access.
 	User string
 	// Pass is the basic-auth password; see User.
 	Pass string
@@ -496,6 +497,16 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 
 	if (*user != "" || *pass != "") && *apiKey != "" {
 		return result, &RunError{Kind: ErrInvalidOptions, Op: "validating auth options", Err: fmt.Errorf("cannot use both basic auth and API key")}
+	}
+	// A lone credential used to be dropped silently, connecting anonymously
+	// and reporting success. Reject it here, before any I/O. The API-key
+	// conflict check above stays first so its message wins for prior inputs.
+	// Messages name the missing field only, never a credential value.
+	if *user != "" && *pass == "" {
+		return result, &RunError{Kind: ErrInvalidOptions, Op: "validating auth options", Err: fmt.Errorf("basic auth requires both -user and -pass: -pass is empty")}
+	}
+	if *user == "" && *pass != "" {
+		return result, &RunError{Kind: ErrInvalidOptions, Op: "validating auth options", Err: fmt.Errorf("basic auth requires both -user and -pass: -user is empty")}
 	}
 
 	action, err := selectedDataAction(*addToIndex, *flushIndex, *deleteIndex)

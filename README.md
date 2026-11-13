@@ -389,7 +389,7 @@ Settings can be loaded from a configuration file (e.g.
 | `-nuke` | Delete the current index and declared managed resources first, including dependent pipelines that reference declared enrich policies |
 | `-id` | Field to use in the document to override _id (default: not set) |
 | `-enrich` | Run enrich policies after the bulk insert; omit value for all or pass a comma-separated list |
-| `-user` / `-pass` | Username and password for Basic Auth |
+| `-user` / `-pass` | Username and password for Basic Auth; both are required together. `-user` is not read from the environment (`USER` is a shell variable); set it with `-user` or a `user` line in the `-config` file. `-pass` still reads `PASS` |
 | `-apiKey` | Elasticsearch API key |
 | `-level` | Log level filter: `trace`, `debug`, `info`, `warn`, or `error` (default: `info`) |
 | `-version` | Print version and exit |

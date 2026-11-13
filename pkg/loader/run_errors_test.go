@@ -2,6 +2,7 @@ package loader
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -264,6 +265,20 @@ func TestRunErrorContract(t *testing.T) {
 	const bothAuth = "cannot use both basic auth and API key"
 	validation("user with API key", "validating auth options", bothAuth, Options{Index: "cards", SyncManaged: true, User: "u", APIKey: "k"})
 	validation("pass with API key", "validating auth options", bothAuth, Options{Index: "cards", SyncManaged: true, Pass: "p", APIKey: "k"})
+	// A lone credential must fail loudly rather than connect anonymously.
+	// The values are distinctive so a message that leaked them would differ
+	// from the exact expected text.
+	validation("user only", "validating auth options", "basic auth requires both -user and -pass: -pass is empty",
+		Options{Index: "cards", SyncManaged: true, User: "lone-user-value"})
+	validation("pass only", "validating auth options", "basic auth requires both -user and -pass: -user is empty",
+		Options{Index: "cards", SyncManaged: true, Pass: "lone-pass-value"})
+	// Ordering guard: the lone-credential check must run before action and
+	// index validation. These rows also carry invalid later options, so moving
+	// the check below them would change the reported Op and fail here.
+	validation("user only before action validation", "validating auth options", "basic auth requires both -user and -pass: -pass is empty",
+		Options{Index: "cards", AddToIndex: true, FlushIndex: true, DataFile: "d.json", User: "lone-user-value"})
+	validation("pass only before index validation", "validating auth options", "basic auth requires both -user and -pass: -user is empty",
+		Options{SyncManaged: true, KeepLast: -1, Pass: "lone-pass-value"})
 	// Client construction is a setup failure, not option validation: its Op keeps
 	// the loader-execution classification and the parser's own cause.
 	tests = append(tests, runErrorCase{
@@ -2234,5 +2249,52 @@ func TestRunAliasPreflightSkipsEmptyMappingPlan(t *testing.T) {
 				t.Fatalf("requests = %v, want %v", got, want)
 			}
 		})
+	}
+}
+
+// TestBasicAuthValidationEntrypoints guards that the public convenience
+// entrypoints inherit Run's lone-credential rejection. They delegate to Run
+// unchanged, so a future entrypoint that touched auth fields or ran its own
+// validation first would let a lone credential through silently.
+func TestBasicAuthValidationEntrypoints(t *testing.T) {
+	t.Parallel()
+	entrypoints := []struct {
+		name string
+		run  func(ctx context.Context, opts Options) (Result, error)
+	}{
+		{"SyncManaged", SyncManaged},
+		{"LoadData", LoadData},
+		{"ExecuteEnrich", ExecuteEnrich},
+	}
+	inputs := []struct {
+		name    string
+		user    string
+		pass    string
+		wantMsg string
+	}{
+		{"user only", "lone-user-value", "", "validating auth options: basic auth requires both -user and -pass: -pass is empty"},
+		{"pass only", "", "lone-pass-value", "validating auth options: basic auth requires both -user and -pass: -user is empty"},
+	}
+	for _, ep := range entrypoints {
+		for _, in := range inputs {
+			t.Run(ep.name+"/"+in.name, func(t *testing.T) {
+				t.Parallel()
+				// Route-less stub: any request fails the test.
+				result, err := ep.run(t.Context(), Options{URL: esstub.New(t).URL(), Index: "cards", User: in.user, Pass: in.pass})
+				if !errors.Is(err, ErrInvalidOptions) {
+					t.Fatalf("err = %v, want ErrInvalidOptions", err)
+				}
+				var runErr *RunError
+				if !errors.As(err, &runErr) || runErr.Op != "validating auth options" {
+					t.Fatalf("err = %#v, want RunError with auth Op", err)
+				}
+				if err.Error() != in.wantMsg {
+					t.Fatalf("message = %q, want %q", err.Error(), in.wantMsg)
+				}
+				if !reflect.DeepEqual(result, Result{}) {
+					t.Fatalf("result = %+v, want zero", result)
+				}
+			})
+		}
 	}
 }

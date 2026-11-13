@@ -192,8 +192,8 @@ func main() {
 	replicas := flag.Int("replicas", -1, "number_of_replicas for indices this run creates; -1 derives it from cluster node count (ADR 0001)")
 	nuke := flag.Bool("nuke", false, "Delete the current index and declared managed resources, including dependent pipelines that reference declared enrich policies")
 	idField := flag.String("id", "", "Field to use to override _id (not normal)")
-	user := flag.String("user", "", "Username for basic auth (optional)")
-	pass := flag.String("pass", "", "Password for basic auth (optional)")
+	user := flag.String("user", "", "Username for basic auth; requires -pass. Read only from this argument or the -config file, never from the USER environment variable (optional)")
+	pass := flag.String("pass", "", "Password for basic auth; requires -user (optional)")
 	apiKey := flag.String("apiKey", "", "Elasticsearch API key (optional)")
 	logLevel := flag.String("level", "info", "Log level (trace, debug, info, warn, error)")
 	enrich := &enrichFlagValue{}
@@ -201,7 +201,12 @@ func main() {
 	showVersion := flag.Bool("version", false, "print version and exit")
 
 	flag.String(flag.DefaultConfigFlagname, "", "path to config file")
-	flag.Parse()
+	// USER is hidden only while parsing so -user cannot bind to the shell's
+	// USER; see withEnvHidden.
+	if err := withEnvHidden("USER", flag.Parse); err != nil {
+		fmt.Fprintf(os.Stderr, "flag parsing: %v\n", err)
+		os.Exit(1)
+	}
 
 	zerolog.TimeFieldFormat = time.RFC3339
 	parsedLogLevel, err := parseLogLevel(*logLevel)

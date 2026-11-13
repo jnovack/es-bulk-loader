@@ -55,11 +55,7 @@ func newCLIStub(t *testing.T) *esstub.Stub {
 // Building the binary alone would not prove this wiring.
 func TestCLIReplicasReachCreateIndexBody(t *testing.T) {
 	// Not parallel: builds one binary shared by every row.
-	bin := filepath.Join(t.TempDir(), "es-bulk-loader")
-	build := exec.CommandContext(t.Context(), "go", "build", "-o", bin, ".")
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("go build: %v\n%s", err, out)
-	}
+	bin := buildCLI(t)
 	dataFile := filepath.Join(t.TempDir(), "data.json")
 	if err := os.WriteFile(dataFile, []byte(`[{"id":1}]`), 0o600); err != nil {
 		t.Fatalf("write data: %v", err)

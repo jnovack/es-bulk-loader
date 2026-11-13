@@ -26,11 +26,7 @@ const (
 // immediate, then the deadline interrupts the wait) fails the run.
 func TestCLIWaitTransformsReachesLoader(t *testing.T) {
 	// Not parallel: builds one binary shared by every row.
-	bin := filepath.Join(t.TempDir(), "es-bulk-loader")
-	build := exec.CommandContext(t.Context(), "go", "build", "-o", bin, ".")
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("go build: %v\n%s", err, out)
-	}
+	bin := buildCLI(t)
 	dir := t.TempDir()
 	dataFile := filepath.Join(dir, "data.json")
 	if err := os.WriteFile(dataFile, []byte(`[{"id":1}]`), 0o600); err != nil {
