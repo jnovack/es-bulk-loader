@@ -151,6 +151,104 @@ func TestEnrichFromOptions(t *testing.T) {
 	}
 }
 
+// TestExecuteEnrichHonorsRequestedSelection guards that a Policies or Raw
+// request is executed as asked when Enabled is false, instead of being
+// replaced by all policies, which would rebuild unrequested enrich indices.
+func TestExecuteEnrichHonorsRequestedSelection(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		enrich      EnrichOptions
+		wantRun     []string
+		wantMissing []string
+	}{
+		{"policies without enabled", EnrichOptions{Policies: []string{"p1"}}, []string{"p1"}, nil},
+		{"raw without enabled", EnrichOptions{Raw: "p1"}, []string{"p1"}, nil},
+		{"policies override conflicting fields", EnrichOptions{Policies: []string{"p1"}, All: true, Raw: "p2"}, []string{"p1"}, nil},
+		{"all still overrides raw", EnrichOptions{All: true, Raw: "p1"}, []string{"p1", "p2"}, nil},
+		{"whitespace raw", EnrichOptions{Raw: " \t "}, []string{"p1", "p2"}, nil},
+		{"zero selection", EnrichOptions{}, []string{"p1", "p2"}, nil},
+		{"empty policies allow raw", EnrichOptions{Policies: []string{}, Raw: "p2"}, []string{"p2"}, nil},
+		{"enabled policies unchanged", EnrichOptions{Enabled: true, Policies: []string{"p2"}}, []string{"p2"}, nil},
+		{"enabled raw unchanged", EnrichOptions{Enabled: true, Raw: "p2"}, []string{"p2"}, nil},
+		{"enabled empty unchanged", EnrichOptions{Enabled: true}, []string{"p1", "p2"}, nil},
+		{"enabled all unchanged", EnrichOptions{Enabled: true, All: true}, []string{"p1", "p2"}, nil},
+		{"raw parsing and order", EnrichOptions{Raw: " p2, p1, p2 ,, "}, []string{"p2", "p1"}, nil},
+		{"policies parsing and caller isolation", EnrichOptions{Policies: []string{"p2", " p1 ", "p2", ""}}, []string{"p2", "p1"}, nil},
+		{"known and missing", EnrichOptions{Raw: "p2,unknown"}, []string{"p2"}, []string{"unknown"}},
+		{"only missing", EnrichOptions{Policies: []string{"unknown"}}, nil, []string{"unknown"}},
+		{"only delimiters", EnrichOptions{Raw: " , "}, nil, nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			stub := newLifecycleStub(t, lifecycleConfig{index: "cards", indexExists: true, policies: []string{"p1", "p2"}})
+			logger := zerolog.Nop()
+			opts := Options{
+				URL:         stub.URL(),
+				Index:       "cards",
+				DataFile:    writeBulkDataFixture(t),
+				AddToIndex:  true,
+				FlushIndex:  true,
+				DeleteIndex: true,
+				Nuke:        true,
+				Enrich:      tt.enrich,
+				Logger:      &logger,
+			}
+			saved := opts
+			savedPolicies := slices.Clone(opts.Enrich.Policies)
+
+			result, err := ExecuteEnrich(t.Context(), opts)
+			if err != nil {
+				t.Fatalf("ExecuteEnrich() error = %v", err)
+			}
+
+			// The operation label alone omits the policy name, so read the
+			// executed names from the request paths, in arrival order.
+			var executed []string
+			for _, req := range stub.Requests() {
+				name, ok := strings.CutPrefix(req.Path, "/_enrich/policy/")
+				if !ok {
+					continue
+				}
+				name, ok = strings.CutSuffix(name, "/_execute")
+				if ok && (req.Method == http.MethodPut || req.Method == http.MethodPost) {
+					executed = append(executed, name)
+				}
+			}
+			for _, req := range stub.Requests() {
+				if req.Method == http.MethodDelete || strings.HasSuffix(req.Path, "/_bulk") || strings.HasSuffix(req.Path, "/_delete_by_query") ||
+					(req.Method == http.MethodPut && req.Path == "/cards") {
+					t.Errorf("unexpected data or destructive request: %s %s", req.Method, req.Path)
+				}
+			}
+
+			if !slices.Equal(executed, tt.wantRun) {
+				t.Errorf("executed = %v, want %v", executed, tt.wantRun)
+			}
+			if !slices.Equal(result.EnrichSelected, tt.wantRun) {
+				t.Errorf("EnrichSelected = %v, want %v", result.EnrichSelected, tt.wantRun)
+			}
+			if !slices.Equal(result.EnrichMissing, tt.wantMissing) {
+				t.Errorf("EnrichMissing = %v, want %v", result.EnrichMissing, tt.wantMissing)
+			}
+			if result.EnrichSucceeded != len(tt.wantRun) || result.EnrichFailed != 0 {
+				t.Errorf("EnrichSucceeded/Failed = %d/%d, want %d/0", result.EnrichSucceeded, result.EnrichFailed, len(tt.wantRun))
+			}
+			if result.DocumentsProcessed != 0 || result.DocumentsSucceeded != 0 || result.DocumentsFailed != 0 {
+				t.Errorf("document counters = %d/%d/%d, want all zero", result.DocumentsProcessed, result.DocumentsSucceeded, result.DocumentsFailed)
+			}
+
+			if !reflect.DeepEqual(opts, saved) || !slices.Equal(opts.Enrich.Policies, savedPolicies) {
+				t.Errorf("ExecuteEnrich mutated caller options:\n got %+v\nwant %+v", opts, saved)
+			}
+		})
+	}
+}
+
 // TestRunWarningLogIncludesTimestamp guards that warnings logged through an injected logger carry a timestamp, because Run decorates every injected logger.
 func TestRunWarningLogIncludesTimestamp(t *testing.T) {
 	t.Parallel()

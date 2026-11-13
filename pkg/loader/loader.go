@@ -1032,19 +1032,30 @@ func LoadData(ctx context.Context, opts Options) (Result, error) {
 }
 
 // ExecuteEnrich runs Run with every data action and Nuke cleared, so it loads
-// no documents. It checks only Enrich.Enabled: when that field is false it
-// replaces Enrich with an all-policies selection, discarding Policies, All and
-// Raw. Set Enabled with Policies to execute a subset. SyncManaged passes
-// through unchanged, so when set it still upserts managed resources and
-// garbage-collects policy versions (see Options.SyncManaged), and AliasMode with
-// KeepLast > 0 still prunes older generations.
+// no documents. When Enrich.Enabled is false it defaults to all policies only
+// if Policies is empty and Raw is blank; otherwise it sets Enabled and keeps
+// the supplied Policies, All and Raw, so a Policies or Raw request needs no
+// Enabled. A selection with Enabled already true is left unchanged. The usual
+// EnrichOptions precedence applies: a non-empty Policies wins, then All, then
+// Raw. SyncManaged passes through unchanged, so when set it still upserts
+// managed resources and garbage-collects policy versions (see
+// Options.SyncManaged), and AliasMode with KeepLast > 0 still prunes older
+// generations.
 func ExecuteEnrich(ctx context.Context, opts Options) (Result, error) {
 	opts.AddToIndex = false
 	opts.FlushIndex = false
 	opts.DeleteIndex = false
 	opts.Nuke = false
 	if !opts.Enrich.Enabled {
-		opts.Enrich = EnrichOptions{Enabled: true, All: true}
+		// Replacing an explicit request with all policies would rebuild
+		// unrequested .enrich-* indices. Enabled must be set for Raw too:
+		// enrichFromOptions clears Raw while disabled, and an enrich-only Run
+		// would then fail action validation.
+		if len(opts.Enrich.Policies) == 0 && strings.TrimSpace(opts.Enrich.Raw) == "" {
+			opts.Enrich = EnrichOptions{Enabled: true, All: true}
+		} else {
+			opts.Enrich.Enabled = true
+		}
 	}
 	return Run(ctx, opts)
 }
