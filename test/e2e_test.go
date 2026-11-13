@@ -234,6 +234,13 @@ func TestEndToEndScenarios(t *testing.T) {
 			checks: "fails naming the index, declared resources and the remedy; no index, pipelines or policy versions are created",
 			run:    scenarioSyncManagedMissingIndexFails,
 		},
+		{
+			// Appended last: the slice index sets each scenario's e2e-NN prefix.
+			name:   "nuke_sync-managed_resets",
+			flags:  "-nuke -sync-managed (no data action, settings or mappings)",
+			checks: "warns that the run is a reset that recreates nothing; the source index, its pipelines and policy are deleted, the dependent target pipeline is removed and the target index survives without a default pipeline",
+			run:    scenarioNukeSyncManagedResets,
+		},
 	}
 
 	for i, sc := range scenarios {
@@ -414,6 +421,32 @@ func scenarioNuke(t *testing.T, ctx *scenarioContext) {
 	assertIndexMissing(t, ctx, ctx.sourceIndex)
 	assertPolicyMissing(t, ctx, ctx.sourcePolicy)
 	assertPipelineMissing(t, ctx, ctx.sourcePipelinePrimary)
+	assertPipelineMissing(t, ctx, ctx.targetPipelinePrimary)
+	assertIndexExists(t, ctx, ctx.targetIndex)
+	assertNoDefaultPipeline(t, ctx, ctx.targetIndex)
+}
+
+// scenarioNukeSyncManagedResets guards FIX-NUKESYNC-01: -nuke -sync-managed with no
+// data action, settings or mappings recreates nothing, so the loader must warn
+// that it is a reset while still deleting exactly what plain -nuke deletes.
+func scenarioNukeSyncManagedResets(t *testing.T, ctx *scenarioContext) {
+	mustSucceed(t, runLoader(t, ctx, nil, sourceArgs(ctx, ctx.sourceBaseDir, "-delete", true, true, "")))
+	mustSucceed(t, runLoader(t, ctx, nil, targetArgs(ctx, "-delete", true)))
+
+	result := runLoader(t, ctx, nil, append(nukeArgs(ctx), "-sync-managed"))
+	mustSucceed(t, result)
+
+	mustContain(t, result.output, fmt.Sprintf("is a managed-resource reset: it deletes index %q", ctx.sourceIndex))
+	mustContain(t, result.output, "recreates nothing")
+	mustContain(t, result.output, "add -settings/-mappings or a data action with -data")
+	if got := strings.Count(result.output, "is a managed-resource reset"); got != 1 {
+		t.Fatalf("reset warning appeared %d times, want 1\n%s", got, result.output)
+	}
+
+	assertIndexMissing(t, ctx, ctx.sourceIndex)
+	assertPolicyMissing(t, ctx, ctx.sourcePolicy)
+	assertPipelineMissing(t, ctx, ctx.sourcePipelinePrimary)
+	assertPipelineMissing(t, ctx, ctx.sourcePipelineSecondary)
 	assertPipelineMissing(t, ctx, ctx.targetPipelinePrimary)
 	assertIndexExists(t, ctx, ctx.targetIndex)
 	assertNoDefaultPipeline(t, ctx, ctx.targetIndex)

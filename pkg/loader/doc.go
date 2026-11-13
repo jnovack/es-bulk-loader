@@ -18,7 +18,9 @@
 //     fails here with ErrIndexOperation, naming the resources it would have synced.
 //
 //  4. -nuke: delete the alias targets and timestamped generations, or the index,
-//     then the declared managed resources.
+//     then the declared managed resources. With -sync-managed but no data action,
+//     -settings or -mappings, this is a reset that recreates nothing; Run warns
+//     before any request.
 //
 //  5. -delete on a concrete index: delete the index, then the managed resources.
 //     In AliasMode, -delete keeps managed resources and rolls forward in steps 8 to 11.

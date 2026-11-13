@@ -288,15 +288,21 @@ The loader now separates three concerns:
 2. One optional data action, exactly one of `-add`, `-flush`, or `-delete`,
    controls how documents are handled.
 3. `-sync-managed` creates or updates declared pipelines, policies, and
-   transforms. Without a data action or `-nuke`, it needs an existing index or
-   alias, or `-settings`/`-mappings` that let it create one.
+   transforms. Against an existing index or alias it updates them in place
+   without recreating the index. Without a data action or `-nuke`, it needs an
+   existing index or alias, or `-settings`/`-mappings` that let it create one.
+   After `-nuke`, it rebuilds only when the run creates an index from
+   `-settings`/`-mappings` or a data action with `-data`; otherwise nothing is
+   recreated.
 
 When combined, the execution order is:
 
 1. Parse the `-mappings` file, when a data action is selected, before any
    destructive work, so a malformed file fails the run before anything is
    deleted.
-2. Run `-nuke`, if requested.
+2. Run `-nuke`, if requested. With `-sync-managed` and no data action,
+   `-settings` or `-mappings`, this is a reset that recreates nothing, and the
+   loader warns before sending any request.
 3. For `-add` or `-flush` into an existing index or alias, verify the live
    mappings against `-mappings` before any document or managed-resource
    change.
@@ -386,8 +392,8 @@ Settings can be loaded from a configuration file (e.g.
 | `-flush` | Delete all documents from an existing index without deleting the index, then load replacement data |
 | `-delete` | Recreate data target before loading data: deletes concrete index in normal mode; rolls alias to a new timestamped index in `-alias` mode |
 | `-data` | Path to a JSON array or NDJSON document file to load (**required with** `-add`, `-flush`, or `-delete`) |
-| `-sync-managed` | Create or update declared ingest pipelines, enrich policies, and transforms |
-| `-nuke` | Delete the current index and declared managed resources first, including dependent pipelines that reference declared enrich policies |
+| `-sync-managed` | Create or update declared ingest pipelines, enrich policies, and transforms. After `-nuke`, this rebuilds only when the run creates an index (`-settings`/`-mappings`, or a data action with `-data`) |
+| `-nuke` | Delete the current index and declared managed resources first, including dependent pipelines that reference declared enrich policies. With `-sync-managed` but no data action, `-settings` or `-mappings`, nothing is recreated and the loader warns |
 | `-id` | Field to use in the document to override _id (default: not set) |
 | `-enrich` | Run enrich policies after the bulk insert; omit value for all or pass a comma-separated list |
 | `-user` / `-pass` | Username and password for Basic Auth; both are required together. `-user` is not read from the environment (`USER` is a shell variable); set it with `-user` or a `user` line in the `-config` file. `-pass` still reads `PASS` |
@@ -404,8 +410,8 @@ Settings can be loaded from a configuration file (e.g.
 | `-add` | Append data to an existing index, or create the index and load data if it does not exist |
 | `-flush` | Remove existing documents, keep the existing index structure, then load replacement data |
 | `-delete` | Recreate data target and reload data: concrete index is deleted/recreated in normal mode; alias mode creates a new timestamped index and repoints alias |
-| `-sync-managed` | Create or update declared pipelines, policies, and transforms without changing document data by itself. With no data action and no `-nuke`, a missing index or alias and no `-settings`/`-mappings` fails with `ErrIndexOperation` before any write; supply `-settings` or `-mappings`, or choose `-add`, `-flush` or `-delete` (with `-data`) |
-| `-nuke` | Remove the current index and declared managed resources first; if combined with another action, that action runs afterward |
+| `-sync-managed` | Create or update declared pipelines, policies, and transforms without changing document data by itself. After `-nuke`, it recreates resources only when the run creates an index from `-settings`/`-mappings` or a data action with `-data`. With no data action and no `-nuke`, a missing index or alias and no `-settings`/`-mappings` fails with `ErrIndexOperation` before any write; supply `-settings` or `-mappings`, or choose `-add`, `-flush` or `-delete` (with `-data`) |
+| `-nuke` | Remove the current index and declared managed resources first; if combined with another action, that action runs afterward. `-nuke -sync-managed` with no data action, `-settings` or `-mappings` is a reset that recreates nothing and warns |
 | `-alias` | Treat `-index` as an alias and use timestamped concrete index names (`<alias>-YYYYMMDDHHMMSS`) when a new index is created |
 | `-keep-last` | With `-alias`, prune older timestamped concrete indices after the run and keep only the newest N by parsed timestamp suffix |
 
@@ -421,6 +427,16 @@ Common combinations:
   cleanly
 - `-nuke`: remove the current index and declared managed resources without
   loading new data
+- `-nuke -sync-managed` (no data action, `-settings` or `-mappings`): a
+  managed-resource reset. It deletes the index and declared pipelines,
+  policies, and transforms, recreates nothing, and logs a warning (also in
+  `Result.Warnings`). To rebuild, add `-settings`/`-mappings` or a data action
+  with `-data`, for example:
+
+  ```bash
+  es-bulk-loader -index cards -nuke -delete -sync-managed -data cards.ndjson
+  ```
+
 - `-delete -alias -keep-last 2`: roll to a new timestamped index, repoint
   alias, then keep only the newest two generations
 

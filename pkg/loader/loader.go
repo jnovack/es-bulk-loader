@@ -185,8 +185,11 @@ type Options struct {
 	// that has neither SettingsFile nor MappingsFile fails with
 	// ErrIndexOperation before any cluster write, naming the resources it
 	// would have synced; supply a settings or mappings file, or a data action.
-	// A Nuke run is not rejected by this rule. Alias -delete implies
-	// SyncManaged, with a warning, when it is not set.
+	// A Nuke run is not rejected by this rule. After Nuke, SyncManaged rebuilds
+	// only when the run creates an index from SettingsFile/MappingsFile or a
+	// data action with DataFile; otherwise it is a reset that recreates nothing
+	// and Run warns. Alias -delete implies SyncManaged, with a warning, when it
+	// is not set.
 	SyncManaged bool
 	// AliasMode treats Index as an alias. Creating or recreating the index makes
 	// a timestamped <alias>-YYYYMMDDHHMMSS index, loads it, and then repoints the
@@ -203,7 +206,10 @@ type Options struct {
 	Replicas *int
 	// Nuke (-nuke) deletes the index, or in AliasMode the alias's target indices
 	// and timestamped generations, plus the declared managed resources, before
-	// the data action runs.
+	// the data action runs. Nuke with SyncManaged and no data action, Settings
+	// or Mappings is a reset only: nothing is recreated, and Run adds a warning
+	// to Result.Warnings before any request. Rebuilding needs Settings/Mappings
+	// or a data action with DataFile.
 	Nuke bool
 	// IDField names a document field whose non-empty string value becomes the
 	// bulk _id. Otherwise Elasticsearch assigns the ID.
@@ -409,6 +415,12 @@ func runFailure(err error) error {
 
 // ─── Primary Execution Entry Points ────────────────────────────────────────────
 
+// nukeResetWarning is the Run warning for -nuke with -sync-managed and no data
+// action, -settings or -mappings. %s is the quoted target phrase.
+const nukeResetWarning = "-nuke with -sync-managed and no data action or -settings/-mappings is a managed-resource reset: " +
+	"it deletes %s and the declared pipelines, policies and transforms for this run, and recreates nothing. " +
+	"To rebuild, add -settings/-mappings or a data action with -data (for example -nuke -delete -sync-managed -data <file>)"
+
 // Run executes one lifecycle pass for opts.Index, in the stage order listed in
 // the package documentation. It normalizes zero-valued options on a private copy,
 // so the caller's Options is never modified (TestRunDoesNotMutateCallerOptions).
@@ -547,6 +559,19 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 	}
 	if strings.TrimSpace(*transformsFile) != "" && !effectiveSyncManaged {
 		warn("Ignoring -transforms because -sync-managed is not enabled")
+	}
+	// -nuke with sync but no data action and no -settings/-mappings creates no
+	// index afterwards (see shouldCreateIndex), so the managed-upsert gate
+	// (effectiveSyncManaged && exists) is false and nothing is rebuilt. Docs
+	// once implied sync rebuilds; a silent reset looks like success. Exact ""
+	// comparisons mirror shouldCreateIndex: do not trim. Warn here, before any
+	// cluster request, and keep the reset itself unchanged (decided 2026-11-01).
+	if *nuke && effectiveSyncManaged && action == dataActionNone && *settingsFile == "" && *mappingsFile == "" {
+		target := fmt.Sprintf("index %q", *index)
+		if *aliasMode {
+			target = fmt.Sprintf("alias %q's target indices and timestamped generations", *index)
+		}
+		warn(fmt.Sprintf(nukeResetWarning, target))
 	}
 
 	cfg := elasticsearch.Config{

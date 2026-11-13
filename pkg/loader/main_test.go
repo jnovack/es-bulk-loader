@@ -1478,6 +1478,287 @@ func assertCreatedAndLoaded(t *testing.T, s *lifecycleStub) {
 	}
 }
 
+// nukeResetWantWarning is the expected reset warning, written out
+// independently of nukeResetWarning so a reworded constant fails the tests.
+func nukeResetWantWarning(target string) string {
+	return "-nuke with -sync-managed and no data action or -settings/-mappings is a managed-resource reset: " +
+		"it deletes " + target + " and the declared pipelines, policies and transforms for this run, and recreates nothing. " +
+		"To rebuild, add -settings/-mappings or a data action with -data (for example -nuke -delete -sync-managed -data <file>)"
+}
+
+const (
+	nukeResetConcrete = `index "cards"`
+	nukeResetAlias    = `alias "cards"'s target indices and timestamped generations`
+	nukeResetTx       = `{"tx":{"source_index":"cards","body":{"source":{"index":"cards"},"dest":{"index":"dest"},"pivot":{}}},` +
+		`"tx-other":{"source_index":"other","body":{"source":{"index":"other"},"dest":{"index":"dest"},"pivot":{}}}}`
+)
+
+// nukeResetStub serves exactly the requests a reset with the base declarations
+// may issue; the strict stub fails the test on any other request (create,
+// upsert, refresh, transform stop/start, bulk, alias swap).
+func nukeResetStub(t *testing.T, alias bool, polName string, overrides ...map[string]http.HandlerFunc) *esstub.Stub {
+	t.Helper()
+	routes := map[string]http.HandlerFunc{
+		"DELETE /_ingest/pipeline/{name}": replyAck,
+		"DELETE /_enrich/policy/{name}":   replyAck,
+		"DELETE /_transform/{name}":       replyAck,
+	}
+	maps.Copy(routes, policyListRoutes(esstub.JSON(http.StatusOK, `{"policies":[{"config":{"match":{"name":"`+polName+`"}}}]}`)))
+	if alias {
+		maps.Copy(routes, map[string]http.HandlerFunc{
+			"GET /_alias/cards":            esstub.JSON(http.StatusOK, `{"cards-a":{"aliases":{"cards":{}}}}`),
+			"DELETE /cards-a":              replyAck,
+			"GET /cards-*":                 esstub.JSON(http.StatusOK, `{"cards-20260101000000":{}}`),
+			"DELETE /cards-20260101000000": replyAck,
+		})
+	} else {
+		maps.Copy(routes, map[string]http.HandlerFunc{
+			"HEAD /cards":   replyHeadOK,
+			"DELETE /cards": replyAck,
+		})
+	}
+	return newRouteStub(t, append([]map[string]http.HandlerFunc{routes}, overrides...)...)
+}
+
+// TestRunNukeSyncManagedResetWarns guards FIX-NUKESYNC-01: -nuke with
+// -sync-managed and no data action, settings or mappings deletes and recreates
+// nothing, so Run must say so in Result.Warnings. The cluster requests stay the
+// plain reset; only the warning is new.
+func TestRunNukeSyncManagedResetWarns(t *testing.T) {
+	t.Parallel()
+
+	polName := managedPolicyName(t, "pol", stopPolicyBody)
+	declared := func(t *testing.T, opts Options) Options {
+		return syncOnlyDeclared(t, opts, stopPipelines, syncOnlyPolicies, nukeResetTx)
+	}
+	deletes := []string{
+		"DELETE /_ingest/pipeline/p1", "DELETE /_ingest/pipeline/p2",
+		"DELETE /_enrich/policy/" + polName, "DELETE /_transform/tx",
+	}
+	concrete := slices.Concat([]string{"GET /_enrich/policy", "HEAD /cards", "DELETE /cards"}, deletes)
+	aliased := slices.Concat([]string{"GET /_enrich/policy", "GET /_alias/cards", "DELETE /cards-a", "GET /cards-*", "DELETE /cards-20260101000000"}, deletes)
+	zero := 0
+
+	tests := []struct {
+		name         string
+		alias        bool
+		opts         func(t *testing.T, url string) Options
+		overrides    []map[string]http.HandlerFunc
+		wantTrace    []string
+		wantWarnings []string
+		wantKind     error
+		wantOp       string
+	}{
+		{
+			name: "concrete reset", opts: func(t *testing.T, url string) Options {
+				return declared(t, Options{URL: url, Index: "cards", SyncManaged: true, Nuke: true})
+			},
+			wantTrace: concrete, wantWarnings: []string{nukeResetWantWarning(nukeResetConcrete)},
+		},
+		{
+			name: "alias reset with orphan generation", alias: true, opts: func(t *testing.T, url string) Options {
+				return declared(t, Options{URL: url, Index: "cards", AliasMode: true, SyncManaged: true, Nuke: true})
+			},
+			wantTrace: aliased, wantWarnings: []string{nukeResetWantWarning(nukeResetAlias)},
+		},
+		{
+			name: "no declarations", opts: func(_ *testing.T, url string) Options {
+				return Options{URL: url, Index: "cards", SyncManaged: true, Nuke: true}
+			},
+			wantTrace: []string{"HEAD /cards", "DELETE /cards"}, wantWarnings: []string{nukeResetWantWarning(nukeResetConcrete)},
+		},
+		{
+			name: "data file and replicas without an action do not create an index", opts: func(t *testing.T, url string) Options {
+				return declared(t, Options{URL: url, Index: "cards", SyncManaged: true, Nuke: true, DataFile: writeBulkDataFixture(t), Replicas: &zero})
+			},
+			wantTrace: concrete, wantWarnings: []string{nukeResetWantWarning(nukeResetConcrete)},
+		},
+		{
+			name: "missing target keeps warning order", opts: func(t *testing.T, url string) Options {
+				return declared(t, Options{URL: url, Index: "cards", SyncManaged: true, Nuke: true, KeepLast: 1, Transforms: TransformOptions{Wait: true}})
+			},
+			overrides: []map[string]http.HandlerFunc{{"HEAD /cards": replyHeadMissing}},
+			wantTrace: slices.Concat([]string{"GET /_enrich/policy", "HEAD /cards"}, deletes),
+			wantWarnings: []string{
+				"Ignoring -keep-last because -alias is not enabled",
+				nukeResetWantWarning(nukeResetConcrete),
+				`Index "cards" does not exist. Nuke will still remove declared managed resources`,
+				"Ignoring transform wait because no transforms were synced for this run",
+			},
+		},
+		{
+			name: "index delete failure keeps its error and the warning", opts: func(t *testing.T, url string) Options {
+				return declared(t, Options{URL: url, Index: "cards", SyncManaged: true, Nuke: true})
+			},
+			overrides: []map[string]http.HandlerFunc{{"DELETE /cards": replyFail}},
+			wantTrace: []string{"GET /_enrich/policy", "HEAD /cards", "DELETE /cards"}, wantWarnings: []string{nukeResetWantWarning(nukeResetConcrete)},
+			wantKind: ErrIndexOperation, wantOp: "Failed to delete index",
+		},
+		{
+			name: "enrich refresh of the deleted index still fails", opts: func(t *testing.T, url string) Options {
+				return declared(t, Options{URL: url, Index: "cards", SyncManaged: true, Nuke: true, Enrich: EnrichOptions{Enabled: true, All: true}})
+			},
+			overrides: []map[string]http.HandlerFunc{{"POST /cards/_refresh": esstub.JSON(http.StatusNotFound, failBody)}},
+			wantTrace: append(slices.Clone(concrete), "POST /cards/_refresh"), wantWarnings: []string{nukeResetWantWarning(nukeResetConcrete)},
+			wantKind: ErrIndexOperation, wantOp: "Failed to refresh index",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			stub := nukeResetStub(t, tt.alias, polName, tt.overrides...)
+			nop := zerolog.Nop()
+			opts := tt.opts(t, stub.URL())
+			opts.Logger = &nop
+
+			result, err := Run(t.Context(), opts)
+			if tt.wantKind == nil {
+				if err != nil {
+					t.Fatalf("Run() error = %v, want nil", err)
+				}
+			} else {
+				var runErr *RunError
+				if !errors.As(err, &runErr) || runErr.Kind != tt.wantKind || runErr.Op != tt.wantOp {
+					t.Fatalf("Run() error = %v, want Kind %v Op %q", err, tt.wantKind, tt.wantOp)
+				}
+			}
+			if !slices.Equal(result.Warnings, tt.wantWarnings) {
+				t.Errorf("Warnings = %q, want %q", result.Warnings, tt.wantWarnings)
+			}
+			if got := requestLabels(stub); !slices.Equal(got, tt.wantTrace) {
+				t.Errorf("trace = %q, want %q", got, tt.wantTrace)
+			}
+			if tt.wantKind == nil {
+				if result.CreatedIndex != "" || result.DocumentsProcessed != 0 || result.EnrichSucceeded != 0 ||
+					len(result.EnrichSelected) != 0 || len(result.EnrichMissing) != 0 {
+					t.Errorf("reset reported created or loaded state: %+v", result)
+				}
+			}
+			// The trace above pins whether the transform DELETE happens; this pins
+			// its flags. An empty query must fail too: dropping it would delete the
+			// transform's destination index.
+			for _, r := range stub.Requests() {
+				if r.Method == http.MethodDelete && r.Path == "/_transform/tx" {
+					q := r.RawQuery
+					if !strings.Contains(q, "force=true") || !strings.Contains(q, "delete_dest_index=false") {
+						t.Errorf("transform delete query = %q, want force=true and delete_dest_index=false", q)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestRunNukeSyncManagedResetWarningBoundaries pins when the reset warning
+// fires, its Warn log event, and that it precedes client construction. Every
+// row reaches the same known failure (an unparsable URL fails client setup),
+// so an earlier validation error cannot make a negative row pass vacuously.
+func TestRunNukeSyncManagedResetWarningBoundaries(t *testing.T) {
+	t.Parallel()
+
+	const badURL = "http://%"
+	dir := t.TempDir()
+	file := fixture.WriteTempJSON(t, dir, `{}`)
+	base := func() Options { return Options{URL: badURL, Index: "cards", SyncManaged: true, Nuke: true} }
+	with := func(mutate func(*Options)) func() Options {
+		return func() Options {
+			o := base()
+			mutate(&o)
+			return o
+		}
+	}
+
+	tests := []struct {
+		name     string
+		opts     func() Options
+		wantWarn string // reset warning expected exactly once; empty means none
+	}{
+		{"concrete reset", base, nukeResetWantWarning(nukeResetConcrete)},
+		{"alias reset", with(func(o *Options) { o.AliasMode = true }), nukeResetWantWarning(nukeResetAlias)},
+		{"whitespace-only settings path is not empty", with(func(o *Options) { o.SettingsFile = " " }), ""},
+		{"no nuke", with(func(o *Options) { o.Nuke = false }), ""},
+		{"no sync", with(func(o *Options) { o.SyncManaged = false }), ""},
+		{"settings file", with(func(o *Options) { o.SettingsFile = file }), ""},
+		{"mappings file", with(func(o *Options) { o.MappingsFile = file }), ""},
+		{"add", with(func(o *Options) { o.AddToIndex, o.DataFile = true, file }), ""},
+		{"flush", with(func(o *Options) { o.FlushIndex, o.DataFile = true, file }), ""},
+		{"delete", with(func(o *Options) { o.DeleteIndex, o.DataFile = true, file }), ""},
+		// Nuke stays true: alias -delete implies sync, so only the data-action
+		// term keeps this shape from warning.
+		{"alias delete without explicit sync", with(func(o *Options) {
+			o.AliasMode, o.DeleteIndex, o.DataFile, o.SyncManaged = true, true, file, false
+		}), ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var buf bytes.Buffer
+			logger := zerolog.New(&buf)
+			opts := tt.opts()
+			opts.Logger = &logger
+
+			result, err := Run(t.Context(), opts)
+			var runErr *RunError
+			if !errors.As(err, &runErr) || runErr.Kind != ErrLoaderExecution || runErr.Op != "creating Elasticsearch client" || runErr.Err == nil {
+				t.Fatalf("Run() error = %v, want ErrLoaderExecution at creating Elasticsearch client", err)
+			}
+
+			inResult := 0
+			for _, w := range result.Warnings {
+				if strings.Contains(w, "is a managed-resource reset") {
+					inResult++
+					if w != tt.wantWarn {
+						t.Errorf("reset warning = %q, want %q", w, tt.wantWarn)
+					}
+				}
+			}
+			inLog := 0
+			for line := range strings.SplitSeq(strings.TrimSpace(buf.String()), "\n") {
+				if line == "" {
+					continue
+				}
+				var event map[string]any
+				if err := json.Unmarshal([]byte(line), &event); err != nil {
+					t.Fatalf("log line %q is not JSON: %v", line, err)
+				}
+				if msg, _ := event["message"].(string); strings.Contains(msg, "is a managed-resource reset") {
+					inLog++
+					if event["level"] != "warn" || msg != tt.wantWarn {
+						t.Errorf("reset log event = %v, want level warn message %q", event, tt.wantWarn)
+					}
+				}
+			}
+			want := 0
+			if tt.wantWarn != "" {
+				want = 1
+			}
+			if inResult != want || inLog != want {
+				t.Errorf("reset warning count result=%d log=%d, want %d each (warnings %q)", inResult, inLog, want, result.Warnings)
+			}
+		})
+	}
+}
+
+// TestRunNukeSyncManagedResetEarlierValidationWins guards that an invalid
+// option returns before the reset warning is added.
+func TestRunNukeSyncManagedResetEarlierValidationWins(t *testing.T) {
+	t.Parallel()
+
+	nop := zerolog.Nop()
+	result, err := Run(t.Context(), Options{URL: "http://%", Index: "cards", SyncManaged: true, Nuke: true, DeleteIndex: true, Logger: &nop})
+	var runErr *RunError
+	if !errors.As(err, &runErr) || runErr.Kind != ErrInvalidOptions || runErr.Op != "validating data option" {
+		t.Fatalf("Run() error = %v, want ErrInvalidOptions at validating data option", err)
+	}
+	if len(result.Warnings) != 0 {
+		t.Errorf("Warnings = %q, want none", result.Warnings)
+	}
+}
+
 // TestRunRetriesBulkOnRetryableStatus guards that a retryable HTTP status on a bulk request is retried.
 func TestRunRetriesBulkOnRetryableStatus(t *testing.T) {
 	t.Parallel()
