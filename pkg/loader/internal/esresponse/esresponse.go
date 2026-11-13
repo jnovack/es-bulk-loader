@@ -1,7 +1,9 @@
 // Package esresponse holds pure predicates over Elasticsearch HTTP responses
 // and transport errors that more than one owner package needs (bulk, enrich,
-// managed, transform): they read a status code, raw body or error value and
-// never perform I/O or log. Callers own retry counts, sleeps and deadlines.
+// managed, transform), plus bounded, redacted rejection diagnostics
+// (NewRejection): they read a status code, raw body or error value and never
+// perform I/O or log. Callers own body reads, retry counts, sleeps and
+// deadlines.
 package esresponse
 
 import (

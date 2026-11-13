@@ -461,7 +461,27 @@ func deletePolicyBestEffort(ctx context.Context, es *elasticsearch.Client, polic
 	runlog.From(ctx).Info().Str("policy", policy).Msg("Managed policy GC deleted unreferenced policy")
 }
 
-// CreatePipelines puts each pipeline in declared order.
+// createPipelineMessageBudget leaves room for the "<Op>: " prefix RunError
+// adds, so the complete public message stays within
+// esresponse.MaxPublicMessageBytes. It is derived from the same literal Op
+// passed to runlog.Fail below; keep the two in step.
+const createPipelineMessageBudget = esresponse.MaxPublicMessageBytes -
+	len("Failed to create pipeline: ")
+
+// readRejectionBody reads at most esresponse.MaxRejectionBodyBytes+1
+// bytes, so a hostile or huge rejection body cannot drive an unbounded
+// read or allocation; the probe byte lets NewRejection detect oversize.
+// It never closes body (the caller does) and starts no goroutine: the
+// request context bound to the response owns cancellation.
+func readRejectionBody(body io.Reader) ([]byte, error) {
+	return io.ReadAll(io.LimitReader(body, esresponse.MaxRejectionBodyBytes+1))
+}
+
+// CreatePipelines puts each pipeline in declared order and stops at the first
+// failure. A transport failure returns Op "creating pipeline" with its cause.
+// An HTTP rejection returns Op "Failed to create pipeline" whose cause is an
+// *esresponse.Rejection: the pipeline, HTTP status and bounded, redacted
+// Elasticsearch type/reason pairs (or a fixed explanation), never the raw body.
 func CreatePipelines(ctx context.Context, es *elasticsearch.Client, definitions config.Definitions, names []string) error {
 	for _, name := range names {
 		res, err := es.Ingest.PutPipeline(
@@ -474,13 +494,23 @@ func CreatePipelines(ctx context.Context, es *elasticsearch.Client, definitions 
 		}
 
 		if res.IsError() {
-			body, _ := io.ReadAll(res.Body)
+			// The rejection reason is the only actionable part of this failure,
+			// and it used to be dropped: a nil cause rendered as
+			// "Failed to create pipeline: Failed to create pipeline", and the raw
+			// body went only to the log, unbounded and unredacted. The cause now
+			// carries bounded, redacted ES type/reason pairs, and the log reuses
+			// it through runlog.Fail's error field. The Op stays fixed so the
+			// RunError Kind (ErrManagedResource) does not change.
+			data, readErr := readRejectionBody(res.Body)
 			res.Body.Close()
+			cause := esresponse.NewRejection(
+				"pipeline", name, res.StatusCode, data, readErr,
+				createPipelineMessageBudget,
+			)
 			return runlog.Fail(runlog.FailureEvent(ctx).
-				Str("pipeline", name).
-				Int("status_code", res.StatusCode).
-				Str("body", string(body)),
-				"Failed to create pipeline", nil)
+				Str("pipeline", cause.ResourceName()).
+				Int("status_code", res.StatusCode),
+				"Failed to create pipeline", cause)
 		}
 		res.Body.Close()
 

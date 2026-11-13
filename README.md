@@ -86,6 +86,22 @@ are stable. Fixes to undocumented or data-corrupting behavior ship in
 minor releases with a release note. Changes to documented behavior get a
 deprecation path.
 
+**Error messages.** When Elasticsearch rejects an ingest-pipeline PUT, `Run`
+returns a `*RunError` (Op `Failed to create pipeline`, Kind
+`ErrManagedResource`) whose message names the pipeline, the HTTP status and up
+to four Elasticsearch type/reason pairs, bounded to 2,048 bytes in total.
+After the Op prefix the cause reads
+`pipeline "<name>" rejected with HTTP <status>: <type>: <reason>`, with further
+pairs separated by semicolons.
+
+URL credentials, sensitive query parameters, Authorization values and common
+secret keys (such as `password`, `api_key`, `token`, `secret`) are replaced
+with `[REDACTED]`. An unreadable, oversized (over 64 KiB), empty or non-JSON
+response yields a fixed explanation instead. The raw response body of this
+rejected pipeline PUT is never logged or returned. Redaction recognizes
+structured credentials only: free-text reasons can still contain sensitive
+prose that generic redaction cannot recognize.
+
 Full lifecycle run:
 
 ```go

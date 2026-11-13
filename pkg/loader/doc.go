@@ -68,5 +68,9 @@
 //   - a failed enrich policy is counted in Result.EnrichFailed and the run continues,
 //   - every other run-ending error is returned as a *RunError whose Kind is chosen
 //     from its Op name: bulk, then enrich, then pipeline/policy/transform/managed,
-//     then index/indices/alias, otherwise ErrLoaderExecution (see RunError).
+//     then index/indices/alias, otherwise ErrLoaderExecution (see RunError),
+//   - a rejected ingest-pipeline PUT keeps Op "Failed to create pipeline"; its cause
+//     carries the pipeline, HTTP status and up to four bounded, redacted Elasticsearch
+//     type/reason pairs (2,048 bytes for the whole message), never the raw body.
+//     Free-text reasons may still hold sensitive prose redaction cannot recognize.
 package loader

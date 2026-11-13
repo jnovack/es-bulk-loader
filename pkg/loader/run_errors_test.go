@@ -15,11 +15,13 @@ import (
 	"reflect"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rs/zerolog"
 
@@ -34,7 +36,8 @@ import (
 // every failure origin: the sentinel Kind (errors.Is), the operation string
 // (errors.As to *RunError), the original cause where one exists, the exact
 // message (no new prefix or wrapping; a failure without a cause keeps its
-// duplicated "op: op" text), and the partial Result returned alongside the
+// duplicated "op: op" text, except a rejected pipeline PUT, which carries the
+// bounded ES reason), and the partial Result returned alongside the
 // error. Internal failures moved from panics to returned errors; a regression
 // in classification, Op, cause or partial-Result population fails here.
 func TestRunErrorContract(t *testing.T) {
@@ -183,21 +186,29 @@ func TestRunErrorContract(t *testing.T) {
 			wantResult: &Result{},
 		},
 		{
+			// Deliberately changed with FIX-PIPECAUSE-01: the cause now carries
+			// the pipeline, status and bounded ES type/reason instead of the
+			// duplicated "op: op" text. Op and Kind are unchanged. The Nop
+			// logger and nil Progress prove the message is built without them.
 			name: "managed pipeline put rejected",
 			setup: func(t *testing.T) Options {
 				stub := esstub.New(t)
 				stub.Handle("HEAD /cards", esstub.JSON(http.StatusOK, ""))
-				stub.Handle("PUT /_ingest/pipeline/p", esstub.JSON(http.StatusBadRequest, `{"error":{"type":"parse_exception"}}`))
+				stub.Handle("PUT /_ingest/pipeline/p", esstub.JSON(http.StatusBadRequest,
+					`{"error":{"root_cause":[{"type":"parse_exception","reason":"No processor type exists with name [fixture_proc]"}],`+
+						`"type":"parse_exception","reason":"No processor type exists with name [fixture_proc]","stack_trace":"FAKE-TRACE"},"status":400}`))
+				nop := zerolog.Nop()
 				return Options{
 					URL:           stub.URL(),
 					Index:         "cards",
 					SyncManaged:   true,
 					PipelinesFile: fixture.WriteTempJSON(t, t.TempDir(), `{"p":{"processors":[]}}`),
+					Logger:        &nop,
 				}
 			},
 			wantKind:   ErrManagedResource,
 			wantOp:     "Failed to create pipeline",
-			wantMsg:    "Failed to create pipeline: Failed to create pipeline",
+			wantMsg:    `Failed to create pipeline: pipeline "p" rejected with HTTP 400: parse_exception: No processor type exists with name [fixture_proc]`,
 			wantResult: &Result{WriteIndex: "cards"},
 		},
 		{
@@ -1293,6 +1304,126 @@ func TestRunStopsAfterLifecycleFailure(t *testing.T) {
 				"PUT /cards-<ts>", "HEAD /cards-<ts>", "POST /_bulk",
 			},
 		},
+	})
+}
+
+// TestRunPipelineRejectionReasonAndPrivacy guards FIX-PIPECAUSE-01 at the
+// real HTTP response boundary: a rejected pipeline PUT on an existing index
+// returns its bounded, redacted ES reason through RunError (same Op and Kind),
+// the raw body never reaches the returned message or the log, and the run
+// still stops at the PUT. Refresh, bulk and policy listing are routed and a
+// data action plus enrich are enabled, so a lost return would extend the
+// trace instead of failing on an unexpected route. Every body, name and
+// FAKE-* value is synthetic and must change with the diagnostic contract.
+// The two-pipeline stop rows in TestRunStopsAfterLifecycleFailure keep
+// guarding the second-pipeline and index-create paths.
+func TestRunPipelineRejectionReasonAndPrivacy(t *testing.T) {
+	t.Parallel()
+
+	const reason = "No processor type exists with name [fixture_proc]"
+
+	// run drives one Run whose only pipeline, name, is rejected with body.
+	run := func(t *testing.T, name, body string, logger *zerolog.Logger) error {
+		t.Helper()
+		pipelines, err := json.Marshal(map[string]any{name: map[string]any{"processors": []any{}}})
+		if err != nil {
+			t.Fatalf("marshal pipelines: %v", err)
+		}
+		stub := newRouteStub(t, map[string]http.HandlerFunc{
+			"HEAD /cards": replyHeadOK,
+			// A wildcard route with an exact decoded-name check avoids putting
+			// quotes or backslashes into a ServeMux pattern.
+			"PUT /_ingest/pipeline/{name}": func(w http.ResponseWriter, r *http.Request) {
+				if got := r.PathValue("name"); got != name {
+					t.Errorf("pipeline PUT name = %q, want %q", got, name)
+				}
+				esstub.JSON(http.StatusBadRequest, body)(w, r)
+			},
+			"POST /cards/_refresh": esstub.JSON(http.StatusOK, refreshBody),
+			"POST /_bulk":          esstub.JSON(http.StatusOK, bulkOKBody("cards")),
+		}, policyListRoutes(esstub.JSON(http.StatusOK, `{"policies":[]}`)))
+
+		_, runErr := Run(t.Context(), Options{
+			URL: stub.URL(), Index: "cards", AddToIndex: true, SyncManaged: true,
+			DataFile:      writeBulkDataFixture(t),
+			PipelinesFile: fixture.WriteTempJSON(t, t.TempDir(), string(pipelines)),
+			Enrich:        EnrichOptions{Enabled: true, All: true},
+			Logger:        logger,
+		})
+		if runErr == nil {
+			t.Fatal("expected Run to fail")
+		}
+		assertRunError(t, runErr, ErrManagedResource, "Failed to create pipeline")
+		if !errors.Is(runErr, ErrManagedResource) {
+			t.Fatalf("error = %v, want ErrManagedResource", runErr)
+		}
+		if got, want := requestLabels(stub), []string{"HEAD /cards", "PUT /_ingest/pipeline/" + name}; !slices.Equal(got, want) {
+			t.Fatalf("requests = %q\n want     %q", got, want)
+		}
+		msg := runErr.Error()
+		if len(msg) > 2048 || !utf8.ValidString(msg) {
+			t.Fatalf("message is %d bytes, valid=%v; want <= 2048 bytes of valid UTF-8", len(msg), utf8.ValidString(msg))
+		}
+		return runErr
+	}
+
+	t.Run("nop logger", func(t *testing.T) {
+		t.Parallel()
+		nop := zerolog.Nop()
+		body := `{"error":{"root_cause":[{"type":"parse_exception","reason":"` + reason + `"}],` +
+			`"type":"parse_exception","reason":"` + reason + `"},"status":400}`
+		err := run(t, "p", body, &nop)
+		for _, want := range []string{`pipeline "p"`, "HTTP 400", "parse_exception", reason} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("message %q lacks %q", err.Error(), want)
+			}
+		}
+		if strings.Contains(err.Error(), "Failed to create pipeline: Failed to create pipeline") {
+			t.Fatalf("message still duplicates the Op: %q", err.Error())
+		}
+	})
+
+	t.Run("captured logs", func(t *testing.T) {
+		t.Parallel()
+		var buf bytes.Buffer
+		logger := zerolog.New(&buf)
+		secretReason := `Authorization: Bearer FAKE-SECRET-A at https://user:FAKE-SECRET-B@es.example/x?api_key=FAKE-SECRET-C ` +
+			`with password="FAKE SECRET D"`
+		body := `{"error":{"root_cause":[{"type":"security_exception","reason":` + strconv.Quote(secretReason) + `}],` +
+			`"type":"security_exception","reason":"denied","index":"FAKE-METADATA","stack_trace":"FAKE-TRACE"},"status":400}`
+		err := run(t, "p", body, &logger)
+		logs := buf.String()
+		for _, leak := range []string{"FAKE-SECRET", "FAKE SECRET", "FAKE-METADATA", "FAKE-TRACE"} {
+			if strings.Contains(err.Error(), leak) {
+				t.Fatalf("error leaks %q: %s", leak, err.Error())
+			}
+			if strings.Contains(logs, leak) {
+				t.Fatalf("log leaks %q: %s", leak, logs)
+			}
+		}
+		for _, want := range []string{"security_exception: Authorization: [REDACTED]", "https://[REDACTED]@es.example", "denied"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("message %q lacks %q", err.Error(), want)
+			}
+		}
+		if !strings.Contains(logs, `"pipeline":"p"`) || !strings.Contains(logs, `"status_code":400`) || strings.Contains(logs, `"body"`) {
+			t.Fatalf("failure log: want pipeline and status fields and no raw body field: %s", logs)
+		}
+	})
+
+	t.Run("public message bound", func(t *testing.T) {
+		t.Parallel()
+		nop := zerolog.Nop()
+		name := strings.Repeat(`"é\`, 100)
+		body := `{"error":{"type":"parse_exception","reason":"` + strings.Repeat("é", 3000) + `"},"status":400}`
+		err := run(t, name, body, &nop)
+		msg := err.Error()
+		if !strings.HasPrefix(msg, `Failed to create pipeline: pipeline "\"é\\`) || !strings.HasSuffix(msg, " [truncated]") {
+			t.Fatalf("message %q: want the fixed Op, quoted name and truncation marker", msg)
+		}
+		if !strings.Contains(msg, "rejected with HTTP 400: parse_exception: é") {
+			t.Fatalf("message lacks status and reason: %q", msg)
+		}
 	})
 }
 
