@@ -92,7 +92,7 @@ jobs:
               -X main.revision=${{ github.sha }} \
               -X main.buildRFC3339=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
             -o ${{ matrix.artifact }} \
-            ./cmd/${{ github.event.repository.name }}/main.go
+            ./cmd/${{ github.event.repository.name }}
 
       - name: Upload binary to release
         env:
