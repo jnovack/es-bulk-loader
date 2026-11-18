@@ -622,6 +622,73 @@ func TestRunFailureBoundary(t *testing.T) {
 	}
 }
 
+// TestRunErrorErrorNeverPanics pins RunError.Error for every combination of
+// Op, Kind and Err, including the zero value. Error is called directly because
+// callers such as loggers format a RunError outside Run. A nil Err with an
+// empty Op must fall back to Kind or ErrLoaderExecution rather than
+// dereference nil, and formatting must never write to the value or change its
+// errors.Is/Unwrap results.
+func TestRunErrorErrorNeverPanics(t *testing.T) {
+	t.Parallel()
+
+	cause := errors.New("cause")
+	custom := errors.New("custom kind")
+
+	tests := []struct {
+		name       string
+		in         *RunError
+		want       string
+		wantUnwrap error   // expected Unwrap result; nil means nil
+		wantIs     []error // each must match through errors.Is
+		notIs      []error // each must not match through errors.Is
+	}{
+		{name: "nil receiver", in: nil, want: ""},
+		{name: "Op and Err", in: &RunError{Op: "op", Err: cause}, want: "op: cause", wantUnwrap: cause, wantIs: []error{cause}},
+		{name: "Op only", in: &RunError{Op: "op"}, want: "op"},
+		{name: "Err only", in: &RunError{Err: cause}, want: "cause", wantUnwrap: cause, wantIs: []error{cause}},
+		{name: "Kind only", in: &RunError{Kind: ErrBulkFailure}, want: "bulk insert failed", wantIs: []error{ErrBulkFailure}},
+		{name: "execution Kind only", in: &RunError{Kind: ErrLoaderExecution}, want: "loader execution failed", wantIs: []error{ErrLoaderExecution}},
+		{name: "custom Kind only", in: &RunError{Kind: custom}, want: "custom kind", wantIs: []error{custom}},
+		{name: "zero value", in: &RunError{}, want: "loader execution failed", notIs: []error{ErrLoaderExecution, ErrBulkFailure}},
+		{name: "Kind with Op", in: &RunError{Kind: ErrBulkFailure, Op: "op"}, want: "op", wantIs: []error{ErrBulkFailure}},
+		{name: "Kind with Err", in: &RunError{Kind: ErrBulkFailure, Err: cause}, want: "cause", wantUnwrap: cause, wantIs: []error{ErrBulkFailure, cause}},
+		{name: "all fields", in: &RunError{Kind: ErrBulkFailure, Op: "op", Err: cause}, want: "op: cause", wantUnwrap: cause, wantIs: []error{ErrBulkFailure, cause}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if tt.in == nil {
+				if got := tt.in.Error(); got != tt.want {
+					t.Fatalf("Error() = %q, want %q", got, tt.want)
+				}
+				return
+			}
+
+			before := *tt.in
+			if got := tt.in.Error(); got != tt.want {
+				t.Fatalf("Error() = %q, want %q", got, tt.want)
+			}
+			if got := tt.in.Unwrap(); got != tt.wantUnwrap {
+				t.Fatalf("Unwrap() = %v, want %v", got, tt.wantUnwrap)
+			}
+			for _, target := range tt.wantIs {
+				if !errors.Is(tt.in, target) {
+					t.Fatalf("errors.Is(%v, %v) = false, want true", tt.in, target)
+				}
+			}
+			for _, target := range tt.notIs {
+				if errors.Is(tt.in, target) {
+					t.Fatalf("errors.Is(%v, %v) = true, want false", tt.in, target)
+				}
+			}
+			if tt.in.Kind != before.Kind || tt.in.Op != before.Op || tt.in.Err != before.Err {
+				t.Fatalf("Error() mutated fields: got %+v, want %+v", *tt.in, before)
+			}
+		})
+	}
+}
+
 // TestOperationKindsOfMovedHelpers keeps the public Kind evidence for helper
 // failures whose direct tests now live in their owner packages, where only the
 // internal Op is visible. Kind is derived from Op at the Run boundary, so each

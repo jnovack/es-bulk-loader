@@ -82,12 +82,28 @@ type RunError struct {
 }
 
 // Error returns the composed error message used by callers.
+//
+// A nil receiver returns "". Otherwise the message is Op alone when there is
+// no cause, "Op: cause" when both are set, and the cause's text when Op is
+// empty. A value with neither Op nor cause (zero value or Kind only) returns
+// Kind's text, or ErrLoaderExecution's text when Kind is nil. The fallback only
+// formats: it never sets Kind, synthesizes a cause, or changes errors.Is/As
+// results. Formatting must not panic on a nil cause, because callers such as
+// loggers report failures through Error() directly.
 func (e *RunError) Error() string {
 	if e == nil {
 		return ""
 	}
 	if e.Op == "" {
-		return e.Err.Error()
+		if e.Err != nil {
+			return e.Err.Error()
+		}
+		if e.Kind != nil {
+			return e.Kind.Error()
+		}
+		// Falling back to a fixed text rather than a default Kind keeps a
+		// zero-value message from implying a classification it never had.
+		return ErrLoaderExecution.Error()
 	}
 	if e.Err == nil {
 		return e.Op
