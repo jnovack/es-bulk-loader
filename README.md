@@ -293,6 +293,9 @@ go tool staticcheck -checks=SA1019 ./...
 go tool staticcheck -tags=e2e -checks=SA1019 ./...
 ```
 
+`make lint` runs both commands in that order and stops at the first failure.
+It fails on any finding or tool error. It runs no tests and needs no Docker.
+
 Canonical E2E command (also available as `make test-e2e`) uses the tagged
 suite entrypoint:
 
@@ -319,6 +322,7 @@ Makefile shortcuts:
 make test-unit
 make test-e2e
 make test-e2e-verbose
+make lint
 ```
 
 ## Loader Workflow

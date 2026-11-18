@@ -17,7 +17,7 @@ IMAGE ?= $(if $(and $(DOCKER_ORGANIZATION),$(DOCKER_REPOSITORY)),$(DOCKER_ORGANI
 
 URL ?= http://127.0.0.1:9200
 
-.PHONY: help docker-build print-vars test-unit test-e2e test-e2e-verbose
+.PHONY: help docker-build print-vars test-unit test-e2e test-e2e-verbose lint
 
 help:
 	@echo "Targets:"
@@ -26,6 +26,7 @@ help:
 	@echo "  make test-unit     Run unit tests"
 	@echo "  make test-e2e      Run canonical Go E2E suite (requires Docker)"
 	@echo "  make test-e2e-verbose  Run canonical Go E2E suite with verbose output"
+	@echo "  make lint          Run pinned staticcheck SA1019 check, untagged then -tags=e2e (no tests, no Docker)"
 
 print-vars:
 	@echo "DOCKERFILE=$(DOCKERFILE)"
@@ -48,6 +49,12 @@ test-e2e:
 
 test-e2e-verbose:
 	go test -count=1 -tags=e2e ./test -run TestEndToEndScenarios -v
+
+# Keep SA1019 only: expanding the check set needs separate review.
+# Use the go.mod pin to avoid a stale globally installed analyzer.
+lint:
+	go tool staticcheck -checks=SA1019 ./...
+	go tool staticcheck -tags=e2e -checks=SA1019 ./...
 
 docker-build:
 	docker buildx build \

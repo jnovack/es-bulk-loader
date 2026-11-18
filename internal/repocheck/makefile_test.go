@@ -1,8 +1,12 @@
 package repocheck
 
 import (
+	"errors"
+	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -140,5 +144,118 @@ func TestMakefileE2ETargetsDisableTestCache(t *testing.T) {
 		if !hasCountOne(lines) {
 			t.Errorf("%s recipe lacks -count=1 on a single direct `go test` line: %q", target, lines)
 		}
+	}
+}
+
+// lintGoStandIn records each argument list it receives and fails the
+// untagged or -tags=e2e invocation on request. It never runs Go itself.
+const lintGoStandIn = `#!/bin/sh
+echo "$*" >> "$LINT_RECORD"
+case "$*" in
+*-tags=e2e*) [ "$LINT_FAIL_TAGGED" = 1 ] && exit 1 ;;
+*) [ "$LINT_FAIL_UNTAGGED" = 1 ] && exit 1 ;;
+esac
+exit 0
+`
+
+// TestMakefileLintTarget runs the real lint recipe, copied into a fresh
+// directory, with the recording stand-in for go first on PATH. It guards the
+// order of the two SA1019 invocations, that the tagged pass never runs after
+// an untagged failure, that either failure fails make, and that a file named
+// "lint" cannot shadow the phony target. No analyzer, network or Docker runs.
+func TestMakefileLintTarget(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the go stand-in is a POSIX shell script")
+	}
+	makePath, err := exec.LookPath("make")
+	if err != nil {
+		t.Skipf("make not available: %v", err)
+	}
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skipf("POSIX sh not available: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join("..", "..", "Makefile"))
+	if err != nil {
+		t.Fatalf("read Makefile: %v", err)
+	}
+	const untagged = "tool staticcheck -checks=SA1019 ./..."
+	const tagged = "tool staticcheck -tags=e2e -checks=SA1019 ./..."
+	tests := []struct {
+		name         string
+		failUntagged bool
+		failTagged   bool
+		lintFile     bool
+		wantRecord   []string
+		wantFailure  bool
+	}{
+		{"both passes succeed in order", false, false, false, []string{untagged, tagged}, false},
+		{"untagged failure stops before tagged pass", true, false, false, []string{untagged}, true},
+		{"tagged failure after clean untagged pass fails", false, true, false, []string{untagged, tagged}, true},
+		{"file named lint does not shadow target", false, false, true, []string{untagged, tagged}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			binDir := filepath.Join(dir, "bin")
+			if err := os.Mkdir(binDir, 0o755); err != nil {
+				t.Fatalf("create stand-in dir: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(binDir, "go"), []byte(lintGoStandIn), 0o755); err != nil {
+				t.Fatalf("write go stand-in: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "Makefile"), raw, 0o644); err != nil {
+				t.Fatalf("copy Makefile: %v", err)
+			}
+			if tt.lintFile {
+				if err := os.WriteFile(filepath.Join(dir, "lint"), nil, 0o644); err != nil {
+					t.Fatalf("create lint file: %v", err)
+				}
+			}
+			recordPath := filepath.Join(dir, "record.txt")
+
+			// Drop caller make overrides so they cannot mask a failing recipe.
+			env := []string{
+				"PATH=" + binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+				"LINT_RECORD=" + recordPath,
+			}
+			if tt.failUntagged {
+				env = append(env, "LINT_FAIL_UNTAGGED=1")
+			}
+			if tt.failTagged {
+				env = append(env, "LINT_FAIL_TAGGED=1")
+			}
+			for _, kv := range os.Environ() {
+				if strings.HasPrefix(kv, "MAKEFLAGS=") || strings.HasPrefix(kv, "MFLAGS=") ||
+					strings.HasPrefix(kv, "GNUMAKEFLAGS=") || strings.HasPrefix(kv, "PATH=") ||
+					strings.HasPrefix(kv, "LINT_") {
+					continue
+				}
+				env = append(env, kv)
+			}
+
+			cmd := exec.CommandContext(t.Context(), makePath, "lint")
+			cmd.Dir = dir
+			cmd.Env = env
+			out, err := cmd.CombinedOutput()
+			if tt.wantFailure && err == nil {
+				t.Errorf("make lint succeeded, want failure; output:\n%s", out)
+			}
+			if !tt.wantFailure && err != nil {
+				t.Errorf("make lint failed, want success: %v; output:\n%s", err, out)
+			}
+
+			var got []string
+			data, readErr := os.ReadFile(recordPath)
+			switch {
+			case errors.Is(readErr, fs.ErrNotExist):
+			case readErr != nil:
+				t.Fatalf("read invocation record: %v", readErr)
+			default:
+				got = strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
+			}
+			if !slices.Equal(got, tt.wantRecord) {
+				t.Errorf("go invocations = %q, want %q; output:\n%s", got, tt.wantRecord, out)
+			}
+		})
 	}
 }
