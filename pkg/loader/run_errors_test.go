@@ -28,6 +28,7 @@ import (
 	"github.com/jnovack/es-bulk-loader/internal/testutil/esstub"
 	"github.com/jnovack/es-bulk-loader/internal/testutil/fixture"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/config"
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/esresponse"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/failure"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/managed"
 )
@@ -152,7 +153,7 @@ func TestRunErrorContract(t *testing.T) {
 			},
 			wantKind:   ErrIndexOperation,
 			wantOp:     "Failed to create index",
-			wantMsg:    "Failed to create index: Failed to create index",
+			wantMsg:    "Failed to create index: index \"cards\" rejected with HTTP 500: stub_failure",
 			wantResult: &Result{WriteIndex: "cards"},
 		},
 		{
@@ -219,7 +220,7 @@ func TestRunErrorContract(t *testing.T) {
 			},
 			wantKind:   ErrBulkFailure,
 			wantOp:     "Bulk API request failed",
-			wantMsg:    "Bulk API request failed: Bulk API request failed",
+			wantMsg:    "Bulk API request failed: bulk request rejected with HTTP 400: ES error detail unavailable (no recognizable error field)",
 			wantResult: &Result{WriteIndex: "cards"},
 		},
 		{
@@ -235,7 +236,7 @@ func TestRunErrorContract(t *testing.T) {
 			},
 			wantKind:   ErrEnrichExecution,
 			wantOp:     "Failed to get enrich policies",
-			wantMsg:    "Failed to get enrich policies: Failed to get enrich policies",
+			wantMsg:    "Failed to get enrich policies: enrich policy list request rejected with HTTP 500: stub_failure",
 			wantResult: &Result{WriteIndex: "cards"},
 		},
 	}
@@ -995,6 +996,34 @@ func TestRunStopsAfterDestructiveFailure(t *testing.T) {
 			wantKind:     ErrManagedResource,
 			wantOp:       "Failed to delete pipeline",
 			wantRequests: []string{"HEAD /cards", "DELETE /cards", "DELETE /_ingest/pipeline/p1"},
+		},
+		{
+			// An oversized policy-delete 404 cannot be classified, and predicate
+			// no-match alone would have reported an absent policy and let the
+			// reset continue into index create and bulk. It must stop at the
+			// existing Failed to delete enrich policy Op (ErrEnrichExecution).
+			name: "oversized policy delete 404 stops before index create and bulk",
+			setup: func(t *testing.T, rec *opRecorder) (*esstub.Stub, Options) {
+				oversized := esstub.JSON(http.StatusNotFound,
+					`{"error":{"type":"resource_not_found_exception"}}`+strings.Repeat(" ", 70_000))
+				stub := newRouteStub(t, map[string]http.HandlerFunc{
+					"HEAD /cards":                   replyHeadOK,
+					"DELETE /cards":                 replyAck,
+					"DELETE /_enrich/policy/{name}": rec.recorded("policy.delete", oversized),
+					"GET /_nodes":                   esstub.JSON(http.StatusOK, nodesBody),
+					"PUT /cards":                    rec.recorded("index.create", replyAck),
+					"POST /_bulk":                   rec.recorded("bulk", esstub.JSON(http.StatusOK, bulkOKBody("cards"))),
+				}, policyListRoutes(esstub.JSON(http.StatusOK, `{"policies":[{"config":{"match":{"name":"pol"}}}]}`)))
+				return stub, Options{
+					URL: stub.URL(), Index: "cards", DeleteIndex: true,
+					DataFile:     writeBulkDataFixture(t),
+					PoliciesFile: fixture.WriteTempJSON(t, t.TempDir(), `{"pol":`+stopPolicyBody+`}`),
+				}
+			},
+			wantKind:  ErrEnrichExecution,
+			wantOp:    "Failed to delete enrich policy",
+			wantLast:  "policy.delete",
+			forbidden: []string{"index.create", "bulk"},
 		},
 		{
 			// Run's alias -flush loop return. The first target has already been
@@ -2427,5 +2456,87 @@ func TestBasicAuthValidationEntrypoints(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestRunWrappedRejectionTailsKeepOpKindAndCapInnerText pins LOG-RAWBODY-01's
+// Q2 decision through the public Run boundary: the mapping-fetch and
+// transform _stats errors keep their Op and Kind, their raw body tail is
+// replaced by a Rejection whose own text is at most MaxPublicMessageBytes, and
+// the outer context is preserved, so the complete public message can be
+// longer than that bound.
+func TestRunWrappedRejectionTailsKeepOpKindAndCapInnerText(t *testing.T) {
+	t.Parallel()
+
+	longBody := `{"error":{"type":"t","reason":"` + strings.Repeat("é", 3000) + `"}}`
+	tests := []struct {
+		name       string
+		setup      func(t *testing.T) Options
+		wantKind   error
+		wantOp     string
+		wantPrefix string
+	}{
+		{
+			name: "mapping fetch",
+			setup: func(t *testing.T) Options {
+				stub := newRouteStub(t, map[string]http.HandlerFunc{
+					"HEAD /cards":          replyHeadOK,
+					"GET /cards/_mapping":  esstub.JSON(http.StatusInternalServerError, longBody),
+					"POST /cards/_refresh": esstub.JSON(http.StatusOK, refreshBody),
+				})
+				return Options{
+					URL: stub.URL(), Index: "cards", FlushIndex: true,
+					DataFile:     writeBulkDataFixture(t),
+					MappingsFile: fixture.WriteTempJSON(t, t.TempDir(), `{"properties":{"id":{"type":"keyword"}}}`),
+				}
+			},
+			wantKind:   ErrBulkFailure,
+			wantOp:     "Mapping preflight failed before bulk insert",
+			wantPrefix: `Mapping preflight failed before bulk insert: fetching mappings for index "cards" failed with status 500: index "cards" rejected with HTTP 500: t: ééé`,
+		},
+		{
+			name: "transform _stats status",
+			setup: func(t *testing.T) Options {
+				stub := newStageStub(t, map[string]http.HandlerFunc{
+					"GET /_transform/tx1/_stats": esstub.JSON(http.StatusBadRequest, longBody),
+				})
+				return Options{
+					URL: stub.URL(), Index: "cards", SyncManaged: true,
+					TransformsFile: fixture.WriteTempJSON(t, t.TempDir(), stopTransforms),
+					Transforms:     TransformOptions{Wait: true},
+				}
+			},
+			wantKind:   ErrManagedResource,
+			wantOp:     "Transform wait failed",
+			wantPrefix: `Transform wait failed: transform "tx1": _stats returned status 400: transform "tx1" rejected with HTTP 400: t: ééé`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := Run(t.Context(), tt.setup(t))
+
+			if err == nil {
+				t.Fatal("expected Run to fail")
+			}
+			assertRunError(t, err, tt.wantKind, tt.wantOp)
+			if !strings.HasPrefix(err.Error(), tt.wantPrefix) {
+				t.Fatalf("message = %.200q\nwant prefix %.200q", err.Error(), tt.wantPrefix)
+			}
+			var rejection *esresponse.Rejection
+			if !errors.As(err, &rejection) {
+				t.Fatalf("error %v does not wrap an *esresponse.Rejection", err)
+			}
+			if len(rejection.Error()) > esresponse.MaxPublicMessageBytes {
+				t.Fatalf("inner Rejection is %d bytes, want <= %d", len(rejection.Error()), esresponse.MaxPublicMessageBytes)
+			}
+			if len(err.Error()) <= len(rejection.Error()) {
+				t.Fatal("the preserved outer context must make the complete message longer than the inner Rejection")
+			}
+			if strings.Contains(err.Error(), longBody) {
+				t.Fatal("the raw body must not appear in the message")
+			}
+		})
 	}
 }

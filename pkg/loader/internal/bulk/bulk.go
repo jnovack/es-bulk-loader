@@ -11,7 +11,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 	"time"
@@ -388,13 +387,15 @@ func bulkInsert(
 		}
 
 		if res.IsError() {
-			body, _ := io.ReadAll(res.Body)
+			body, readErr := esresponse.ReadBounded(res.Body)
 			_ = res.Body.Close()
 			if shouldRetryBulkRequest(res.StatusCode, nil) && attempt < retryAttempts {
 				nextBackoff := computeExponentialBackoff(attempt, retryBackoffBase, retryBackoffMax)
 				runlog.From(ctx).Warn().
 					Int("status_code", res.StatusCode).
-					Str("body", string(body)).
+					Str("es_error", esresponse.NewRejection(
+						"bulk request", "", res.StatusCode, body, readErr,
+						esresponse.MaxPublicMessageBytes).Error()).
 					Int("attempt", attempt).
 					Int("max_attempts", retryAttempts).
 					Str("next_backoff", nextBackoff.String()).
@@ -405,9 +406,10 @@ func bulkInsert(
 				continue
 			}
 			return bulkInsertResult{}, runlog.Fail(runlog.FailureEvent(ctx).
-				Int("status_code", res.StatusCode).
-				Str("body", string(body)),
-				"Bulk API request failed", nil)
+				Int("status_code", res.StatusCode),
+				"Bulk API request failed", esresponse.NewRejection(
+					"bulk request", "", res.StatusCode, body, readErr,
+					esresponse.MaxPublicMessageBytes))
 		}
 
 		if attempt > 1 {

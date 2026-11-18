@@ -19,6 +19,7 @@ import (
 	"github.com/elastic/go-elasticsearch/v9"
 
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/config"
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/esresponse"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/runlog"
 )
 
@@ -178,12 +179,23 @@ func fetchIndexMappings(es *elasticsearch.Client, name string) (map[string]map[s
 	}
 	defer res.Body.Close()
 
+	// An error status is read bounded (it only feeds the Rejection detail); a
+	// 2xx body is decoded below, so it is read in full. The Rejection text is
+	// capped at MaxPublicMessageBytes on its own: this wrapper's prefix and the
+	// caller's Run Op stay outside that budget, so the complete message can be
+	// longer.
+	if res.IsError() {
+		errBody, err := esresponse.ReadBounded(res.Body)
+		if err != nil {
+			return nil, fmt.Errorf("reading mappings response for index %q: %w", name, err)
+		}
+		return nil, fmt.Errorf("fetching mappings for index %q failed with status %d: %w", name, res.StatusCode,
+			esresponse.NewRejection("index", name, res.StatusCode, errBody, nil, esresponse.MaxPublicMessageBytes))
+	}
+
 	body, err := io.ReadAll(res.Body)
 	if err != nil {
 		return nil, fmt.Errorf("reading mappings response for index %q: %w", name, err)
-	}
-	if res.IsError() {
-		return nil, fmt.Errorf("fetching mappings for index %q failed with status %d: %s", name, res.StatusCode, string(body))
 	}
 
 	var payload map[string]any
@@ -340,16 +352,29 @@ func Flush(ctx context.Context, es *elasticsearch.Client, index string) error {
 	}
 	defer res.Body.Close()
 
+	if res.IsError() {
+		body, readErr := esresponse.ReadBounded(res.Body)
+		if readErr != nil {
+			// A read failure keeps its own Op even on an error status. The
+			// Rejection cause hides the read error's text but keeps errors.Is.
+			return runlog.Fail(runlog.FailureEvent(ctx).
+				Str("index", index).
+				Int("status_code", res.StatusCode),
+				"Unable to read index flush response body", esresponse.NewRejection(
+					"index", index, res.StatusCode, body, readErr,
+					esresponse.MaxPublicMessageBytes))
+		}
+		return runlog.Fail(runlog.FailureEvent(ctx).
+			Str("index", index).
+			Int("status_code", res.StatusCode),
+			"Failed to flush index", esresponse.NewRejection(
+				"index", index, res.StatusCode, body, readErr,
+				esresponse.MaxPublicMessageBytes))
+	}
+
 	body, err := io.ReadAll(res.Body)
 	if err != nil {
 		return runlog.Fail(runlog.FailureEvent(ctx).Str("index", index), "Unable to read index flush response body", err)
-	}
-	if res.IsError() {
-		return runlog.Fail(runlog.FailureEvent(ctx).
-			Str("index", index).
-			Int("status_code", res.StatusCode).
-			Str("body", string(body)),
-			"Failed to flush index", nil)
 	}
 
 	var result struct {
@@ -424,11 +449,12 @@ func FindIndicesUsingDefaultPipeline(ctx context.Context, es *elasticsearch.Clie
 		return nil, nil
 	}
 	if res.IsError() {
-		body, _ := io.ReadAll(res.Body)
+		body, readErr := esresponse.ReadBounded(res.Body)
 		return nil, runlog.Fail(runlog.FailureEvent(ctx).
-			Int("status_code", res.StatusCode).
-			Str("body", string(body)),
-			"Failed to get index settings", nil)
+			Int("status_code", res.StatusCode),
+			"Failed to get index settings", esresponse.NewRejection(
+				"index settings request", "", res.StatusCode, body, readErr,
+				esresponse.MaxPublicMessageBytes))
 	}
 
 	var parsed map[string]struct {
@@ -466,13 +492,14 @@ func ClearDefaultPipeline(ctx context.Context, es *elasticsearch.Client, indices
 		}
 
 		if res.IsError() {
-			body, _ := io.ReadAll(res.Body)
+			body, readErr := esresponse.ReadBounded(res.Body)
 			res.Body.Close()
 			return runlog.Fail(runlog.FailureEvent(ctx).
 				Str("index", index).
-				Int("status_code", res.StatusCode).
-				Str("body", string(body)),
-				"Failed to clear index.default_pipeline", nil)
+				Int("status_code", res.StatusCode),
+				"Failed to clear index.default_pipeline", esresponse.NewRejection(
+					"index", index, res.StatusCode, body, readErr,
+					esresponse.MaxPublicMessageBytes))
 		}
 		res.Body.Close()
 
@@ -492,12 +519,13 @@ func Refresh(ctx context.Context, es *elasticsearch.Client, index string) error 
 	defer res.Body.Close()
 
 	if res.IsError() {
-		body, _ := io.ReadAll(res.Body)
+		body, readErr := esresponse.ReadBounded(res.Body)
 		return runlog.Fail(runlog.FailureEvent(ctx).
 			Str("index", index).
-			Int("status_code", res.StatusCode).
-			Str("body", string(body)),
-			"Failed to refresh index", nil)
+			Int("status_code", res.StatusCode),
+			"Failed to refresh index", esresponse.NewRejection(
+				"index", index, res.StatusCode, body, readErr,
+				esresponse.MaxPublicMessageBytes))
 	}
 
 	runlog.From(ctx).Info().Str("index", index).Msg("Refreshed index")
@@ -514,12 +542,13 @@ func Create(ctx context.Context, es *elasticsearch.Client, index, body string) e
 	}
 	defer res.Body.Close()
 	if res.IsError() {
-		responseBody, _ := io.ReadAll(res.Body)
+		responseBody, readErr := esresponse.ReadBounded(res.Body)
 		return runlog.Fail(runlog.FailureEvent(ctx).
 			Str("index", index).
-			Int("status_code", res.StatusCode).
-			Str("body", string(responseBody)),
-			"Failed to create index", nil)
+			Int("status_code", res.StatusCode),
+			"Failed to create index", esresponse.NewRejection(
+				"index", index, res.StatusCode, responseBody, readErr,
+				esresponse.MaxPublicMessageBytes))
 	}
 	return nil
 }

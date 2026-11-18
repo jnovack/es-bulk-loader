@@ -8,7 +8,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"slices"
 	"sort"
@@ -17,6 +16,7 @@ import (
 
 	"github.com/elastic/go-elasticsearch/v9"
 
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/esresponse"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/indexops"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/runlog"
 )
@@ -78,12 +78,13 @@ func ResolveTargets(ctx context.Context, es *elasticsearch.Client, alias string)
 		return nil, nil
 	}
 	if res.IsError() {
-		body, _ := io.ReadAll(res.Body)
+		body, readErr := esresponse.ReadBounded(res.Body)
 		return nil, runlog.Fail(runlog.FailureEvent(ctx).
 			Str("alias", alias).
-			Int("status_code", res.StatusCode).
-			Str("body", string(body)),
-			"Failed to resolve alias targets", nil)
+			Int("status_code", res.StatusCode),
+			"Failed to resolve alias targets", esresponse.NewRejection(
+				"alias", alias, res.StatusCode, body, readErr,
+				esresponse.MaxPublicMessageBytes))
 	}
 
 	var parsed map[string]json.RawMessage
@@ -142,13 +143,14 @@ func Update(ctx context.Context, es *elasticsearch.Client, alias, index string) 
 	defer res.Body.Close()
 
 	if res.IsError() {
-		body, _ := io.ReadAll(res.Body)
+		body, readErr := esresponse.ReadBounded(res.Body)
 		return runlog.Fail(runlog.FailureEvent(ctx).
 			Str("alias", alias).
 			Str("index", index).
-			Int("status_code", res.StatusCode).
-			Str("body", string(body)),
-			"Failed to update alias", nil)
+			Int("status_code", res.StatusCode),
+			"Failed to update alias", esresponse.NewRejection(
+				"alias", alias, res.StatusCode, body, readErr,
+				esresponse.MaxPublicMessageBytes))
 	}
 
 	runlog.From(ctx).Info().Str("alias", alias).Str("index", index).Msg("Alias now points to index")
@@ -186,12 +188,13 @@ func ListTimestampedIndices(ctx context.Context, es *elasticsearch.Client, alias
 		return nil, nil
 	}
 	if res.IsError() {
-		body, _ := io.ReadAll(res.Body)
+		body, readErr := esresponse.ReadBounded(res.Body)
 		return nil, runlog.Fail(runlog.FailureEvent(ctx).
 			Str("alias", alias).
-			Int("status_code", res.StatusCode).
-			Str("body", string(body)),
-			"Failed to list timestamped indices", nil)
+			Int("status_code", res.StatusCode),
+			"Failed to list timestamped indices", esresponse.NewRejection(
+				"alias", alias, res.StatusCode, body, readErr,
+				esresponse.MaxPublicMessageBytes))
 	}
 
 	var parsed map[string]json.RawMessage

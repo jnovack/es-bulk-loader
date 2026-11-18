@@ -86,21 +86,46 @@ are stable. Fixes to undocumented or data-corrupting behavior ship in
 minor releases with a release note. Changes to documented behavior get a
 deprecation path.
 
-**Error messages.** When Elasticsearch rejects an ingest-pipeline PUT, `Run`
-returns a `*RunError` (Op `Failed to create pipeline`, Kind
-`ErrManagedResource`) whose message names the pipeline, the HTTP status and up
-to four Elasticsearch type/reason pairs, bounded to 2,048 bytes in total.
-After the Op prefix the cause reads
-`pipeline "<name>" rejected with HTTP <status>: <type>: <reason>`, with further
-pairs separated by semicolons.
+**Error messages.** When Elasticsearch rejects a request in the enumerated
+HTTP-failure paths (ingest pipelines, enrich policies, transforms, indices,
+aliases, the bulk request and the list requests for index settings, ingest
+pipelines and enrich policies), `Run` returns a `*RunError` that keeps its
+existing Op and Kind and whose message names the resource, the HTTP status and
+up to four Elasticsearch type/reason pairs. After the Op prefix the cause reads
+`<resource> "<name>" rejected with HTTP <status>: <type>: <reason>`, with
+further pairs separated by semicolons. A request with no single resource name
+omits the quoted name: `bulk request rejected with HTTP 503: <type>: <reason>`.
+Paths that never read a response body, such as `indexops.Delete`, are
+unchanged and carry no richer cause.
+
+Error bodies are read with a bound of 64 KiB plus one probe byte; a branch that
+needs only the status may close the body without reading. Successful (2xx)
+responses that the loader decodes are not subject to this bound. The log line
+for a failure carries the same bounded text in its `error` field, and
+warnings and debug lines that report a failed request carry it in `es_error`;
+the raw response body is never logged or returned. The former `body` log field
+is gone. A child-task response that could not be parsed logs only its length
+(`body_bytes`).
+
+A direct failure message, Op prefix included, is at most 2,048 bytes. Two
+errors wrap the same bounded text inside longer context instead: the
+mapping-fetch error (`fetching mappings for index ... failed with status`) and
+the transform wait's `_stats returned status` error. Only the Rejection text
+inside them is capped at 2,048 bytes; their outer context (index, transform,
+timeout and Run Op) is preserved, so the complete message can be longer.
 
 URL credentials, sensitive query parameters, Authorization values and common
 secret keys (such as `password`, `api_key`, `token`, `secret`) are replaced
 with `[REDACTED]`. An unreadable, oversized (over 64 KiB), empty or non-JSON
-response yields a fixed explanation instead. The raw response body of this
-rejected pipeline PUT is never logged or returned. Redaction recognizes
-structured credentials only: free-text reasons can still contain sensitive
-prose that generic redaction cannot recognize.
+response yields a fixed explanation instead. An oversized body is treated as
+no match by the loader's body classifiers, so a body-dependent retry or
+recovery does not happen; an oversized 404 on an enrich-policy delete fails the
+run instead of being read as an absent policy. Status-only retries are
+unchanged. Redaction recognizes structured credentials only: free-text reasons
+can still contain sensitive prose that generic redaction cannot recognize.
+Failure text parsed out of successful (2xx) responses, such as the first flush
+shard failure, enrich task errors, bulk item reasons and transform failure
+reasons, is not covered by this contract.
 
 Full lifecycle run:
 

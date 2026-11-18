@@ -112,7 +112,8 @@ commitment.
     failure since the last valid poll; a valid poll clears it.
   - Enrich task polls retry the transient statuses only, not transport
     errors. The third consecutive transient status fails the policy (two
-    retries), logged at Error with its status and body. A decoded task poll
+    retries), logged at Error with its status and redacted ES error
+    (`es_error`). A decoded task poll
     resets the streak, and each policy has its own. This caps a failure
     streak, not execution time: a healthy running task still waits for
     completion or cancellation. The kickoff, alias reads and child-task reads

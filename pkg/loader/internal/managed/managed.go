@@ -12,7 +12,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"slices"
 	"strings"
@@ -444,37 +443,23 @@ func deletePolicyBestEffort(ctx context.Context, es *elasticsearch.Client, polic
 	}
 	defer res.Body.Close()
 
-	body, _ := io.ReadAll(res.Body)
 	if res.StatusCode == http.StatusNotFound {
 		runlog.From(ctx).Trace().Str("policy", policy).Msg("Managed policy GC found policy already deleted")
 		return
 	}
 	if res.IsError() {
+		body, readErr := esresponse.ReadBounded(res.Body)
 		runlog.From(ctx).Warn().
 			Str("policy", policy).
 			Int("status_code", res.StatusCode).
-			Str("body", string(body)).
+			Str("es_error", esresponse.NewRejection(
+				"enrich policy", policy, res.StatusCode, body, readErr,
+				esresponse.MaxPublicMessageBytes).Error()).
 			Msg("Managed policy GC could not delete policy")
 		return
 	}
 
 	runlog.From(ctx).Info().Str("policy", policy).Msg("Managed policy GC deleted unreferenced policy")
-}
-
-// createPipelineMessageBudget leaves room for the "<Op>: " prefix RunError
-// adds, so the complete public message stays within
-// esresponse.MaxPublicMessageBytes. It is derived from the same literal Op
-// passed to runlog.Fail below; keep the two in step.
-const createPipelineMessageBudget = esresponse.MaxPublicMessageBytes -
-	len("Failed to create pipeline: ")
-
-// readRejectionBody reads at most esresponse.MaxRejectionBodyBytes+1
-// bytes, so a hostile or huge rejection body cannot drive an unbounded
-// read or allocation; the probe byte lets NewRejection detect oversize.
-// It never closes body (the caller does) and starts no goroutine: the
-// request context bound to the response owns cancellation.
-func readRejectionBody(body io.Reader) ([]byte, error) {
-	return io.ReadAll(io.LimitReader(body, esresponse.MaxRejectionBodyBytes+1))
 }
 
 // CreatePipelines puts each pipeline in declared order and stops at the first
@@ -501,11 +486,11 @@ func CreatePipelines(ctx context.Context, es *elasticsearch.Client, definitions 
 			// carries bounded, redacted ES type/reason pairs, and the log reuses
 			// it through runlog.Fail's error field. The Op stays fixed so the
 			// RunError Kind (ErrManagedResource) does not change.
-			data, readErr := readRejectionBody(res.Body)
+			data, readErr := esresponse.ReadBounded(res.Body)
 			res.Body.Close()
 			cause := esresponse.NewRejection(
 				"pipeline", name, res.StatusCode, data, readErr,
-				createPipelineMessageBudget,
+				esresponse.MaxPublicMessageBytes,
 			)
 			return runlog.Fail(runlog.FailureEvent(ctx).
 				Str("pipeline", cause.ResourceName()).
@@ -536,13 +521,14 @@ func deletePipelines(ctx context.Context, es *elasticsearch.Client, names []stri
 			continue
 		}
 		if res.IsError() {
-			body, _ := io.ReadAll(res.Body)
+			body, readErr := esresponse.ReadBounded(res.Body)
 			res.Body.Close()
 			return runlog.Fail(runlog.FailureEvent(ctx).
 				Str("pipeline", name).
-				Int("status_code", res.StatusCode).
-				Str("body", string(body)),
-				"Failed to delete pipeline", nil)
+				Int("status_code", res.StatusCode),
+				"Failed to delete pipeline", esresponse.NewRejection(
+					"pipeline", name, res.StatusCode, body, readErr,
+					esresponse.MaxPublicMessageBytes))
 		}
 		res.Body.Close()
 
@@ -568,13 +554,15 @@ func CreatePolicies(ctx context.Context, es *elasticsearch.Client, definitions c
 				break
 			}
 
-			body, _ := io.ReadAll(res.Body)
+			body, readErr := esresponse.ReadBounded(res.Body)
 			res.Body.Close()
 
 			if esresponse.IsUnsupportedEnrichAPI(res.StatusCode, body) {
 				runlog.From(ctx).Warn().
 					Int("status_code", res.StatusCode).
-					Str("body", string(body)).
+					Str("es_error", esresponse.NewRejection(
+						"enrich API", "", res.StatusCode, body, readErr,
+						esresponse.MaxPublicMessageBytes).Error()).
 					Msg("Enrich policy endpoint returned a generic 404; check proxy or routing for /_enrich/policy and confirm this URL matches the backend used by Dev Tools")
 				return nil
 			}
@@ -583,7 +571,9 @@ func CreatePolicies(ctx context.Context, es *elasticsearch.Client, definitions c
 					Str("policy", name).
 					Int("attempt", attempt).
 					Int("status_code", res.StatusCode).
-					Str("body", string(body)).
+					Str("es_error", esresponse.NewRejection(
+						"enrich policy", name, res.StatusCode, body, readErr,
+						esresponse.MaxPublicMessageBytes).Error()).
 					Msg("Source index for enrich policy is not visible yet; retrying enrich policy creation")
 				if err := sleep(ctx, 500*time.Millisecond); err != nil {
 					return runlog.Fail(runlog.FailureEvent(ctx).Str("policy", name), "Context cancelled during enrich policy retry", err)
@@ -599,9 +589,10 @@ func CreatePolicies(ctx context.Context, es *elasticsearch.Client, definitions c
 
 			return runlog.Fail(runlog.FailureEvent(ctx).
 				Str("policy", name).
-				Int("status_code", res.StatusCode).
-				Str("body", string(body)),
-				"Failed to create enrich policy", nil)
+				Int("status_code", res.StatusCode),
+				"Failed to create enrich policy", esresponse.NewRejection(
+					"enrich policy", name, res.StatusCode, body, readErr,
+					esresponse.MaxPublicMessageBytes))
 		}
 	}
 	return nil
@@ -637,12 +628,27 @@ func deletePolicies(ctx context.Context, es *elasticsearch.Client, names []strin
 			}
 
 			if res.StatusCode == http.StatusNotFound {
-				body, _ := io.ReadAll(res.Body)
+				body, readErr := esresponse.ReadBounded(res.Body)
 				res.Body.Close()
+				if esresponse.Oversized(body) {
+					// A body past the read bound cannot be classified, and the
+					// classifier below would read "no ES error object" as an
+					// absent policy. An unclassifiable 404 must not be reported
+					// as success, so fail before the generic-404 and
+					// missing-policy split.
+					return runlog.Fail(runlog.FailureEvent(ctx).
+						Str("policy", name).
+						Int("status_code", res.StatusCode),
+						"Failed to delete enrich policy", esresponse.NewRejection(
+							"enrich policy", name, res.StatusCode, body, readErr,
+							esresponse.MaxPublicMessageBytes))
+				}
 				if esresponse.IsUnsupportedEnrichAPI(res.StatusCode, body) {
 					runlog.From(ctx).Warn().
 						Int("status_code", res.StatusCode).
-						Str("body", string(body)).
+						Str("es_error", esresponse.NewRejection(
+							"enrich API", "", res.StatusCode, body, readErr,
+							esresponse.MaxPublicMessageBytes).Error()).
 						Msg("Enrich policy endpoint returned a generic 404; check proxy or routing for /_enrich/policy and confirm this URL matches the backend used by Dev Tools")
 					return nil
 				}
@@ -650,7 +656,7 @@ func deletePolicies(ctx context.Context, es *elasticsearch.Client, names []strin
 				break
 			}
 			if res.IsError() {
-				body, _ := io.ReadAll(res.Body)
+				body, readErr := esresponse.ReadBounded(res.Body)
 				res.Body.Close()
 				if res.StatusCode == http.StatusConflict && nuke && policyDeleteBlockedByPipelineReference(body) && attempt == 1 {
 					referencing, err := findPipelinesReferencingPolicy(ctx, es, name)
@@ -660,9 +666,10 @@ func deletePolicies(ctx context.Context, es *elasticsearch.Client, names []strin
 					if len(referencing) == 0 {
 						return runlog.Fail(runlog.FailureEvent(ctx).
 							Str("policy", name).
-							Int("status_code", res.StatusCode).
-							Str("body", string(body)),
-							"Failed to delete enrich policy; nuke mode could not find referencing pipelines", nil)
+							Int("status_code", res.StatusCode),
+							"Failed to delete enrich policy; nuke mode could not find referencing pipelines", esresponse.NewRejection(
+								"enrich policy", name, res.StatusCode, body, readErr,
+								esresponse.MaxPublicMessageBytes))
 					}
 
 					runlog.From(ctx).Warn().
@@ -677,9 +684,10 @@ func deletePolicies(ctx context.Context, es *elasticsearch.Client, names []strin
 
 				return runlog.Fail(runlog.FailureEvent(ctx).
 					Str("policy", name).
-					Int("status_code", res.StatusCode).
-					Str("body", string(body)),
-					"Failed to delete enrich policy", nil)
+					Int("status_code", res.StatusCode),
+					"Failed to delete enrich policy", esresponse.NewRejection(
+						"enrich policy", name, res.StatusCode, body, readErr,
+						esresponse.MaxPublicMessageBytes))
 			}
 			res.Body.Close()
 
@@ -735,7 +743,7 @@ func deletePipelinesForNuke(ctx context.Context, es *elasticsearch.Client, names
 			continue
 		}
 		if res.IsError() {
-			body, _ := io.ReadAll(res.Body)
+			body, readErr := esresponse.ReadBounded(res.Body)
 			res.Body.Close()
 			if res.StatusCode == http.StatusBadRequest && pipelineDeleteBlockedByDefaultIndex(body) {
 				indices, err := indexops.FindIndicesUsingDefaultPipeline(ctx, es, name)
@@ -745,9 +753,10 @@ func deletePipelinesForNuke(ctx context.Context, es *elasticsearch.Client, names
 				if len(indices) == 0 {
 					return runlog.Fail(runlog.FailureEvent(ctx).
 						Str("pipeline", name).
-						Int("status_code", res.StatusCode).
-						Str("body", string(body)),
-						"Failed to delete pipeline; nuke mode could not find indices using it as default pipeline", nil)
+						Int("status_code", res.StatusCode),
+						"Failed to delete pipeline; nuke mode could not find indices using it as default pipeline", esresponse.NewRejection(
+							"pipeline", name, res.StatusCode, body, readErr,
+							esresponse.MaxPublicMessageBytes))
 				}
 
 				runlog.From(ctx).Warn().
@@ -764,9 +773,10 @@ func deletePipelinesForNuke(ctx context.Context, es *elasticsearch.Client, names
 			}
 			return runlog.Fail(runlog.FailureEvent(ctx).
 				Str("pipeline", name).
-				Int("status_code", res.StatusCode).
-				Str("body", string(body)),
-				"Failed to delete pipeline", nil)
+				Int("status_code", res.StatusCode),
+				"Failed to delete pipeline", esresponse.NewRejection(
+					"pipeline", name, res.StatusCode, body, readErr,
+					esresponse.MaxPublicMessageBytes))
 		}
 		res.Body.Close()
 
@@ -789,11 +799,12 @@ func findPipelinesReferencingPolicy(ctx context.Context, es *elasticsearch.Clien
 		return nil, nil
 	}
 	if res.IsError() {
-		body, _ := io.ReadAll(res.Body)
+		body, readErr := esresponse.ReadBounded(res.Body)
 		return nil, runlog.Fail(runlog.FailureEvent(ctx).
-			Int("status_code", res.StatusCode).
-			Str("body", string(body)),
-			"Failed to get ingest pipelines", nil)
+			Int("status_code", res.StatusCode),
+			"Failed to get ingest pipelines", esresponse.NewRejection(
+				"ingest pipeline list request", "", res.StatusCode, body, readErr,
+				esresponse.MaxPublicMessageBytes))
 	}
 
 	var definitions config.Definitions
@@ -853,11 +864,11 @@ func valueReferencesPolicy(value any, policy string) bool {
 // policyDeleteBlockedByPipelineReference reports a policy delete refused because
 // a pipeline references the policy.
 func policyDeleteBlockedByPipelineReference(body []byte) bool {
-	return bytes.Contains(body, []byte("pipeline is referencing it"))
+	return !esresponse.Oversized(body) && bytes.Contains(body, []byte("pipeline is referencing it"))
 }
 
 // pipelineDeleteBlockedByDefaultIndex reports a pipeline delete refused because
 // an index uses it as index.default_pipeline.
 func pipelineDeleteBlockedByDefaultIndex(body []byte) bool {
-	return bytes.Contains(body, []byte("cannot be deleted because it is the default pipeline"))
+	return !esresponse.Oversized(body) && bytes.Contains(body, []byte("cannot be deleted because it is the default pipeline"))
 }

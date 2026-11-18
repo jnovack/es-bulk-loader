@@ -17,8 +17,10 @@ const (
 	// MaxRejectionBodyBytes is the most response content diagnostics read;
 	// one more byte is read only to detect an oversized body.
 	MaxRejectionBodyBytes = 64 << 10 // 65536
-	// MaxPublicMessageBytes bounds the complete public err.Error() of an
-	// HTTP rejection, operation prefix included.
+	// MaxPublicMessageBytes bounds the complete public err.Error() at direct
+	// Rejection failure sites, operation prefix included (runlog.Fail applies
+	// the Op-relative bound). For the two wrapped diagnostic paths (mapping
+	// fetch and transform _stats) it bounds only the inner Rejection text.
 	MaxPublicMessageBytes = 2048
 
 	maxDiagnosticPairs   = 4
@@ -88,20 +90,64 @@ func NewRejection(
 	}
 
 	detail := rejectionDetail(data, readErr)
-	msg := fmt.Sprintf("%s %q rejected with HTTP %d: %s", resource, displayName, status, detail)
-	if len(msg) > maxMessageBytes {
-		// Cutting the whole message at the budget only ever cuts the detail
-		// when the budget fits the prefix; sanitization already ran, so a cut
-		// can split a placeholder but never expose a secret.
-		if maxMessageBytes > len(truncationMarker) {
-			msg = truncateUTF8(msg, maxMessageBytes-len(truncationMarker)) + truncationMarker
-		} else {
-			msg = truncateUTF8(msg, maxMessageBytes)
-		}
+	var msg string
+	if name == "" {
+		// Some requests have no single resource (bulk, list requests); an empty
+		// quoted name would print `bulk ""`, so the name is omitted instead.
+		msg = fmt.Sprintf("%s rejected with HTTP %d: %s", resource, status, detail)
+	} else {
+		msg = fmt.Sprintf("%s %q rejected with HTTP %d: %s", resource, displayName, status, detail)
 	}
 
-	return &Rejection{msg: msg, err: readErr, resourceName: displayName}
+	return &Rejection{msg: boundMessage(msg, maxMessageBytes), err: readErr, resourceName: displayName}
 }
+
+// boundMessage cuts msg to at most max bytes at a rune boundary, ending with
+// the truncation marker when the budget can fit it. It is the one cut
+// algorithm shared by NewRejection and Bounded. Cutting the whole message at
+// the budget only ever cuts the detail when the budget fits the prefix;
+// sanitization already ran, so a cut can split a placeholder but never expose a
+// secret.
+func boundMessage(msg string, max int) string {
+	if len(msg) <= max {
+		return msg
+	}
+	if max > len(truncationMarker) {
+		return truncateUTF8(msg, max-len(truncationMarker)) + truncationMarker
+	}
+	return truncateUTF8(msg, max)
+}
+
+// Bounded returns r unchanged when its message fits max bytes, otherwise a
+// copy whose message is cut at a rune boundary to max with the truncation
+// marker when the budget can fit it, exactly as NewRejection cuts.
+// max <= 0 yields an empty message. The copy preserves the read error and
+// resource display name and never modifies the receiver.
+func (r *Rejection) Bounded(max int) *Rejection {
+	if max < 0 {
+		max = 0
+	}
+	if len(r.msg) <= max {
+		return r
+	}
+	return &Rejection{msg: boundMessage(r.msg, max), err: r.err, resourceName: r.resourceName}
+}
+
+// ReadBounded reads at most MaxRejectionBodyBytes+1 bytes of an error
+// response body, so a hostile or huge body cannot drive an unbounded read or
+// allocation; the probe byte lets NewRejection detect oversize. It reads only
+// the caller-supplied reader, never closes it, sends no request and does not
+// log.
+func ReadBounded(body io.Reader) ([]byte, error) {
+	return io.ReadAll(io.LimitReader(body, MaxRejectionBodyBytes+1))
+}
+
+// Oversized reports whether data, as returned by ReadBounded, hit the probe
+// byte and is therefore a cut body. Body classifiers must treat a cut body as
+// no match: they are substring checks, so a cut body could still match a token
+// in its first MaxRejectionBodyBytes bytes or lose the "error":{ marker they
+// look for.
+func Oversized(data []byte) bool { return len(data) > MaxRejectionBodyBytes }
 
 // rejectionDetail selects the fallback or the extracted pairs, in the
 // documented precedence: read failure, oversize, empty, not one JSON value,

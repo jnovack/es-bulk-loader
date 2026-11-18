@@ -1,9 +1,9 @@
 // Package esresponse holds pure predicates over Elasticsearch HTTP responses
 // and transport errors that more than one owner package needs (bulk, enrich,
 // managed, transform), plus bounded, redacted rejection diagnostics
-// (NewRejection): they read a status code, raw body or error value and never
-// perform I/O or log. Callers own body reads, retry counts, sleeps and
-// deadlines.
+// (NewRejection). Callers own requests, closing, retries, sleeps and
+// deadlines; the package does not log. ReadBounded is its only read, of a
+// caller-supplied body with a fixed bound.
 package esresponse
 
 import (
@@ -56,7 +56,7 @@ func IsRetryableTransportError(err error) bool {
 // error object: a proxy or routing problem in front of the enrich API, not a
 // missing policy (resource_not_found_exception) or another ES error.
 func IsUnsupportedEnrichAPI(statusCode int, body []byte) bool {
-	if statusCode != http.StatusNotFound {
+	if statusCode != http.StatusNotFound || Oversized(body) {
 		return false
 	}
 
@@ -70,5 +70,8 @@ func IsUnsupportedEnrichAPI(statusCode int, body []byte) bool {
 // HasErrorType reports whether body contains an Elasticsearch error of
 // errorType (a literal "type":"<errorType>" match).
 func HasErrorType(body []byte, errorType string) bool {
+	if Oversized(body) {
+		return false
+	}
 	return bytes.Contains(body, []byte(`"type":"`+errorType+`"`))
 }

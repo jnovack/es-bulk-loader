@@ -138,8 +138,8 @@ func TestWaitForCheckpointRetries(t *testing.T) {
 			wantGets:   3,
 			wantSleeps: 2,
 			wantWarns: []wantRetryWarn{
-				{1, http.StatusServiceUnavailable, `_stats returned status 503: {"error":"unavailable"}`},
-				{2, http.StatusBadGateway, "_stats returned status 502: <html>bad gateway</html>"},
+				{1, http.StatusServiceUnavailable, statsStatus(503, "unavailable")},
+				{2, http.StatusBadGateway, statsStatus(502, notJSON)},
 			},
 		},
 		{

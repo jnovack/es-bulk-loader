@@ -13,6 +13,7 @@ import (
 	"github.com/elastic/go-elasticsearch/v9"
 
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/config"
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/esresponse"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/progress"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/runlog"
 )
@@ -110,14 +111,15 @@ func CreateOrUpdate(ctx context.Context, es *elasticsearch.Client, definitions c
 		if err := runlog.Check(ctx, "creating transform", err); err != nil {
 			return err
 		}
-		body, _ := io.ReadAll(res.Body)
+		body, readErr := esresponse.ReadBounded(res.Body)
 		res.Body.Close()
 		if res.IsError() {
 			return runlog.Fail(runlog.FailureEvent(ctx).
 				Str("transform", name).
-				Int("status_code", res.StatusCode).
-				Str("body", string(body)),
-				"Failed to create transform", nil)
+				Int("status_code", res.StatusCode),
+				"Failed to create transform", esresponse.NewRejection(
+					"transform", name, res.StatusCode, body, readErr,
+					esresponse.MaxPublicMessageBytes))
 		}
 		runlog.From(ctx).Info().Str("transform", name).Msg("Transform created")
 	}
@@ -134,19 +136,24 @@ func transformExists(ctx context.Context, es *elasticsearch.Client, name string)
 	if err := runlog.Check(ctx, "checking if transform exists", err); err != nil {
 		return false, err
 	}
-	body, _ := io.ReadAll(res.Body)
-	res.Body.Close()
-
 	if res.StatusCode == http.StatusNotFound {
+		res.Body.Close()
 		return false, nil
 	}
 	if res.IsError() {
+		body, readErr := esresponse.ReadBounded(res.Body)
+		res.Body.Close()
 		return false, runlog.Fail(runlog.FailureEvent(ctx).
 			Str("transform", name).
-			Int("status_code", res.StatusCode).
-			Str("body", string(body)),
-			"Failed to check transform existence", nil)
+			Int("status_code", res.StatusCode),
+			"Failed to check transform existence", esresponse.NewRejection(
+				"transform", name, res.StatusCode, body, readErr,
+				esresponse.MaxPublicMessageBytes))
 	}
+	// A 2xx body is decoded for its count, so it is read in full; only the
+	// error branch above is bounded.
+	body, _ := io.ReadAll(res.Body)
+	res.Body.Close()
 	var parsed struct {
 		Count int `json:"count"`
 	}
@@ -173,7 +180,7 @@ func StopBestEffort(ctx context.Context, es *elasticsearch.Client, names []strin
 		if err := runlog.Check(ctx, "stopping transform", err); err != nil {
 			return err
 		}
-		body, _ := io.ReadAll(res.Body)
+		body, readErr := esresponse.ReadBounded(res.Body)
 		res.Body.Close()
 
 		if res.StatusCode == http.StatusNotFound || stopAlreadyStopped(res.StatusCode, body) {
@@ -183,9 +190,10 @@ func StopBestEffort(ctx context.Context, es *elasticsearch.Client, names []strin
 		if res.IsError() {
 			return runlog.Fail(runlog.FailureEvent(ctx).
 				Str("transform", name).
-				Int("status_code", res.StatusCode).
-				Str("body", string(body)),
-				"Failed to stop transform", nil)
+				Int("status_code", res.StatusCode),
+				"Failed to stop transform", esresponse.NewRejection(
+					"transform", name, res.StatusCode, body, readErr,
+					esresponse.MaxPublicMessageBytes))
 		}
 		runlog.From(ctx).Debug().Str("transform", name).Msg("Transform stopped")
 	}
@@ -208,7 +216,7 @@ func Delete(ctx context.Context, es *elasticsearch.Client, names []string) error
 		if err := runlog.Check(ctx, "deleting transform", err); err != nil {
 			return err
 		}
-		body, _ := io.ReadAll(res.Body)
+		body, readErr := esresponse.ReadBounded(res.Body)
 		res.Body.Close()
 
 		if res.StatusCode == http.StatusNotFound {
@@ -218,9 +226,10 @@ func Delete(ctx context.Context, es *elasticsearch.Client, names []string) error
 		if res.IsError() {
 			return runlog.Fail(runlog.FailureEvent(ctx).
 				Str("transform", name).
-				Int("status_code", res.StatusCode).
-				Str("body", string(body)),
-				"Failed to delete transform", nil)
+				Int("status_code", res.StatusCode),
+				"Failed to delete transform", esresponse.NewRejection(
+					"transform", name, res.StatusCode, body, readErr,
+					esresponse.MaxPublicMessageBytes))
 		}
 		runlog.From(ctx).Info().Str("transform", name).Msg("Transform deleted")
 	}
@@ -241,7 +250,7 @@ func Start(ctx context.Context, es *elasticsearch.Client, names []string) error 
 		if err := runlog.Check(ctx, "starting transform", err); err != nil {
 			return err
 		}
-		body, _ := io.ReadAll(res.Body)
+		body, readErr := esresponse.ReadBounded(res.Body)
 		res.Body.Close()
 
 		if startAlreadyStarted(res.StatusCode, body) {
@@ -251,9 +260,10 @@ func Start(ctx context.Context, es *elasticsearch.Client, names []string) error 
 		if res.IsError() {
 			return runlog.Fail(runlog.FailureEvent(ctx).
 				Str("transform", name).
-				Int("status_code", res.StatusCode).
-				Str("body", string(body)),
-				"Failed to start transform", nil)
+				Int("status_code", res.StatusCode),
+				"Failed to start transform", esresponse.NewRejection(
+					"transform", name, res.StatusCode, body, readErr,
+					esresponse.MaxPublicMessageBytes))
 		}
 
 		runlog.From(ctx).Info().Str("transform", name).Msg("Transform started")
@@ -263,7 +273,7 @@ func Start(ctx context.Context, es *elasticsearch.Client, names []string) error 
 
 // stopAlreadyStopped reports a stop rejected because the transform is stopped.
 func stopAlreadyStopped(statusCode int, body []byte) bool {
-	if statusCode != http.StatusConflict && statusCode != http.StatusBadRequest {
+	if (statusCode != http.StatusConflict && statusCode != http.StatusBadRequest) || esresponse.Oversized(body) {
 		return false
 	}
 	lowered := strings.ToLower(string(body))
@@ -272,7 +282,7 @@ func stopAlreadyStopped(statusCode int, body []byte) bool {
 
 // startAlreadyStarted reports a start rejected because the transform runs.
 func startAlreadyStarted(statusCode int, body []byte) bool {
-	if statusCode != http.StatusConflict && statusCode != http.StatusBadRequest {
+	if (statusCode != http.StatusConflict && statusCode != http.StatusBadRequest) || esresponse.Oversized(body) {
 		return false
 	}
 	lowered := strings.ToLower(string(body))
@@ -399,7 +409,14 @@ func statsGetter(es *elasticsearch.Client) Getter {
 			return 0, nil, err
 		}
 		defer res.Body.Close()
-		body, err := io.ReadAll(res.Body)
+		// An error status is read bounded (it only feeds a Rejection); a 2xx
+		// body is decoded by ParseStats, so it is read in full. A read error is
+		// the same transport/read failure on both branches, ahead of the status.
+		read := io.ReadAll
+		if res.StatusCode < 200 || res.StatusCode > 299 {
+			read = esresponse.ReadBounded
+		}
+		body, err := read(res.Body)
 		if err != nil {
 			return 0, nil, fmt.Errorf("reading _stats response: %w", err)
 		}

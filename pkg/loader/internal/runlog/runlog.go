@@ -11,6 +11,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/esresponse"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/failure"
 )
 
@@ -66,7 +67,20 @@ func FailureEvent(ctx context.Context) *zerolog.Event {
 // must not add their own .Err: a second copy could drift from the returned
 // cause. A nil cause logs no error field (as the former panic bridge did) and
 // is returned as errors.New(op) (see failure.New).
+//
+// A *esresponse.Rejection cause is re-bounded here, with the op already in
+// hand, so the whole "<op>: <cause>" message (see failure.Error.Error) stays
+// within esresponse.MaxPublicMessageBytes. Doing it here keeps every op a
+// single literal passed directly to Fail (the opkind scanner requires that)
+// and needs no per-site budget constant. The logged error field and the
+// returned cause use the same bounded value. An op longer than the whole cap
+// clamps the cause budget to zero rather than going negative; no total cap is
+// claimed for such an op. Other causes pass through unchanged.
 func Fail(event *zerolog.Event, op string, cause error) error {
+	if r, ok := cause.(*esresponse.Rejection); ok && r != nil {
+		budget := max(0, esresponse.MaxPublicMessageBytes-len(op)-len(": "))
+		cause = r.Bounded(budget)
+	}
 	event.Err(cause).Msg(op)
 	return failure.New(op, cause)
 }

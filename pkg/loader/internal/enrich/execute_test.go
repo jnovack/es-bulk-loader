@@ -592,10 +592,23 @@ func TestExecutePolicyPollRetries(t *testing.T) {
 	readErr := errors.New("injected body read failure")
 	closeErr := errors.New("injected body close failure")
 
+	// The poll diagnostics log es_error, the sanitized Rejection text, never
+	// the raw body: a fully read non-JSON body yields the fixed not-JSON
+	// detail, an injected read error the fixed read-failed detail, and a JSON
+	// ES error its type/reason.
+	const (
+		notJSON    = "ES error detail unavailable (response is not a single JSON value)"
+		readFailed = "ES error detail unavailable (response body read failed)"
+	)
+	es := func(status int, detail string) string {
+		return fmt.Sprintf("enrich task \"node:1\" rejected with HTTP %d: %s", status, detail)
+	}
+	busy := taskStep{status: http.StatusServiceUnavailable, body: `{"error":{"type":"x","reason":"busy"}}`}
+
 	type warn struct {
 		attempt int
 		status  int
-		body    string
+		es      string // exact expected es_error
 		field   string // optional extra diagnostic field that must be present
 	}
 	type row struct {
@@ -609,7 +622,7 @@ func TestExecutePolicyPollRetries(t *testing.T) {
 		wantWarns     []warn
 		wantFinalMsg  string // the terminal Error message, "" for none
 		wantFinalCode int    // its status_code, 0 for none
-		wantFinalBody string
+		wantFinalES   string
 		wantFinalTry  int    // its attempt field, 0 for absent
 		wantFinalErr  string // substring of its error field
 		wantVerdict   string // alias verification message for task-404 rows
@@ -623,7 +636,7 @@ func TestExecutePolicyPollRetries(t *testing.T) {
 			want:       true,
 			wantPolls:  3,
 			wantSleeps: 3,
-			wantWarns:  []warn{{1, status, fail.body, ""}, {2, status, fail.body, ""}},
+			wantWarns:  []warn{{1, status, es(status, notJSON), ""}, {2, status, es(status, notJSON), ""}},
 		})
 	}
 	tests = append(tests,
@@ -632,10 +645,10 @@ func TestExecutePolicyPollRetries(t *testing.T) {
 			tasks:         []taskStep{unavailable, unavailable, unavailable},
 			wantPolls:     3,
 			wantSleeps:    3,
-			wantWarns:     []warn{{1, 503, unavailable.body, ""}, {2, 503, unavailable.body, ""}},
+			wantWarns:     []warn{{1, 503, es(503, "unavailable"), ""}, {2, 503, es(503, "unavailable"), ""}},
 			wantFinalMsg:  msgTaskPollError,
 			wantFinalCode: 503,
-			wantFinalBody: unavailable.body,
+			wantFinalES:   es(503, "unavailable"),
 			wantFinalTry:  3,
 		},
 		row{
@@ -643,10 +656,10 @@ func TestExecutePolicyPollRetries(t *testing.T) {
 			tasks:         []taskStep{{status: 429, body: "a"}, {status: 502, body: "b"}, {status: 504, body: "c"}},
 			wantPolls:     3,
 			wantSleeps:    3,
-			wantWarns:     []warn{{1, 429, "a", ""}, {2, 502, "b", ""}},
+			wantWarns:     []warn{{1, 429, es(429, notJSON), ""}, {2, 502, es(502, notJSON), ""}},
 			wantFinalMsg:  msgTaskPollError,
 			wantFinalCode: 504,
-			wantFinalBody: "c",
+			wantFinalES:   es(504, notJSON),
 			wantFinalTry:  3,
 		},
 		row{
@@ -655,7 +668,7 @@ func TestExecutePolicyPollRetries(t *testing.T) {
 			want:       true,
 			wantPolls:  5,
 			wantSleeps: 5,
-			wantWarns:  []warn{{1, 503, unavailable.body, ""}, {1, 503, unavailable.body, ""}, {2, 503, unavailable.body, ""}},
+			wantWarns:  []warn{{1, 503, es(503, "unavailable"), ""}, {1, 503, es(503, "unavailable"), ""}, {2, 503, es(503, "unavailable"), ""}},
 		},
 		row{
 			name:       "read error body still retries by status",
@@ -663,7 +676,7 @@ func TestExecutePolicyPollRetries(t *testing.T) {
 			want:       true,
 			wantPolls:  2,
 			wantSleeps: 2,
-			wantWarns:  []warn{{1, 503, "partial-503", "body_error"}},
+			wantWarns:  []warn{{1, 503, es(503, readFailed), "body_error"}},
 		},
 		row{
 			name:       "close error body still retries by status",
@@ -671,7 +684,18 @@ func TestExecutePolicyPollRetries(t *testing.T) {
 			want:       true,
 			wantPolls:  2,
 			wantSleeps: 2,
-			wantWarns:  []warn{{1, 503, "closing-503", "body_close_error"}},
+			wantWarns:  []warn{{1, 503, es(503, notJSON), "body_close_error"}},
+		},
+		row{
+			name:          "a JSON type and reason stay visible in the retry warn",
+			tasks:         []taskStep{busy, busy, busy},
+			wantPolls:     3,
+			wantSleeps:    3,
+			wantWarns:     []warn{{1, 503, es(503, "x: busy"), ""}, {2, 503, es(503, "x: busy"), ""}},
+			wantFinalMsg:  msgTaskPollError,
+			wantFinalCode: 503,
+			wantFinalES:   es(503, "x: busy"),
+			wantFinalTry:  3,
 		},
 		row{
 			name:          "400 fails on the first poll",
@@ -680,7 +704,7 @@ func TestExecutePolicyPollRetries(t *testing.T) {
 			wantSleeps:    1,
 			wantFinalMsg:  msgTaskPollError,
 			wantFinalCode: 400,
-			wantFinalBody: "bad",
+			wantFinalES:   es(400, notJSON),
 		},
 		row{
 			name:          "500 fails on the first poll",
@@ -689,7 +713,7 @@ func TestExecutePolicyPollRetries(t *testing.T) {
 			wantSleeps:    1,
 			wantFinalMsg:  msgTaskPollError,
 			wantFinalCode: 500,
-			wantFinalBody: "boom",
+			wantFinalES:   es(500, notJSON),
 		},
 		row{
 			name:         "malformed 2xx fails on the first poll",
@@ -712,7 +736,7 @@ func TestExecutePolicyPollRetries(t *testing.T) {
 			cancelOnSleep: 2,
 			wantPolls:     1,
 			wantSleeps:    2,
-			wantWarns:     []warn{{1, 503, unavailable.body, ""}},
+			wantWarns:     []warn{{1, 503, es(503, "unavailable"), ""}},
 			wantFinalMsg:  msgPollCancelled,
 		},
 		row{
@@ -722,7 +746,7 @@ func TestExecutePolicyPollRetries(t *testing.T) {
 			want:        true,
 			wantPolls:   3,
 			wantSleeps:  3,
-			wantWarns:   []warn{{1, 503, unavailable.body, ""}, {2, 503, unavailable.body, ""}},
+			wantWarns:   []warn{{1, 503, es(503, "unavailable"), ""}, {2, 503, es(503, "unavailable"), ""}},
 			wantVerdict: msgAliasVerified,
 		},
 		row{
@@ -731,7 +755,7 @@ func TestExecutePolicyPollRetries(t *testing.T) {
 			aliases:     []aliasStep{absent, absent},
 			wantPolls:   3,
 			wantSleeps:  3,
-			wantWarns:   []warn{{1, 503, unavailable.body, ""}, {2, 503, unavailable.body, ""}},
+			wantWarns:   []warn{{1, 503, es(503, "unavailable"), ""}, {2, 503, es(503, "unavailable"), ""}},
 			wantVerdict: msgAliasNotMoved,
 		},
 		row{
@@ -740,7 +764,7 @@ func TestExecutePolicyPollRetries(t *testing.T) {
 			aliases:     []aliasStep{absent, {status: http.StatusInternalServerError, body: `{"error":{"type":"boom"}}`}},
 			wantPolls:   3,
 			wantSleeps:  3,
-			wantWarns:   []warn{{1, 503, unavailable.body, ""}, {2, 503, unavailable.body, ""}},
+			wantWarns:   []warn{{1, 503, es(503, "unavailable"), ""}, {2, 503, es(503, "unavailable"), ""}},
 			wantVerdict: msgAliasUnverified,
 		},
 	)
@@ -906,8 +930,11 @@ func TestExecutePolicyPollRetries(t *testing.T) {
 					line["status_code"] != float64(w.status) || line["attempt"] != float64(w.attempt) {
 					t.Fatalf("retry warn %d = %v, want policy-a/node:1, status %d, attempt %d", i, line, w.status, w.attempt)
 				}
-				if body, _ := line["body"].(string); !strings.Contains(body, w.body) {
-					t.Fatalf("retry warn %d body = %q, want it to contain %q", i, body, w.body)
+				if _, has := line["body"]; has {
+					t.Fatalf("retry warn %d = %v, must not log the raw body", i, line)
+				}
+				if got, _ := line["es_error"].(string); got != w.es {
+					t.Fatalf("retry warn %d es_error = %q, want %q", i, got, w.es)
 				}
 				if w.field != "" {
 					if text, _ := line[w.field].(string); text == "" {
@@ -932,8 +959,11 @@ func TestExecutePolicyPollRetries(t *testing.T) {
 				if tt.wantFinalCode != 0 && line["status_code"] != float64(tt.wantFinalCode) {
 					t.Fatalf("terminal line = %v, want status_code %d", line, tt.wantFinalCode)
 				}
-				if body, _ := line["body"].(string); tt.wantFinalBody != "" && body != tt.wantFinalBody {
-					t.Fatalf("terminal line body = %q, want %q", body, tt.wantFinalBody)
+				if _, has := line["body"]; has {
+					t.Fatalf("terminal line = %v, must not log the raw body", line)
+				}
+				if got, _ := line["es_error"].(string); tt.wantFinalES != "" && got != tt.wantFinalES {
+					t.Fatalf("terminal line es_error = %q, want %q", got, tt.wantFinalES)
 				}
 				attempt, hasAttempt := line["attempt"]
 				if tt.wantFinalTry == 0 && hasAttempt {

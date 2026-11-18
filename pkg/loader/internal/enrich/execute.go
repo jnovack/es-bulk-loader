@@ -117,18 +117,21 @@ func ListPolicies(ctx context.Context, es *elasticsearch.Client) ([]string, bool
 	defer res.Body.Close()
 
 	if res.IsError() {
-		body, _ := io.ReadAll(res.Body)
+		body, readErr := esresponse.ReadBounded(res.Body)
 		if esresponse.IsUnsupportedEnrichAPI(res.StatusCode, body) {
 			runlog.From(ctx).Warn().
 				Int("status_code", res.StatusCode).
-				Str("body", string(body)).
+				Str("es_error", esresponse.NewRejection(
+					"enrich API", "", res.StatusCode, body, readErr,
+					esresponse.MaxPublicMessageBytes).Error()).
 				Msg("Enrich policy endpoint returned a generic 404; check proxy or routing for /_enrich/policy and confirm this URL matches the backend used by Dev Tools")
 			return nil, false, nil
 		}
 		return nil, false, runlog.Fail(runlog.FailureEvent(ctx).
-			Int("status_code", res.StatusCode).
-			Str("body", string(body)),
-			"Failed to get enrich policies", nil)
+			Int("status_code", res.StatusCode),
+			"Failed to get enrich policies", esresponse.NewRejection(
+				"enrich policy list request", "", res.StatusCode, body, readErr,
+				esresponse.MaxPublicMessageBytes))
 	}
 
 	var parsed policiesResponse
@@ -328,8 +331,9 @@ func verifyEnrichOutcome(
 	elapsed := now().Sub(startTime).Seconds()
 
 	if beforeErr != nil || afterErr != nil {
-		// ResolveTargets has already logged the HTTP status/body or decode
-		// cause; this line adds the policy and task the failure belongs to.
+		// ResolveTargets has already logged the HTTP status and bounded ES
+		// error or decode cause; this line adds the policy and task the
+		// failure belongs to.
 		// .Err carries the first failed read; before_error/after_error carry
 		// each one, so a double failure loses neither.
 		firstErr := beforeErr
@@ -426,19 +430,23 @@ func executePolicy(ctx context.Context, es *elasticsearch.Client, policy string,
 	defer res.Body.Close()
 
 	if res.IsError() {
-		body, _ := io.ReadAll(res.Body)
+		body, readErr := esresponse.ReadBounded(res.Body)
 		if esresponse.IsUnsupportedEnrichAPI(res.StatusCode, body) {
 			runlog.From(ctx).Warn().
 				Str("policy", policy).
 				Int("status_code", res.StatusCode).
-				Str("body", string(body)).
+				Str("es_error", esresponse.NewRejection(
+					"enrich API", "", res.StatusCode, body, readErr,
+					esresponse.MaxPublicMessageBytes).Error()).
 				Msg("Enrich execute endpoint returned a generic 404; check proxy or routing for /_enrich/policy/<name>/_execute and confirm this URL matches the backend used by Dev Tools")
 			return false
 		}
 		runlog.From(ctx).Error().
 			Str("policy", policy).
 			Int("status_code", res.StatusCode).
-			Str("body", string(body)).
+			Str("es_error", esresponse.NewRejection(
+				"enrich policy", policy, res.StatusCode, body, readErr,
+				esresponse.MaxPublicMessageBytes).Error()).
 			Float64("time_taken", cfg.Now().Sub(startTime).Seconds()).
 			Msg("Enrich policy execution failed")
 		return false
@@ -498,7 +506,7 @@ func executePolicy(ctx context.Context, es *elasticsearch.Client, policy string,
 		// a task outcome. Every other status fails at once, since retrying it
 		// would repeat the same answer and hide the cause.
 		if taskRes.IsError() {
-			body, readErr := io.ReadAll(taskRes.Body)
+			body, readErr := esresponse.ReadBounded(taskRes.Body)
 			closeErr := taskRes.Body.Close()
 			retryable := esresponse.IsRetryableStatus(taskRes.StatusCode)
 			if retryable {
@@ -509,7 +517,9 @@ func executePolicy(ctx context.Context, es *elasticsearch.Client, policy string,
 					Str("policy", policy).
 					Str("task", taskID).
 					Int("status_code", taskRes.StatusCode).
-					Str("body", string(body)).
+					Str("es_error", esresponse.NewRejection(
+						"enrich task", taskID, taskRes.StatusCode, body, readErr,
+						esresponse.MaxPublicMessageBytes).Error()).
 					Int("attempt", failures)
 				warn = withBodyErrors(warn, readErr, closeErr)
 				warn.Msg("Enrich policy task poll failed; retrying")
@@ -519,7 +529,9 @@ func executePolicy(ctx context.Context, es *elasticsearch.Client, policy string,
 				Str("policy", policy).
 				Str("task", taskID).
 				Int("status_code", taskRes.StatusCode).
-				Str("body", string(body))
+				Str("es_error", esresponse.NewRejection(
+					"enrich task", taskID, taskRes.StatusCode, body, readErr,
+					esresponse.MaxPublicMessageBytes).Error())
 			if retryable {
 				event = event.Int("attempt", failures)
 			}
@@ -633,7 +645,14 @@ func reindexProgress(ctx context.Context, es *elasticsearch.Client, taskID strin
 		runlog.From(ctx).Debug().Err(err).Str("task", taskID).Msg("Enrich reindex progress unavailable: child task request failed")
 		return -1, -1
 	}
-	body, readErr := io.ReadAll(res.Body)
+	// An error status is read bounded (it only feeds the es_error diagnostic);
+	// a 2xx body is parsed for counters, so it is read in full. A read error
+	// returns (-1, -1) ahead of any status diagnostic on either branch.
+	read := io.ReadAll
+	if res.IsError() {
+		read = esresponse.ReadBounded
+	}
+	body, readErr := read(res.Body)
 	res.Body.Close()
 	if readErr != nil {
 		runlog.From(ctx).Debug().Err(readErr).Str("task", taskID).Msg("Enrich reindex progress unavailable: unable to read child task response")
@@ -643,7 +662,9 @@ func reindexProgress(ctx context.Context, es *elasticsearch.Client, taskID strin
 		runlog.From(ctx).Debug().
 			Str("task", taskID).
 			Int("status_code", res.StatusCode).
-			Str("body", string(body)).
+			Str("es_error", esresponse.NewRejection(
+				"enrich task", taskID, res.StatusCode, body, nil,
+				esresponse.MaxPublicMessageBytes).Error()).
 			Msg("Enrich reindex progress unavailable: child task request returned an error")
 		return -1, -1
 	}
@@ -651,7 +672,7 @@ func reindexProgress(ctx context.Context, es *elasticsearch.Client, taskID strin
 	if !ok {
 		runlog.From(ctx).Debug().
 			Str("task", taskID).
-			Str("body", string(body)).
+			Int("body_bytes", len(body)).
 			Msg("Enrich reindex progress unavailable: no single reindex child task with readable counters")
 		return -1, -1
 	}

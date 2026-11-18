@@ -281,7 +281,12 @@ func Wait(ctx context.Context, get Getter, id string, cfg WaitConfig) (Stats, er
 			}
 			lastFailure = fmt.Errorf("requesting _stats: %w", err)
 		case status < 200 || status > 299:
-			statusErr := fmt.Errorf("_stats returned status %d: %s", status, strings.TrimSpace(string(body)))
+			// The body is only the cause's detail: bounded and redacted by
+			// NewRejection, capped at MaxPublicMessageBytes for this inner text
+			// alone. The wait/timeout/Run context around it is preserved, so the
+			// complete message can be longer.
+			statusErr := fmt.Errorf("_stats returned status %d: %w", status, esresponse.NewRejection(
+				"transform", id, status, body, nil, esresponse.MaxPublicMessageBytes))
 			if !esresponse.IsRetryableStatus(status) {
 				return last, fmt.Errorf("transform %q: %w", id, statusErr)
 			}

@@ -335,7 +335,16 @@ func TestWaitErrors(t *testing.T) {
 		{
 			name:    "404 reports status and body",
 			get:     func(context.Context, string) (int, []byte, error) { return 404, []byte(`{"error":"missing"}`), nil },
-			wantErr: []string{`transform "t1"`, "status 404", `{"error":"missing"}`},
+			wantErr: []string{`transform "t1"`, "status 404", `transform "t1" rejected with HTTP 404: missing`},
+			// The raw body is replaced by the Rejection detail, never echoed.
+			wantNotErr: []string{`{"error":"missing"}`},
+		},
+		{
+			name: "a JSON type and reason stay visible",
+			get: func(context.Context, string) (int, []byte, error) {
+				return 400, []byte(`{"error":{"type":"x","reason":"busy"}}`), nil
+			},
+			wantErr: []string{statsStatus(400, "x: busy")},
 		},
 		{
 			name:       "getter error with a live context",
@@ -595,6 +604,17 @@ func logLines(t *testing.T, buf *bytes.Buffer, msg string) []map[string]any {
 	return out
 }
 
+// notJSON is the fixed Rejection detail for a fully read body that is not one
+// JSON value; the _stats status failures render it instead of the raw body.
+const notJSON = "ES error detail unavailable (response is not a single JSON value)"
+
+// statsStatus is the text of a _stats status failure for transform "t1": the
+// preserved prefix followed by the Rejection (bounded, redacted), never the
+// raw response body.
+func statsStatus(status int, detail string) string {
+	return fmt.Sprintf(`_stats returned status %d: transform "t1" rejected with HTTP %d: %s`, status, status, detail)
+}
+
 // wantRetryWarn is one expected retry Warn: the 1-based poll number, the HTTP
 // status (0 for a transport failure, which logs no status_code) and text the
 // error field must contain.
@@ -664,10 +684,10 @@ func TestWaitRetries(t *testing.T) {
 		body   string
 		text   string
 	}{
-		{http.StatusTooManyRequests, "  {\"error\":\"too many requests\"}\n", `_stats returned status 429: {"error":"too many requests"}`},
-		{http.StatusBadGateway, "<html><body>502 Bad Gateway</body></html>", "_stats returned status 502: <html><body>502 Bad Gateway</body></html>"},
-		{http.StatusServiceUnavailable, `{"error":"unavailable"}`, `_stats returned status 503: {"error":"unavailable"}`},
-		{http.StatusGatewayTimeout, "gateway timeout", "_stats returned status 504: gateway timeout"},
+		{http.StatusTooManyRequests, "  {\"error\":\"too many requests\"}\n", statsStatus(429, "too many requests")},
+		{http.StatusBadGateway, "<html><body>502 Bad Gateway</body></html>", statsStatus(502, notJSON)},
+		{http.StatusServiceUnavailable, `{"error":"unavailable"}`, statsStatus(503, "unavailable")},
+		{http.StatusGatewayTimeout, "gateway timeout", statsStatus(504, notJSON)},
 	} {
 		fail := pollReply{status: tc.status, body: tc.body}
 		tests = append(tests, row{
@@ -704,8 +724,8 @@ func TestWaitRetries(t *testing.T) {
 			wantSleeps: []time.Duration{two, two, two, two, two, 5 * time.Second},
 			wantPolls:  []int{7},
 			wantWarns: []wantRetryWarn{
-				{1, 503, "busy"}, {2, 503, "busy"}, {3, 503, "busy"},
-				{4, 503, "busy"}, {5, 503, "busy"}, {6, 503, "busy"},
+				{1, 503, statsStatus(503, notJSON)}, {2, 503, statsStatus(503, notJSON)}, {3, 503, statsStatus(503, notJSON)},
+				{4, 503, statsStatus(503, notJSON)}, {5, 503, statsStatus(503, notJSON)}, {6, 503, statsStatus(503, notJSON)},
 			},
 		},
 		row{
@@ -714,7 +734,7 @@ func TestWaitRetries(t *testing.T) {
 			wantCalls:  4,
 			wantSleeps: []time.Duration{two, two, two},
 			wantPolls:  []int{2, 4},
-			wantWarns:  []wantRetryWarn{{1, 503, "busy"}, {3, 503, "busy"}},
+			wantWarns:  []wantRetryWarn{{1, 503, statsStatus(503, notJSON)}, {3, 503, statsStatus(503, notJSON)}},
 		},
 		row{
 			name:       "decoded failed state after a retry is terminal",
@@ -722,7 +742,7 @@ func TestWaitRetries(t *testing.T) {
 			wantCalls:  2,
 			wantSleeps: []time.Duration{two},
 			wantPolls:  []int{2},
-			wantWarns:  []wantRetryWarn{{1, 503, "busy"}},
+			wantWarns:  []wantRetryWarn{{1, 503, statsStatus(503, notJSON)}},
 			wantErr:    []string{`transform "t1" failed: boom`},
 		},
 		row{
@@ -731,7 +751,7 @@ func TestWaitRetries(t *testing.T) {
 			sleepErr:   sleepErr,
 			wantCalls:  1,
 			wantSleeps: []time.Duration{two},
-			wantWarns:  []wantRetryWarn{{1, 503, "busy"}},
+			wantWarns:  []wantRetryWarn{{1, 503, statsStatus(503, notJSON)}},
 			wantErr:    []string{`transform "t1": sleeping between polls`},
 			wantIs:     sleepErr,
 		},
@@ -739,19 +759,19 @@ func TestWaitRetries(t *testing.T) {
 			name:      "400 is terminal",
 			replies:   []pollReply{{status: http.StatusBadRequest, body: "bad"}},
 			wantCalls: 1,
-			wantErr:   []string{`transform "t1": _stats returned status 400: bad`},
+			wantErr:   []string{`transform "t1": ` + statsStatus(400, notJSON)},
 		},
 		row{
 			name:      "404 is terminal",
 			replies:   []pollReply{{status: http.StatusNotFound, body: `{"error":"missing"}`}},
 			wantCalls: 1,
-			wantErr:   []string{`transform "t1": _stats returned status 404: {"error":"missing"}`},
+			wantErr:   []string{`transform "t1": ` + statsStatus(404, "missing")},
 		},
 		row{
 			name:      "500 is terminal",
 			replies:   []pollReply{{status: http.StatusInternalServerError, body: "boom"}},
 			wantCalls: 1,
-			wantErr:   []string{`transform "t1": _stats returned status 500: boom`},
+			wantErr:   []string{`transform "t1": ` + statsStatus(500, notJSON)},
 		},
 		row{
 			name:      "malformed 2xx is terminal",
@@ -858,7 +878,7 @@ func TestWaitRetryDeadline(t *testing.T) {
 			wantSleeps:  5,
 			wantElapsed: 9 * time.Second,
 			wantIs:      context.DeadlineExceeded,
-			wantErr:     []string{`transform "t1" timed out after 9s`, "no _stats response received yet; last poll failed: _stats returned status 503: overloaded"},
+			wantErr:     []string{`transform "t1" timed out after 9s`, "no _stats response received yet; last poll failed: " + statsStatus(503, notJSON)},
 		},
 		{
 			name:        "persistent retryable transport cause",
@@ -878,7 +898,7 @@ func TestWaitRetryDeadline(t *testing.T) {
 			wantSleeps:  5,
 			wantElapsed: 9 * time.Second,
 			wantIs:      context.DeadlineExceeded,
-			wantErr:     []string{"last poll failed: _stats returned status 502: latest-cause"},
+			wantErr:     []string{"last poll failed: " + statsStatus(502, notJSON)},
 			wantNotErr:  []string{"earliest-cause", "status 503"},
 		},
 		{
@@ -902,7 +922,7 @@ func TestWaitRetryDeadline(t *testing.T) {
 			wantCalls:     1,
 			wantSleeps:    1,
 			wantIs:        context.Canceled,
-			wantErr:       []string{`transform "t1" cancelled`, "last poll failed: _stats returned status 503: busy"},
+			wantErr:       []string{`transform "t1" cancelled`, "last poll failed: " + statsStatus(503, notJSON)},
 			wantNotErr:    []string{"timed out"},
 		},
 	}
