@@ -68,7 +68,8 @@ func (r *Rejection) ResourceName() string { return r.resourceName }
 // oversized); readErr is the read error, if any, and takes precedence over
 // every other fallback. It performs no I/O. The message is
 // `<resource> "<name>" rejected with HTTP <status>: <detail>`, at most
-// maxMessageBytes bytes of valid UTF-8 on one line.
+// maxMessageBytes bytes of valid UTF-8 on one line. An empty name omits the
+// quoted name: `<resource> rejected with HTTP <status>: <detail>`.
 //
 // detail is up to four sanitized Elasticsearch type/reason pairs (root_cause
 // entries in order, then the top-level error object, then each one's

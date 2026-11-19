@@ -69,9 +69,11 @@
 //   - every other run-ending error is returned as a *RunError whose Kind is chosen
 //     from its Op name: bulk, then enrich, then pipeline/policy/transform/managed,
 //     then index/indices/alias, otherwise ErrLoaderExecution (see RunError),
-//   - an HTTP rejection keeps its Op and Kind; its cause names the resource, the HTTP
-//     status and up to four bounded, redacted Elasticsearch type/reason pairs (at most
-//     2,048 bytes for the whole message at direct failure sites), never the raw body.
+//   - a run-ending HTTP rejection whose response body is read keeps its Op and Kind;
+//     its cause names the resource, the HTTP status and up to four bounded, redacted
+//     Elasticsearch type/reason pairs (at most 2,048 bytes for the whole message at
+//     direct failure sites), never the raw body. Paths that use only the status, such
+//     as index deletion, keep their existing errors without richer causes.
 //     The mapping-fetch and transform _stats errors cap only that inner text and keep
 //     their longer outer context. Free-text reasons may still hold sensitive prose
 //     redaction cannot recognize, and failure text parsed from successful responses is
