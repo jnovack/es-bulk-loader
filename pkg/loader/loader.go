@@ -61,6 +61,12 @@ var (
 	// (see RunError), an untyped internal error (empty Op), or a panic whose
 	// value is an error (Op "panic"). A panic carrying a *RunError is
 	// returned as that error; any other panic value propagates.
+	// Settings and mappings file read/parse failures and settings serialization
+	// failures use this Kind by design (see ErrInvalidOptions). So does failure
+	// to decode mappings while building the preflight plan, including numeric
+	// overflow or a section that cannot decode into an object. Template
+	// preflight validation remains ErrInvalidOptions. A failed check against
+	// the index's live mappings names the bulk insert and is ErrBulkFailure.
 	ErrLoaderExecution = errors.New("loader execution failed")
 )
 

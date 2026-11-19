@@ -630,11 +630,11 @@ func expectedOpKinds() []opKindRow {
 		opKindLit("Bulk API request failed", ErrBulkFailure, ""),
 		opKindLit("Unable to parse bulk response body", ErrBulkFailure, ""),
 		opKindLit("Cannot read data file", ErrLoaderExecution, "data-file reading/decoding has no classifier keyword; generic loader failure by design"),
-		opKindLit("Failed to build mapping preflight plan", ErrLoaderExecution, "mapping preflight plan construction names no index noun; pinned as the fallback (suspected ErrIndexOperation, see spec follow-up)"),
-		opKindLit("Reading settings file", ErrLoaderExecution, "settings file handling names no index/managed noun; pinned as the fallback (suspected ErrIndexOperation, see spec follow-up)"),
-		opKindLit("Parsing settings file", ErrLoaderExecution, "settings file handling names no index/managed noun; pinned as the fallback (suspected ErrIndexOperation, see spec follow-up)"),
-		opKindLit("Parsing nested settings file", ErrLoaderExecution, "settings file handling names no index/managed noun; pinned as the fallback (suspected ErrIndexOperation, see spec follow-up)"),
-		opKindLit("Serializing settings", ErrLoaderExecution, "settings file handling names no index/managed noun; pinned as the fallback (suspected ErrIndexOperation, see spec follow-up)"),
+		opKindLit("Failed to build mapping preflight plan", ErrLoaderExecution, "local mappings plan decoding names no classifier keyword; ErrLoaderExecution by design, consistent with the ErrInvalidOptions documentation of file failures; includes non-object sections rejected by decoding and numeric overflow (DEC-OPKIND-01)"),
+		opKindLit("Reading settings file", ErrLoaderExecution, "local settings file handling names no classifier keyword; ErrLoaderExecution by design, as the ErrInvalidOptions documentation of file failures states (DEC-OPKIND-01)"),
+		opKindLit("Parsing settings file", ErrLoaderExecution, "local settings file handling names no classifier keyword; ErrLoaderExecution by design, as the ErrInvalidOptions documentation of file failures states (DEC-OPKIND-01)"),
+		opKindLit("Parsing nested settings file", ErrLoaderExecution, "local settings file handling names no classifier keyword; ErrLoaderExecution by design, as the ErrInvalidOptions documentation of file failures states (DEC-OPKIND-01)"),
+		opKindLit("Serializing settings", ErrLoaderExecution, "local settings file handling names no classifier keyword; ErrLoaderExecution by design, as the ErrInvalidOptions documentation of file failures states (DEC-OPKIND-01)"),
 		opKindLit("getting enrich policies", ErrEnrichExecution, ""),
 		opKindLit("Failed to get enrich policies", ErrEnrichExecution, ""),
 		opKindLit("Unable to parse enrich policy response", ErrEnrichExecution, ""),
@@ -699,8 +699,8 @@ func expectedOpKinds() []opKindRow {
 		// (loader.go). The two section formats carry no classifier keyword, so
 		// they fall back by design; the definition formats name the resource
 		// type, which the classifier maps to ErrManagedResource.
-		opKindFmtRow("Reading %s file", ErrLoaderExecution, "section is only \"mappings\"; names no index noun, pinned as the fallback (suspected ErrIndexOperation, see spec follow-up)", "mappings"),
-		opKindFmtRow("Parsing %s file", ErrLoaderExecution, "section is only \"mappings\"; names no index noun, pinned as the fallback (suspected ErrIndexOperation, see spec follow-up)", "mappings"),
+		opKindFmtRow("Reading %s file", ErrLoaderExecution, "section is only \"mappings\"; local mappings file handling names no classifier keyword; ErrLoaderExecution by design, as the ErrInvalidOptions documentation of file failures states (DEC-OPKIND-01)", "mappings"),
+		opKindFmtRow("Parsing %s file", ErrLoaderExecution, "section is only \"mappings\"; local mappings file handling names no classifier keyword; ErrLoaderExecution by design, as the ErrInvalidOptions documentation of file failures states (DEC-OPKIND-01)", "mappings"),
 		opKindFmtRow("Reading %s definitions file", ErrManagedResource, "", "pipeline", "policy", "transform"),
 		opKindFmtRow("Parsing %s definitions file", ErrManagedResource, "", "pipeline", "policy", "transform"),
 		opKindFmtRow("%s definitions file must contain a JSON object", ErrManagedResource, "", "pipeline", "policy", "transform"),

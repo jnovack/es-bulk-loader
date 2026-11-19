@@ -34,9 +34,10 @@ func (p MappingPlan) HasExpectations() bool {
 }
 
 // BuildMappingPlan reads the mappings file and extracts the preflight expectations (boolean date_detection and root field types) that VerifyMappings checks. An empty path yields an empty plan.
-// A read or parse failure of the mappings file is returned as that read
-// site's own operation error; only a section that is not a JSON object fails
-// as "Failed to build mapping preflight plan".
+// Read or parse failures from NormalizeIndexSection keep their own Ops.
+// A subsequent decode of the normalized section into map[string]any can
+// fail, for example on a non-object section or an overflowing number;
+// those failures use "Failed to build mapping preflight plan".
 func BuildMappingPlan(ctx context.Context, mappingsFile string, variables template.Variables) (MappingPlan, error) {
 	trimmed := strings.TrimSpace(mappingsFile)
 	if trimmed == "" {
