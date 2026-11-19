@@ -17,17 +17,15 @@ import (
 	"github.com/jnovack/es-bulk-loader/internal/testutil/logbuf"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/esresponse"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/failure"
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/rejectiontest"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/runlog"
 )
-
-const secretBody = `{"error":{"type":"x","reason":"rejected password=FAKE-SECRET-REASON now"},` +
-	`"password":"FAKE-SECRET-META","status":500}`
 
 func TestListPoliciesFailureCarriesNamelessRejection(t *testing.T) {
 	t.Parallel()
 
 	stub := esstub.New(t)
-	handler := esstub.JSON(http.StatusInternalServerError, secretBody)
+	handler := esstub.JSON(http.StatusInternalServerError, rejectiontest.SecretBody)
 	stub.Handle("GET /_enrich/policy", handler)
 	stub.Handle("GET /_enrich/policy/{$}", handler)
 	logger, buf := logbuf.New()
@@ -36,37 +34,8 @@ func TestListPoliciesFailureCarriesNamelessRejection(t *testing.T) {
 	_, _, err := ListPolicies(ctx, stub.MustClient(t))
 
 	want := "Failed to get enrich policies: enrich policy list request rejected with HTTP 500: x: rejected password=[REDACTED] now"
-	var opErr *failure.Error
-	if !errors.As(err, &opErr) || opErr.Op != "Failed to get enrich policies" {
-		t.Fatalf("error = %#v, want Op %q", err, "Failed to get enrich policies")
-	}
-	var rejection *esresponse.Rejection
-	if !errors.As(err, &rejection) {
-		t.Fatalf("cause = %T, want *esresponse.Rejection", opErr.Err)
-	}
-	if err.Error() != want {
-		t.Fatalf("message mismatch\n got: %s\nwant: %s", err.Error(), want)
-	}
-	var found bool
-	for _, line := range buf.Lines(t) {
-		if _, has := line["body"]; has {
-			t.Fatalf("log line %v carries a body field", line)
-		}
-		if line["message"] == "Failed to get enrich policies" {
-			found = true
-			if line["error"] != opErr.Err.Error() {
-				t.Fatalf("logged error %v != returned cause %q", line["error"], opErr.Err.Error())
-			}
-		}
-	}
-	// Without this, a site that stopped logging the failure would pass both
-	// the cause comparison and the no-body sweep vacuously.
-	if !found {
-		t.Fatalf("no %q line in log:\n%s", "Failed to get enrich policies", buf.String())
-	}
-	if strings.Contains(err.Error()+buf.String(), "FAKE-SECRET") {
-		t.Fatalf("a secret leaked:\n%s", buf.String())
-	}
+	rejectiontest.RequireRejection(t, err, "Failed to get enrich policies", want)
+	rejectiontest.RequireFailureLog(t, buf, err)
 }
 
 // TestEnrichLogOnlyLinesCarryESError pins the log-only shape for the generic
@@ -133,7 +102,7 @@ func TestEnrichLogOnlyLinesCarryESError(t *testing.T) {
 		t.Parallel()
 		stub := esstub.New(t)
 		stub.Handle("GET /_alias/.enrich-policy-a", esstub.JSON(http.StatusNotFound, aliasMissingBody))
-		execute := esstub.JSON(http.StatusInternalServerError, secretBody)
+		execute := esstub.JSON(http.StatusInternalServerError, rejectiontest.SecretBody)
 		stub.Handle("PUT /_enrich/policy/policy-a/_execute", execute)
 		stub.Handle("POST /_enrich/policy/policy-a/_execute", execute)
 		logger, buf := logbuf.New()
@@ -151,7 +120,9 @@ func TestEnrichLogOnlyLinesCarryESError(t *testing.T) {
 		if _, has := lines[0]["body"]; has || lines[0]["es_error"] != want {
 			t.Fatalf("line = %v, want es_error %q and no body", lines[0], want)
 		}
-		if strings.Contains(buf.String(), "FAKE-SECRET") {
+		// SecretMarker, not a literal: this fixture is SecretBody, so a literal
+		// would go vacuous if the shared marker ever changed.
+		if strings.Contains(buf.String(), rejectiontest.SecretMarker) {
 			t.Fatal("log leaks a secret")
 		}
 	})

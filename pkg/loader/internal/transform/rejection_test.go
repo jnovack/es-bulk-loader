@@ -22,11 +22,9 @@ import (
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/config"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/esresponse"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/failure"
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/rejectiontest"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/runlog"
 )
-
-const secretBody = `{"error":{"type":"x","reason":"rejected password=FAKE-SECRET-REASON now"},` +
-	`"password":"FAKE-SECRET-META","status":500}`
 
 func TestTransformFailureSitesCarryRejectionCause(t *testing.T) {
 	t.Parallel()
@@ -44,7 +42,7 @@ func TestTransformFailureSitesCarryRejectionCause(t *testing.T) {
 			name: "create transform",
 			handle: func(s *esstub.Stub) {
 				s.Handle("GET /_transform/tx", esstub.JSON(404, `{"error":{"type":"resource_not_found_exception"}}`))
-				s.Handle("PUT /_transform/tx", esstub.JSON(500, secretBody))
+				s.Handle("PUT /_transform/tx", esstub.JSON(500, rejectiontest.SecretBody))
 			},
 			run: func(ctx context.Context, es *elasticsearch.Client) error {
 				return CreateOrUpdate(ctx, es, defs, []string{"tx"})
@@ -54,7 +52,7 @@ func TestTransformFailureSitesCarryRejectionCause(t *testing.T) {
 		},
 		{
 			name:   "check transform existence",
-			handle: func(s *esstub.Stub) { s.Handle("GET /_transform/tx", esstub.JSON(500, secretBody)) },
+			handle: func(s *esstub.Stub) { s.Handle("GET /_transform/tx", esstub.JSON(500, rejectiontest.SecretBody)) },
 			run: func(ctx context.Context, es *elasticsearch.Client) error {
 				_, err := transformExists(ctx, es, "tx")
 				return err
@@ -63,8 +61,10 @@ func TestTransformFailureSitesCarryRejectionCause(t *testing.T) {
 			wantMsg: `Failed to check transform existence: transform "tx" rejected with HTTP 500: ` + reason,
 		},
 		{
-			name:   "stop transform",
-			handle: func(s *esstub.Stub) { s.Handle("POST /_transform/tx/_stop", esstub.JSON(500, secretBody)) },
+			name: "stop transform",
+			handle: func(s *esstub.Stub) {
+				s.Handle("POST /_transform/tx/_stop", esstub.JSON(500, rejectiontest.SecretBody))
+			},
 			run: func(ctx context.Context, es *elasticsearch.Client) error {
 				return StopBestEffort(ctx, es, []string{"tx"})
 			},
@@ -73,15 +73,17 @@ func TestTransformFailureSitesCarryRejectionCause(t *testing.T) {
 		},
 		{
 			name:   "delete transform",
-			handle: func(s *esstub.Stub) { s.Handle("DELETE /_transform/tx", esstub.JSON(500, secretBody)) },
+			handle: func(s *esstub.Stub) { s.Handle("DELETE /_transform/tx", esstub.JSON(500, rejectiontest.SecretBody)) },
 			run:    func(ctx context.Context, es *elasticsearch.Client) error { return Delete(ctx, es, []string{"tx"}) },
 			wantOp: "Failed to delete transform",
 			wantMsg: `Failed to delete transform: transform "tx" rejected with HTTP 500: ` +
 				reason,
 		},
 		{
-			name:   "start transform",
-			handle: func(s *esstub.Stub) { s.Handle("POST /_transform/tx/_start", esstub.JSON(500, secretBody)) },
+			name: "start transform",
+			handle: func(s *esstub.Stub) {
+				s.Handle("POST /_transform/tx/_start", esstub.JSON(500, rejectiontest.SecretBody))
+			},
 			run:    func(ctx context.Context, es *elasticsearch.Client) error { return Start(ctx, es, []string{"tx"}) },
 			wantOp: "Failed to start transform",
 			wantMsg: `Failed to start transform: transform "tx" rejected with HTTP 500: ` +
@@ -94,31 +96,13 @@ func TestTransformFailureSitesCarryRejectionCause(t *testing.T) {
 
 			stub := esstub.New(t)
 			tt.handle(stub)
-			ctx, buf := bufferLogger(t.Context())
+			logger, buf := logbuf.New()
+			ctx := runlog.WithLogger(t.Context(), logger)
 
 			err := tt.run(ctx, stub.MustClient(t))
 
-			var opErr *failure.Error
-			if !errors.As(err, &opErr) || opErr.Op != tt.wantOp {
-				t.Fatalf("error = %#v, want Op %q", err, tt.wantOp)
-			}
-			var rejection *esresponse.Rejection
-			if !errors.As(err, &rejection) {
-				t.Fatalf("cause = %T, want *esresponse.Rejection", opErr.Err)
-			}
-			if err.Error() != tt.wantMsg {
-				t.Fatalf("message mismatch\n got: %s\nwant: %s", err.Error(), tt.wantMsg)
-			}
-			if strings.Contains(buf.String(), `"body":`) {
-				t.Fatalf("log carries a body field:\n%s", buf.String())
-			}
-			failureLines := logLines(t, buf, tt.wantOp)
-			if len(failureLines) != 1 || failureLines[0]["error"] != opErr.Err.Error() {
-				t.Fatalf("failure lines = %v, want one with error field equal to the returned cause", failureLines)
-			}
-			if strings.Contains(err.Error()+buf.String(), "FAKE-SECRET") {
-				t.Fatalf("a secret leaked:\n%s\n%s", err, buf.String())
-			}
+			rejectiontest.RequireRejection(t, err, tt.wantOp, tt.wantMsg)
+			rejectiontest.RequireFailureLog(t, buf, err)
 		})
 	}
 }

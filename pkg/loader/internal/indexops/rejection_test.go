@@ -18,11 +18,9 @@ import (
 	"github.com/jnovack/es-bulk-loader/internal/testutil/logbuf"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/esresponse"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/failure"
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/rejectiontest"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/runlog"
 )
-
-const secretBody = `{"error":{"type":"x","reason":"rejected password=FAKE-SECRET-REASON now"},` +
-	`"password":"FAKE-SECRET-META","status":500}`
 
 func TestIndexFailureSitesCarryRejectionCause(t *testing.T) {
 	t.Parallel()
@@ -37,28 +35,30 @@ func TestIndexFailureSitesCarryRejectionCause(t *testing.T) {
 	}{
 		{
 			name:    "create index",
-			handle:  func(s *esstub.Stub) { s.Handle("PUT /cards", esstub.JSON(500, secretBody)) },
+			handle:  func(s *esstub.Stub) { s.Handle("PUT /cards", esstub.JSON(500, rejectiontest.SecretBody)) },
 			run:     func(ctx context.Context, es *elasticsearch.Client) error { return Create(ctx, es, "cards", "{}") },
 			wantOp:  "Failed to create index",
 			wantMsg: `Failed to create index: index "cards" rejected with HTTP 500: ` + reason,
 		},
 		{
 			name:    "refresh index",
-			handle:  func(s *esstub.Stub) { s.Handle("POST /cards/_refresh", esstub.JSON(500, secretBody)) },
+			handle:  func(s *esstub.Stub) { s.Handle("POST /cards/_refresh", esstub.JSON(500, rejectiontest.SecretBody)) },
 			run:     func(ctx context.Context, es *elasticsearch.Client) error { return Refresh(ctx, es, "cards") },
 			wantOp:  "Failed to refresh index",
 			wantMsg: `Failed to refresh index: index "cards" rejected with HTTP 500: ` + reason,
 		},
 		{
-			name:    "flush index",
-			handle:  func(s *esstub.Stub) { s.Handle("POST /cards/_delete_by_query", esstub.JSON(500, secretBody)) },
+			name: "flush index",
+			handle: func(s *esstub.Stub) {
+				s.Handle("POST /cards/_delete_by_query", esstub.JSON(500, rejectiontest.SecretBody))
+			},
 			run:     func(ctx context.Context, es *elasticsearch.Client) error { return Flush(ctx, es, "cards") },
 			wantOp:  "Failed to flush index",
 			wantMsg: `Failed to flush index: index "cards" rejected with HTTP 500: ` + reason,
 		},
 		{
 			name:   "clear default pipeline",
-			handle: func(s *esstub.Stub) { s.Handle("PUT /cards/_settings", esstub.JSON(500, secretBody)) },
+			handle: func(s *esstub.Stub) { s.Handle("PUT /cards/_settings", esstub.JSON(500, rejectiontest.SecretBody)) },
 			run: func(ctx context.Context, es *elasticsearch.Client) error {
 				return ClearDefaultPipeline(ctx, es, []string{"cards"})
 			},
@@ -67,7 +67,7 @@ func TestIndexFailureSitesCarryRejectionCause(t *testing.T) {
 		},
 		{
 			name:   "nameless get index settings",
-			handle: func(s *esstub.Stub) { s.Handle("GET /_settings/*", esstub.JSON(500, secretBody)) },
+			handle: func(s *esstub.Stub) { s.Handle("GET /_settings/*", esstub.JSON(500, rejectiontest.SecretBody)) },
 			run: func(ctx context.Context, es *elasticsearch.Client) error {
 				_, err := FindIndicesUsingDefaultPipeline(ctx, es, "p")
 				return err
@@ -87,32 +87,8 @@ func TestIndexFailureSitesCarryRejectionCause(t *testing.T) {
 
 			err := tt.run(ctx, stub.MustClient(t))
 
-			var opErr *failure.Error
-			if !errors.As(err, &opErr) || opErr.Op != tt.wantOp {
-				t.Fatalf("error = %#v, want Op %q", err, tt.wantOp)
-			}
-			var rejection *esresponse.Rejection
-			if !errors.As(err, &rejection) {
-				t.Fatalf("cause = %T, want *esresponse.Rejection", opErr.Err)
-			}
-			if err.Error() != tt.wantMsg {
-				t.Fatalf("message mismatch\n got: %s\nwant: %s", err.Error(), tt.wantMsg)
-			}
-			var failureLine map[string]any
-			for _, line := range buf.Lines(t) {
-				if _, has := line["body"]; has {
-					t.Fatalf("log line %v carries a body field", line)
-				}
-				if line["message"] == tt.wantOp {
-					failureLine = line
-				}
-			}
-			if failureLine == nil || failureLine["error"] != opErr.Err.Error() {
-				t.Fatalf("failure line = %v, want error field equal to the returned cause", failureLine)
-			}
-			if strings.Contains(err.Error()+buf.String(), "FAKE-SECRET") {
-				t.Fatalf("a secret leaked:\n%s\n%s", err, buf.String())
-			}
+			rejectiontest.RequireRejection(t, err, tt.wantOp, tt.wantMsg)
+			rejectiontest.RequireFailureLog(t, buf, err)
 		})
 	}
 }
@@ -239,7 +215,7 @@ func TestFetchIndexMappingsErrorTail(t *testing.T) {
 
 	t.Run("JSON reason replaces the raw body", func(t *testing.T) {
 		t.Parallel()
-		tr := &bodytransport.Transport{Replies: []func() bodytransport.Reply{bodytransport.Static(500, secretBody)}}
+		tr := &bodytransport.Transport{Replies: []func() bodytransport.Reply{bodytransport.Static(500, rejectiontest.SecretBody)}}
 
 		_, err := fetchIndexMappings(tr.Client(t), "cards")
 

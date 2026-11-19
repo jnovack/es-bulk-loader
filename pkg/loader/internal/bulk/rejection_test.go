@@ -6,7 +6,6 @@ package bulk
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -18,12 +17,9 @@ import (
 	"github.com/jnovack/es-bulk-loader/internal/testutil/esstub"
 	"github.com/jnovack/es-bulk-loader/internal/testutil/logbuf"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/esresponse"
-	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/failure"
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/rejectiontest"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/runlog"
 )
-
-const secretBody = `{"error":{"type":"x","reason":"rejected password=FAKE-SECRET-REASON now"},` +
-	`"password":"FAKE-SECRET-META","status":400}`
 
 func noSleep(ctx context.Context, _ time.Duration) error { return ctx.Err() }
 
@@ -31,42 +27,15 @@ func TestBulkRequestFailureCarriesNamelessRejection(t *testing.T) {
 	t.Parallel()
 
 	stub := esstub.New(t)
-	stub.Handle("POST /_bulk", esstub.JSON(http.StatusBadRequest, secretBody))
+	stub.Handle("POST /_bulk", esstub.JSON(http.StatusBadRequest, rejectiontest.SecretBody))
 	logger, buf := logbuf.New()
 	ctx := runlog.WithLogger(t.Context(), logger)
 
 	_, err := bulkInsert(ctx, stub.MustClient(t), "cards", []map[string]interface{}{{"id": "1"}}, 0, 1, 3, time.Millisecond, time.Millisecond, "", noSleep)
 
 	want := "Bulk API request failed: bulk request rejected with HTTP 400: x: rejected password=[REDACTED] now"
-	var opErr *failure.Error
-	if !errors.As(err, &opErr) || opErr.Op != "Bulk API request failed" {
-		t.Fatalf("error = %#v, want Op %q", err, "Bulk API request failed")
-	}
-	var rejection *esresponse.Rejection
-	if !errors.As(err, &rejection) {
-		t.Fatalf("cause = %T, want *esresponse.Rejection", opErr.Err)
-	}
-	if err.Error() != want {
-		t.Fatalf("message mismatch\n got: %s\nwant: %s", err.Error(), want)
-	}
-	var found bool
-	for _, line := range buf.Lines(t) {
-		if _, has := line["body"]; has {
-			t.Fatalf("log line %v carries a body field", line)
-		}
-		if line["message"] == "Bulk API request failed" {
-			found = true
-			if line["error"] != opErr.Err.Error() {
-				t.Fatalf("logged error %v != returned cause %q", line["error"], opErr.Err.Error())
-			}
-		}
-	}
-	if !found {
-		t.Fatalf("no failure line:\n%s", buf.String())
-	}
-	if strings.Contains(err.Error()+buf.String(), "FAKE-SECRET") {
-		t.Fatalf("a secret leaked:\n%s", buf.String())
-	}
+	rejectiontest.RequireRejection(t, err, "Bulk API request failed", want)
+	rejectiontest.RequireFailureLog(t, buf, err)
 }
 
 // TestBulkRetryWarnLogsESError pins the log-only shape and that the retry stays

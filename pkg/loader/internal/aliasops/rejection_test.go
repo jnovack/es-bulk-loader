@@ -7,7 +7,6 @@ package aliasops
 import (
 	"context"
 	"errors"
-	"strings"
 	"testing"
 
 	"github.com/elastic/go-elasticsearch/v9"
@@ -18,11 +17,9 @@ import (
 	"github.com/jnovack/es-bulk-loader/internal/testutil/logbuf"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/esresponse"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/failure"
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/rejectiontest"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/runlog"
 )
-
-const secretBody = `{"error":{"type":"x","reason":"rejected password=FAKE-SECRET-REASON now"},` +
-	`"password":"FAKE-SECRET-META","status":500}`
 
 func TestAliasFailureSitesCarryRejectionCause(t *testing.T) {
 	t.Parallel()
@@ -37,7 +34,7 @@ func TestAliasFailureSitesCarryRejectionCause(t *testing.T) {
 	}{
 		{
 			name:   "resolve alias targets",
-			handle: func(s *esstub.Stub) { s.Handle("GET /_alias/cards", esstub.JSON(500, secretBody)) },
+			handle: func(s *esstub.Stub) { s.Handle("GET /_alias/cards", esstub.JSON(500, rejectiontest.SecretBody)) },
 			run: func(ctx context.Context, es *elasticsearch.Client) error {
 				_, err := ResolveTargets(ctx, es, "cards")
 				return err
@@ -49,7 +46,7 @@ func TestAliasFailureSitesCarryRejectionCause(t *testing.T) {
 			name: "update alias",
 			handle: func(s *esstub.Stub) {
 				s.Handle("GET /_alias/cards", esstub.JSON(404, `{"error":"alias [cards] missing","status":404}`))
-				s.Handle("POST /_aliases", esstub.JSON(500, secretBody))
+				s.Handle("POST /_aliases", esstub.JSON(500, rejectiontest.SecretBody))
 			},
 			run: func(ctx context.Context, es *elasticsearch.Client) error {
 				return Update(ctx, es, "cards", "cards-20260101000000")
@@ -59,7 +56,7 @@ func TestAliasFailureSitesCarryRejectionCause(t *testing.T) {
 		},
 		{
 			name:   "list timestamped indices",
-			handle: func(s *esstub.Stub) { s.Handle("GET /cards-*", esstub.JSON(500, secretBody)) },
+			handle: func(s *esstub.Stub) { s.Handle("GET /cards-*", esstub.JSON(500, rejectiontest.SecretBody)) },
 			run: func(ctx context.Context, es *elasticsearch.Client) error {
 				_, err := ListTimestampedIndices(ctx, es, "cards")
 				return err
@@ -79,32 +76,8 @@ func TestAliasFailureSitesCarryRejectionCause(t *testing.T) {
 
 			err := tt.run(ctx, stub.MustClient(t))
 
-			var opErr *failure.Error
-			if !errors.As(err, &opErr) || opErr.Op != tt.wantOp {
-				t.Fatalf("error = %#v, want Op %q", err, tt.wantOp)
-			}
-			var rejection *esresponse.Rejection
-			if !errors.As(err, &rejection) {
-				t.Fatalf("cause = %T, want *esresponse.Rejection", opErr.Err)
-			}
-			if err.Error() != tt.wantMsg {
-				t.Fatalf("message mismatch\n got: %s\nwant: %s", err.Error(), tt.wantMsg)
-			}
-			var failureLine map[string]any
-			for _, line := range buf.Lines(t) {
-				if _, has := line["body"]; has {
-					t.Fatalf("log line %v carries a body field", line)
-				}
-				if line["message"] == tt.wantOp {
-					failureLine = line
-				}
-			}
-			if failureLine == nil || failureLine["error"] != opErr.Err.Error() {
-				t.Fatalf("failure line = %v, want error field equal to the returned cause", failureLine)
-			}
-			if strings.Contains(err.Error()+buf.String(), "FAKE-SECRET") {
-				t.Fatalf("a secret leaked:\n%s\n%s", err, buf.String())
-			}
+			rejectiontest.RequireRejection(t, err, tt.wantOp, tt.wantMsg)
+			rejectiontest.RequireFailureLog(t, buf, err)
 		})
 	}
 }

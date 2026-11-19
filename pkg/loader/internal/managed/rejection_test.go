@@ -22,6 +22,7 @@ import (
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/config"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/esresponse"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/failure"
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/rejectiontest"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/runlog"
 )
 
@@ -30,64 +31,6 @@ func bufferContext(t *testing.T) (context.Context, *logbuf.Buffer) {
 	t.Helper()
 	logger, buf := logbuf.New()
 	return runlog.WithLogger(t.Context(), logger), buf
-}
-
-// secretBody carries a synthetic credential both in the selected reason text
-// and in ignored metadata, so a pass proves redaction and metadata exclusion.
-const secretBody = `{"error":{"type":"x","reason":"rejected password=FAKE-SECRET-REASON now"},` +
-	`"password":"FAKE-SECRET-META","status":500}`
-
-// requireRejection asserts err is the operation error for op wrapping a
-// Rejection, with the exact complete message, and returns it.
-func requireRejection(t *testing.T, err error, op, wantMsg string) {
-	t.Helper()
-	var opErr *failure.Error
-	if !errors.As(err, &opErr) || opErr.Op != op {
-		t.Fatalf("error = %#v, want Op %q", err, op)
-	}
-	var rejection *esresponse.Rejection
-	if !errors.As(err, &rejection) {
-		t.Fatalf("cause = %T, want *esresponse.Rejection", opErr.Err)
-	}
-	if err.Error() != wantMsg {
-		t.Fatalf("message mismatch\n got: %s\nwant: %s", err.Error(), wantMsg)
-	}
-	if len(err.Error()) > esresponse.MaxPublicMessageBytes {
-		t.Fatalf("message is %d bytes, want <= %d", len(err.Error()), esresponse.MaxPublicMessageBytes)
-	}
-	for _, secret := range []string{"FAKE-SECRET-REASON", "FAKE-SECRET-META"} {
-		if strings.Contains(err.Error(), secret) {
-			t.Fatalf("message leaks %s: %s", secret, err.Error())
-		}
-	}
-}
-
-// requireLogCarriesCause asserts the failure line has no body field and its
-// error field equals the returned cause, with no secret anywhere in the log.
-func requireLogCarriesCause(t *testing.T, buf *logbuf.Buffer, err error) {
-	t.Helper()
-	var opErr *failure.Error
-	if !errors.As(err, &opErr) {
-		t.Fatalf("error = %T, want *failure.Error", err)
-	}
-	var found bool
-	for _, line := range buf.Lines(t) {
-		if _, has := line["body"]; has {
-			t.Fatalf("log line %v carries a body field", line)
-		}
-		if line["message"] == opErr.Op && line["level"] == "fatal" {
-			found = true
-			if line["error"] != opErr.Err.Error() {
-				t.Fatalf("logged error %v != returned cause %q", line["error"], opErr.Err.Error())
-			}
-		}
-	}
-	if !found {
-		t.Fatalf("no fatal %q line in log:\n%s", opErr.Op, buf.String())
-	}
-	if strings.Contains(buf.String(), "FAKE-SECRET") {
-		t.Fatalf("log leaks a secret:\n%s", buf.String())
-	}
 }
 
 // TestManagedFailureSitesCarryRejectionCause drives one site per failing
@@ -105,8 +48,10 @@ func TestManagedFailureSitesCarryRejectionCause(t *testing.T) {
 		wantMsg string
 	}{
 		{
-			name:   "delete pipeline",
-			handle: func(s *esstub.Stub) { s.Handle("DELETE /_ingest/pipeline/p", esstub.JSON(500, secretBody)) },
+			name: "delete pipeline",
+			handle: func(s *esstub.Stub) {
+				s.Handle("DELETE /_ingest/pipeline/p", esstub.JSON(500, rejectiontest.SecretBody))
+			},
 			run: func(ctx context.Context, es *elasticsearch.Client) error {
 				return DeleteResources(ctx, es, []string{"p"}, nil, nil, false)
 			},
@@ -115,7 +60,7 @@ func TestManagedFailureSitesCarryRejectionCause(t *testing.T) {
 		},
 		{
 			name:   "create enrich policy",
-			handle: func(s *esstub.Stub) { s.Handle("PUT /_enrich/policy/pol", esstub.JSON(500, secretBody)) },
+			handle: func(s *esstub.Stub) { s.Handle("PUT /_enrich/policy/pol", esstub.JSON(500, rejectiontest.SecretBody)) },
 			run: func(ctx context.Context, es *elasticsearch.Client) error {
 				return CreatePolicies(ctx, es, config.Definitions{"pol": []byte(`{"match":{}}`)}, []string{"pol"}, sleepNow)
 			},
@@ -136,7 +81,7 @@ func TestManagedFailureSitesCarryRejectionCause(t *testing.T) {
 			name: "nameless ingest pipeline list request",
 			handle: func(s *esstub.Stub) {
 				s.Handle("DELETE /_enrich/policy/pol", esstub.JSON(409, referencingBody))
-				s.Handle("GET /_ingest/pipeline", esstub.JSON(500, secretBody))
+				s.Handle("GET /_ingest/pipeline", esstub.JSON(500, rejectiontest.SecretBody))
 			},
 			run: func(ctx context.Context, es *elasticsearch.Client) error {
 				return DeleteResources(ctx, es, nil, []string{"pol"}, nil, true)
@@ -155,8 +100,8 @@ func TestManagedFailureSitesCarryRejectionCause(t *testing.T) {
 
 			err := tt.run(ctx, stub.MustClient(t))
 
-			requireRejection(t, err, tt.wantOp, tt.wantMsg)
-			requireLogCarriesCause(t, buf, err)
+			rejectiontest.RequireRejection(t, err, tt.wantOp, tt.wantMsg)
+			rejectiontest.RequireFailureLog(t, buf, err)
 		})
 	}
 }
@@ -236,8 +181,10 @@ func TestManagedLogOnlyLinesCarryESError(t *testing.T) {
 			wantESE: generic404ESError,
 		},
 		{
-			name:   "policy GC delete failure",
-			handle: func(s *esstub.Stub) { s.Handle("DELETE /_enrich/policy/pol", esstub.JSON(500, secretBody)) },
+			name: "policy GC delete failure",
+			handle: func(s *esstub.Stub) {
+				s.Handle("DELETE /_enrich/policy/pol", esstub.JSON(500, rejectiontest.SecretBody))
+			},
 			run: func(ctx context.Context, es *elasticsearch.Client) error {
 				deletePolicyBestEffort(ctx, es, "pol")
 				return nil
@@ -273,7 +220,9 @@ func TestManagedLogOnlyLinesCarryESError(t *testing.T) {
 			if matched != 1 {
 				t.Fatalf("%q lines = %d, want 1\n%s", tt.msg, matched, buf.String())
 			}
-			if strings.Contains(buf.String(), "FAKE-SECRET") {
+			// SecretMarker, not a literal: the GC row serves SecretBody, so a
+			// literal would go vacuous if the shared marker ever changed.
+			if strings.Contains(buf.String(), rejectiontest.SecretMarker) {
 				t.Fatalf("log leaks a secret:\n%s", buf.String())
 			}
 		})
@@ -574,8 +523,8 @@ func TestPolicy404ReadErrorFailsClosed(t *testing.T) {
 				err := tc.run(ctx, tr, t)
 
 				want := tc.op + `: enrich policy "` + tc.resource + `" rejected with HTTP 404: ` + detail
-				requireRejection(t, err, tc.op, want)
-				requireLogCarriesCause(t, buf, err)
+				rejectiontest.RequireRejection(t, err, tc.op, want)
+				rejectiontest.RequireFailureLog(t, buf, err)
 				if !errors.Is(err, boom) {
 					t.Fatalf("errors.Is(err, boom) = false for %v", err)
 				}
@@ -625,7 +574,7 @@ func TestDeletePolicy404ReadErrorWithMissingTokenStillFails(t *testing.T) {
 	if !errors.Is(err, boom) {
 		t.Fatalf("errors.Is(err, boom) = false for %v", err)
 	}
-	requireLogCarriesCause(t, buf, err)
+	rejectiontest.RequireFailureLog(t, buf, err)
 	for _, line := range buf.Lines(t) {
 		if msg, _ := line["message"].(string); strings.Contains(msg, "Nothing to delete") {
 			t.Fatalf("log line %q treats a read-failed 404 as an absent policy", msg)
