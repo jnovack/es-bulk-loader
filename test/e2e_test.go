@@ -862,14 +862,49 @@ func startElasticsearchContainer(containerName string) (string, error) {
 		return "", fmt.Errorf("docker port: %w\n%s", err, string(portOutput))
 	}
 
-	host, port, err := net.SplitHostPort(strings.TrimSpace(string(portOutput)))
-	if err != nil {
-		return "", fmt.Errorf("parse docker port output %q: %w", strings.TrimSpace(string(portOutput)), err)
+	return publishedPort(string(portOutput))
+}
+
+// publishedPort extracts the host port from `docker port` output.
+//
+// Docker prints one line per address-family binding (for example
+// "0.0.0.0:49153" and "[::]:49154"), so the whole output cannot be handed to
+// net.SplitHostPort. The first valid IPv4 candidate wins because the caller
+// builds a loopback IPv4 URL; otherwise the first valid candidate is used.
+// The raw output is quoted in the error so a failure shows what Docker said.
+func publishedPort(output string) (string, error) {
+	fallback := ""
+	for _, line := range strings.Split(output, "\n") {
+		host, port, err := net.SplitHostPort(strings.TrimSpace(line))
+		if err != nil || !validPortText(port) {
+			continue
+		}
+		if net.ParseIP(host).To4() != nil {
+			return port, nil
+		}
+		if fallback == "" {
+			fallback = port
+		}
 	}
-	if host == "0.0.0.0" || host == "::" {
-		return port, nil
+	if fallback == "" {
+		return "", fmt.Errorf("parse docker port output %q: no valid host:port candidate", output)
 	}
-	return port, nil
+	return fallback, nil
+}
+
+// validPortText reports whether s is an unsigned ASCII decimal in 1-65535.
+// Atoi alone would accept a leading sign, so digits are checked first.
+func validPortText(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	n, err := strconv.Atoi(s)
+	return err == nil && n >= 1 && n <= 65535
 }
 
 // waitForCluster polls cluster health until it answers OK, or fails after 90 seconds.
@@ -1941,3 +1976,53 @@ const targetDataJSON = `[
   { "lookup_id": "A1", "target_name": "first" },
   { "lookup_id": "B2", "target_name": "second" }
 ]`
+
+// TestPublishedPort guards the parsing of multi-line `docker port` output:
+// reverting to whole-output SplitHostPort fails the dual-stack rows.
+func TestPublishedPort(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{"single IPv4 line", "0.0.0.0:49153\n", "49153", false},
+		{"IPv4 first", "0.0.0.0:49153\n[::]:49154\n", "49153", false},
+		{"IPv6 first", "[::]:49154\n0.0.0.0:49153\n", "49153", false},
+		{"IPv6 only", "[::]:49155\n", "49155", false},
+		{"IPv4-mapped IPv6", "[::]:49154\n[::ffff:127.0.0.1]:49153\n", "49153", false},
+		{"first fallback retained", "[::]:49154\n[::1]:49155\n", "49154", false},
+		{"multiple IPv4 candidates", "0.0.0.0:49153\n127.0.0.1:49154\n", "49153", false},
+		{"whitespace and CRLF", "  \r\n [::]:49154 \r\n\r\n  0.0.0.0:49153\t\r\n", "49153", false},
+		{"invalid IPv4 port then valid IPv6", "garbage\n0.0.0.0:99999\n[::]:49154\n", "49154", false},
+		{"min port", "0.0.0.0:1\n", "1", false},
+		{"max port", "0.0.0.0:65535\n", "65535", false},
+		{"leading zeros preserved", "0.0.0.0:00080\n", "00080", false},
+		{"empty", "", "", true},
+		{"blank lines", " \r\n\n\t\n", "", true},
+		{"garbage", "not a port\n", "", true},
+		{"missing separator", "0.0.0.0\n", "", true},
+		{"malformed with whitespace and CRLF", "  oops \r\n", "", true},
+		{"empty port", "0.0.0.0:\n", "", true},
+		{"non-numeric port", "0.0.0.0:http\n", "", true},
+		{"plus-signed port", "0.0.0.0:+1\n", "", true},
+		{"minus-signed port", "0.0.0.0:-1\n", "", true},
+		{"zero port", "0.0.0.0:0\n", "", true},
+		{"port 65536", "0.0.0.0:65536\n", "", true},
+		{"integer overflow port", "0.0.0.0:99999999999999999999\n", "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := publishedPort(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("publishedPort(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Errorf("publishedPort(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+			if err != nil && !strings.Contains(err.Error(), strconv.Quote(tt.input)) {
+				t.Errorf("error %q lacks quoted raw output %s", err, strconv.Quote(tt.input))
+			}
+		})
+	}
+}

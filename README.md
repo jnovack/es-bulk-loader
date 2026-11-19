@@ -320,6 +320,20 @@ If you see `build constraints exclude all Go files` for `./test`, the run is
 missing `-tags=e2e`.
 The E2E package is intentionally build-tagged.
 
+The `go-check` GitHub Actions workflow
+(`.github/workflows/go-check.yml`) runs on every branch push and on pull
+requests, as two independent jobs. `check` runs a non-mutating `gofmt -l .`
+gate, `go vet ./...`, `go vet -tags=e2e ./...`, `go test -race ./...` and
+`make lint`. `e2e` runs `make test-e2e` and then the focused port-parser
+regression, which `make test-e2e` does not select:
+
+```bash
+go test -count=1 -tags=e2e ./test -run '^TestPublishedPort$' -v
+```
+
+Both E2E commands start the Docker-backed harness. The workflow does not run
+on tags and does not gate image or release publication.
+
 Makefile shortcuts:
 
 ```bash
