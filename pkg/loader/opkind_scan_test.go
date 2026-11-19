@@ -9,9 +9,33 @@ package loader
 // current classification.
 //
 // Scope: direct calls to runlog.Check, runlog.Fail (Op is argument 1) and
-// failure.New (Op is argument 0) under this package directory. Explicit-Kind
-// RunError construction, indirect calls and packages outside pkg/loader are
-// out of scope.
+// failure.New (Op is argument 0) under this package directory. Every other way
+// to reach those functions or to build a failure.Error is REPORTED as an
+// unsupported shape, never silently skipped, because it can carry an Op the
+// scan cannot see:
+//   - a qualified reference that is not the callee of a call (a function value
+//     such as fn := runlog.Check, an argument, a field, a package var). A
+//     wrapped callee such as (runlog.Check)(...) is not normalized into a
+//     direct call; its selector is reported;
+//   - an unqualified Fail/Check (exact directory internal/runlog) or New
+//     (exact directory internal/failure), as a call or a value, whether it
+//     resolves to a same-file receiver-free function declaration or is
+//     unresolved because it is declared in another file;
+//   - a failure.Error composite literal, qualified anywhere in the tree or
+//     unqualified in the exact directory internal/failure, including an
+//     element literal whose type is elided by its slice, array or map.
+//
+// Unqualified-name rules match the exact slash-normalized parent directory,
+// not a prefix: a subdirectory is a different Go package with its own Fail,
+// Check, New and Error. Qualified detection stays recursive.
+//
+// The one exemption is syntactic: the &Error{Op: op, ...} literal inside the
+// top-level func New of internal/failure/error.go is the constructor, not an Op
+// site, and exactly one must exist when that file is scanned.
+//
+// Still out of scope: new(failure.Error), assigning Op after construction,
+// explicit-Kind RunError construction, named-type composite literal keys whose
+// container kind is not visible syntactically, and packages outside pkg/loader.
 
 import (
 	"errors"
@@ -21,6 +45,7 @@ import (
 	"go/token"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -37,6 +62,12 @@ const (
 	// opKindForwardFile is the only file whose failure.New(op, ...) calls are
 	// forwarding wrappers rather than Op sites.
 	opKindForwardFile = "internal/runlog/runlog.go"
+	// opKindFailureFile is the only file whose &Error{Op: op, ...} literal inside
+	// func New is the constructor itself rather than a bypass of failure.New.
+	opKindFailureFile = "internal/failure/error.go"
+	// Exact parent directories (never prefixes) that own the unqualified names.
+	opKindRunlogDir  = "internal/runlog"
+	opKindFailureDir = "internal/failure"
 )
 
 type opKindShape int
@@ -145,43 +176,178 @@ func scanOpFile(fset *token.FileSet, file *ast.File, rel string) (sites []opKind
 		}
 	}
 
+	// Every imported name (not only the target packages), so an alias such as
+	// `New "errors"` used as New.New(...) is a package qualifier, not a
+	// reference to an own-package New.
+	importNames := map[string]bool{}
+	for _, imp := range file.Imports {
+		p, err := strconv.Unquote(imp.Path.Value)
+		if err != nil {
+			continue // already reported above
+		}
+		name := p[strings.LastIndex(p, "/")+1:]
+		if imp.Name != nil {
+			name = imp.Name.Name
+		}
+		importNames[name] = true
+	}
+
+	// Package-level type declarations of this file. A parsed local type also
+	// has a *ast.TypeSpec Decl, so only membership here proves that an
+	// unqualified Error is the package's own type rather than a local shadow.
+	topTypes := map[*ast.TypeSpec]bool{}
+	for _, decl := range file.Decls {
+		if gd, ok := decl.(*ast.GenDecl); ok && gd.Tok == token.TYPE {
+			for _, spec := range gd.Specs {
+				if ts, ok := spec.(*ast.TypeSpec); ok {
+					topTypes[ts] = true
+				}
+			}
+		}
+	}
+
+	// Unqualified names owned by this file's exact directory. path.Dir on the
+	// slash-normalized relative path, never a prefix: a subdirectory is a
+	// different package whose Fail, Check, New and Error are its own.
+	dir := path.Dir(rel)
+	unqualified := map[string]bool{}
+	switch dir {
+	case opKindRunlogDir:
+		unqualified["Fail"], unqualified["Check"] = true, true
+	case opKindFailureDir:
+		unqualified["New"] = true
+	}
+	inFailureDir := dir == opKindFailureDir
+
 	forwards := map[string]int{}
+	constructors := 0
 	for _, decl := range file.Decls {
 		funcName := ""
 		if fd, ok := decl.(*ast.FuncDecl); ok && fd.Recv == nil {
 			funcName = fd.Name.Name
 		}
+		// callFuns holds selectors that are the callee of a CallExpr. ast.Inspect
+		// visits a CallExpr before its Fun, so the call handler marks the selector
+		// before the selector handler sees it and a normal call is never also
+		// reported as a non-call reference. skip holds identifiers that are not
+		// references: selector names, declaration names, struct field names and
+		// keys.
+		callFuns := map[*ast.SelectorExpr]bool{}
+		skip := map[*ast.Ident]bool{}
+		elided := map[*ast.CompositeLit]ast.Expr{}
 		ast.Inspect(decl, func(n ast.Node) bool {
-			call, ok := n.(*ast.CallExpr)
-			if !ok {
-				return true
-			}
-			callee, ok := opKindResolve(call, imports)
-			if !ok {
-				return true
-			}
-			target, ok := opKindTargets[callee]
-			if !ok {
-				return true
-			}
-			pos := posOf(call.Pos())
-			if len(call.Args) != target.argc || call.Ellipsis.IsValid() {
-				diags = append(diags, fmt.Sprintf("%s: %s.%s call has %d arguments (ellipsis=%t), want exactly %d", pos, callee.pkg[strings.LastIndex(callee.pkg, "/")+1:], callee.fn, len(call.Args), call.Ellipsis.IsValid(), target.argc))
-				return true
-			}
-			opArg := call.Args[target.opIdx]
-			if rel == opKindForwardFile && callee.pkg == opKindPkgFailure && (funcName == "Fail" || funcName == "Check") {
-				if id, isIdent := opArg.(*ast.Ident); isIdent && id.Name == "op" {
-					forwards[funcName]++
+			switch n := n.(type) {
+			case *ast.ImportSpec:
+				return false // alias declarations are not references
+			case *ast.FuncDecl:
+				skip[n.Name] = true // also methods
+			case *ast.Field:
+				for _, name := range n.Names {
+					skip[name] = true
+				}
+			case *ast.SelectorExpr:
+				skip[n.Sel] = true
+				if callFuns[n] {
 					return true
 				}
+				if callee, ok := opKindResolveSelector(n, imports); ok {
+					if _, isTarget := opKindTargets[callee]; isTarget {
+						diags = append(diags, fmt.Sprintf("%s: reference to %s.%s that is not a direct call is unsupported: an indirect call hides its Op from the scan", posOf(n.Pos()), callee.pkg[strings.LastIndex(callee.pkg, "/")+1:], callee.fn))
+					}
+				}
+			case *ast.CompositeLit:
+				// An element, key or value literal may elide its type (as in
+				// []*failure.Error{{Op: "x"}}); its enclosing literal, visited
+				// first, recorded the implied type. Reading only n.Type would
+				// silently skip an elided failure.Error and hide elided map keys.
+				typ := n.Type
+				if typ == nil {
+					typ = elided[n]
+				}
+				opKindNoteElided(typ, n.Elts, elided)
+				// Struct field keys are names, not references. Explicit map, array
+				// and slice keys are expressions and stay visible.
+				switch typ.(type) {
+				case *ast.MapType, *ast.ArrayType:
+				default:
+					for _, elt := range n.Elts {
+						if kv, ok := elt.(*ast.KeyValueExpr); ok {
+							if id, ok := kv.Key.(*ast.Ident); ok {
+								skip[id] = true
+							}
+						}
+					}
+				}
+				switch t := typ.(type) {
+				case *ast.SelectorExpr:
+					if callee, ok := opKindResolveSelector(t, imports); ok && callee == (opKindCallee{opKindPkgFailure, "Error"}) {
+						diags = append(diags, fmt.Sprintf("%s: failure.Error composite literal is unsupported: it can set Op directly; construct it with failure.New so the Op is scanned", posOf(n.Pos())))
+					}
+				case *ast.Ident:
+					if !inFailureDir || t.Name != "Error" {
+						break
+					}
+					if t.Obj != nil {
+						// Resolved: only the package's own top-level type counts; a
+						// local shadow type is unrelated.
+						if ts, ok := t.Obj.Decl.(*ast.TypeSpec); !ok || !topTypes[ts] {
+							break
+						}
+					}
+					if rel == opKindFailureFile && funcName == "New" && opKindIsConstructorLit(n) {
+						constructors++
+						break
+					}
+					diags = append(diags, fmt.Sprintf("%s: failure.Error composite literal is unsupported: it can set Op directly; only the constructor in func New of %s is exempt", posOf(n.Pos()), opKindFailureFile))
+				}
+			case *ast.Ident:
+				if skip[n] || !unqualified[n.Name] {
+					return true
+				}
+				if n.Obj == nil {
+					// Unresolved: declared in another file, or an imported package
+					// qualifier (never a reference to the own-package function).
+					if importNames[n.Name] {
+						return true
+					}
+				} else if fd, ok := n.Obj.Decl.(*ast.FuncDecl); !ok || n.Obj.Kind != ast.Fun || fd.Recv != nil {
+					// Resolved to a local variable, parameter, type or other
+					// binding: a shadow, not the package-level function. Only a
+					// same-file receiver-free function declaration is a reference.
+					return true
+				}
+				diags = append(diags, fmt.Sprintf("%s: unqualified reference to %s in %s is unsupported: a call or function value through it hides its Op from the scan", posOf(n.Pos()), n.Name, dir))
+			case *ast.CallExpr:
+				if sel, ok := n.Fun.(*ast.SelectorExpr); ok {
+					callFuns[sel] = true
+				}
+				callee, ok := opKindResolve(n, imports)
+				if !ok {
+					return true
+				}
+				target, ok := opKindTargets[callee]
+				if !ok {
+					return true
+				}
+				pos := posOf(n.Pos())
+				if len(n.Args) != target.argc || n.Ellipsis.IsValid() {
+					diags = append(diags, fmt.Sprintf("%s: %s.%s call has %d arguments (ellipsis=%t), want exactly %d", pos, callee.pkg[strings.LastIndex(callee.pkg, "/")+1:], callee.fn, len(n.Args), n.Ellipsis.IsValid(), target.argc))
+					return true
+				}
+				opArg := n.Args[target.opIdx]
+				if rel == opKindForwardFile && callee.pkg == opKindPkgFailure && (funcName == "Fail" || funcName == "Check") {
+					if id, isIdent := opArg.(*ast.Ident); isIdent && id.Name == "op" {
+						forwards[funcName]++
+						return true
+					}
+				}
+				key, shape, problem := opKindExtract(opArg, imports)
+				if problem != "" {
+					diags = append(diags, fmt.Sprintf("%s: unsupported Op expression: %s", pos, problem))
+					return true
+				}
+				sites = append(sites, opKindSite{Pos: pos, Key: key, Shape: shape})
 			}
-			key, shape, problem := opKindExtract(opArg, imports)
-			if problem != "" {
-				diags = append(diags, fmt.Sprintf("%s: unsupported Op expression: %s", pos, problem))
-				return true
-			}
-			sites = append(sites, opKindSite{Pos: pos, Key: key, Shape: shape})
 			return true
 		})
 	}
@@ -192,7 +358,61 @@ func scanOpFile(fset *token.FileSet, file *ast.File, rel string) (sites []opKind
 			}
 		}
 	}
+	if rel == opKindFailureFile && constructors != 1 {
+		diags = append(diags, fmt.Sprintf("%s: expected exactly one &Error{Op: op, ...} constructor literal in New, found %d", rel, constructors))
+	}
 	return sites, diags
+}
+
+// opKindNoteElided records, for each element, key or value literal of an array,
+// slice or map literal of type typ that elides its own type, the type the
+// container implies. A pointer element type implies its pointee, matching Go's
+// elision of &T. Array index keys imply nothing.
+func opKindNoteElided(typ ast.Expr, elts []ast.Expr, elided map[*ast.CompositeLit]ast.Expr) {
+	var keyType, valType ast.Expr
+	switch t := typ.(type) {
+	case *ast.ArrayType:
+		valType = t.Elt
+	case *ast.MapType:
+		keyType, valType = t.Key, t.Value
+	default:
+		return
+	}
+	note := func(e, implied ast.Expr) {
+		lit, ok := e.(*ast.CompositeLit)
+		if !ok || lit.Type != nil || implied == nil {
+			return
+		}
+		if star, isStar := implied.(*ast.StarExpr); isStar {
+			implied = star.X
+		}
+		elided[lit] = implied
+	}
+	for _, elt := range elts {
+		if kv, ok := elt.(*ast.KeyValueExpr); ok {
+			note(kv.Key, keyType)
+			note(kv.Value, valType)
+			continue
+		}
+		note(elt, valType)
+	}
+}
+
+// opKindIsConstructorLit reports whether lit sets its Op field to the identifier
+// op. Syntactic only: it does not prove parameter identity or the Err value.
+func opKindIsConstructorLit(lit *ast.CompositeLit) bool {
+	for _, elt := range lit.Elts {
+		kv, ok := elt.(*ast.KeyValueExpr)
+		if !ok {
+			continue
+		}
+		key, keyOK := kv.Key.(*ast.Ident)
+		val, valOK := kv.Value.(*ast.Ident)
+		if keyOK && valOK && key.Name == "Op" && val.Name == "op" {
+			return true
+		}
+	}
+	return false
 }
 
 // opKindResolve returns the imported package path and function of a
@@ -203,6 +423,12 @@ func opKindResolve(call *ast.CallExpr, imports map[string]string) (opKindCallee,
 	if !ok {
 		return opKindCallee{}, false
 	}
+	return opKindResolveSelector(sel, imports)
+}
+
+// opKindResolveSelector resolves a package-qualified selector, whether or not
+// it is called, with the same import-path and shadow rules as opKindResolve.
+func opKindResolveSelector(sel *ast.SelectorExpr, imports map[string]string) (opKindCallee, bool) {
 	id, ok := sel.X.(*ast.Ident)
 	if !ok || id.Obj != nil {
 		return opKindCallee{}, false
@@ -703,6 +929,9 @@ func TestOpKindScannerRejectsUnsupportedShapes(t *testing.T) {
 		{"too few arguments", "func a() error { return runlog.Check(nil, \"x\") }", "want exactly 3"},
 		{"too many arguments", "func a() error { return failure.New(\"x\", nil, nil) }", "want exactly 2"},
 		{"variadic call", "func a(v []any) error { return runlog.Check(v...) }", "ellipsis=true"},
+		{"function value", "func a() { fn := runlog.Check; _ = fn }", "not a direct call"},
+		{"function value argument", "func a() { use(failure.New) }", "not a direct call"},
+		{"failure.Error literal", "func a() any { return &failure.Error{Op: \"x\"} }", "failure.Error composite literal"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -853,6 +1082,384 @@ func TestOpKindTableChecker(t *testing.T) {
 					t.Errorf("diagnostics %q do not contain %q", joined, want)
 				}
 			}
+		})
+	}
+}
+
+// ─── Unsupported-reference, own-package and failure-literal shapes ────────────
+
+// opKindAliasHeader imports the target packages under aliases. Fixture bodies
+// that follow it start at line 9; those after opKindFixtureHeader start at 10.
+const opKindAliasHeader = "package p\n\nimport (\n\tf \"fmt\"\n\trl \"" + opKindPkgRunlog + "\"\n\tfl \"" + opKindPkgFailure + "\"\n)\n\n"
+
+// runOpKindScanCase scans a fixture tree and requires exactly the wanted site
+// count and exactly one diagnostic per wanted prefix. Prefixes carry file:line,
+// so a wrong line fails; a wanted prefix cannot be satisfied twice.
+func runOpKindScanCase(t *testing.T, files map[string]string, wantSites int, want []string) {
+	t.Helper()
+	sites, diags, err := scanOpSites(writeOpKindTree(t, files))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sites) != wantSites {
+		t.Errorf("sites = %+v, want %d", sites, wantSites)
+	}
+	if len(diags) != len(want) {
+		t.Fatalf("diagnostics = %q, want %d matching %q", diags, len(want), want)
+	}
+	used := make([]bool, len(diags))
+	for _, w := range want {
+		matched := false
+		for i, d := range diags {
+			if !used[i] && strings.HasPrefix(d, w) {
+				used[i], matched = true, true
+				break
+			}
+		}
+		if !matched {
+			t.Errorf("no diagnostic with prefix %q in %q", w, diags)
+		}
+	}
+}
+
+func TestOpKindScannerRejectsReferenceShapes(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		files     map[string]string
+		wantSites int
+		want      []string
+	}{
+		{
+			name:  "function value assigned to a variable",
+			files: map[string]string{"a.go": opKindFixtureHeader + "func a() { fn := runlog.Check; _ = fn }\n"},
+			want:  []string{"a.go:10: reference to runlog.Check that is not a direct call"},
+		},
+		{
+			name:  "function value passed as an argument",
+			files: map[string]string{"a.go": opKindFixtureHeader + "func a() { use(failure.New) }\n"},
+			want:  []string{"a.go:10: reference to failure.New that is not a direct call"},
+		},
+		{
+			name: "struct field and package var initialised to runlog.Fail",
+			files: map[string]string{"a.go": opKindFixtureHeader +
+				"type s struct{ f any }\n\nvar v = runlog.Fail\n\nfunc a() s { return s{f: runlog.Fail} }\n"},
+			want: []string{
+				"a.go:12: reference to runlog.Fail that is not a direct call",
+				"a.go:14: reference to runlog.Fail that is not a direct call",
+			},
+		},
+		{
+			name: "aliased imports",
+			files: map[string]string{"a.go": opKindAliasHeader +
+				"func a() {\n\tfn := rl.Check\n\tuse(fl.New)\n\t_ = fn\n}\n"},
+			want: []string{
+				"a.go:10: reference to runlog.Check that is not a direct call",
+				"a.go:11: reference to failure.New that is not a direct call",
+			},
+		},
+		{
+			name:  "parenthesized callee is not normalized into a direct call",
+			files: map[string]string{"a.go": opKindFixtureHeader + "func a() error { return (runlog.Check)(nil, \"x\", nil) }\n"},
+			want:  []string{"a.go:10: reference to runlog.Check that is not a direct call"},
+		},
+		{
+			name: "supported call keeps its site and the value is reported once",
+			files: map[string]string{"a.go": opKindFixtureHeader +
+				"func a() error {\n\tfn := runlog.Check\n\t_ = fn\n\treturn runlog.Check(nil, \"kept\", nil)\n}\n"},
+			wantSites: 1,
+			want:      []string{"a.go:11: reference to runlog.Check that is not a direct call"},
+		},
+		{
+			name:  "pointer failure.Error literal",
+			files: map[string]string{"a.go": opKindFixtureHeader + "func a() any { return &failure.Error{Op: \"x\"} }\n"},
+			want:  []string{"a.go:10: failure.Error composite literal is unsupported"},
+		},
+		{
+			name:  "value failure.Error literal",
+			files: map[string]string{"a.go": opKindFixtureHeader + "func a() any { return failure.Error{Op: \"x\"} }\n"},
+			want:  []string{"a.go:10: failure.Error composite literal is unsupported"},
+		},
+		{
+			name:  "aliased failure.Error literal",
+			files: map[string]string{"a.go": opKindAliasHeader + "func a() any { return fl.Error{Op: \"x\"} }\n"},
+			want:  []string{"a.go:9: failure.Error composite literal is unsupported"},
+		},
+		{
+			// An element literal may elide its type; the container's element, key
+			// or value type still names failure.Error syntactically. Reading only
+			// the literal's own Type would skip these silently.
+			name: "elided-type failure.Error literals in slices, map values, map keys and nested slices",
+			files: map[string]string{"a.go": opKindFixtureHeader +
+				"var s = []*failure.Error{{Op: \"x\"}}\n\nvar m = map[string]failure.Error{\"k\": {Op: \"y\"}}\n\n" +
+				"var k = map[failure.Error]bool{{Op: \"z\"}: true}\n\nvar n = [][]failure.Error{{{Op: \"w\"}}}\n"},
+			want: []string{
+				"a.go:10: failure.Error composite literal is unsupported",
+				"a.go:12: failure.Error composite literal is unsupported",
+				"a.go:14: failure.Error composite literal is unsupported",
+				"a.go:16: failure.Error composite literal is unsupported",
+			},
+		},
+		{
+			name: "qualified references stay recursive in the defining-package subdirectories",
+			files: map[string]string{
+				"internal/runlog/helper/x.go":  opKindFixtureHeader + "var v = runlog.Check\n",
+				"internal/failure/helper/x.go": opKindFixtureHeader + "var e = &failure.Error{Op: \"x\"}\n\nvar n = failure.New\n",
+			},
+			want: []string{
+				"internal/failure/helper/x.go:10: failure.Error composite literal is unsupported",
+				"internal/failure/helper/x.go:12: reference to failure.New that is not a direct call",
+				"internal/runlog/helper/x.go:10: reference to runlog.Check that is not a direct call",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			runOpKindScanCase(t, tt.files, tt.wantSites, tt.want)
+		})
+	}
+}
+
+func TestOpKindScannerRejectsOwnPackageShapes(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name  string
+		files map[string]string
+		want  []string
+	}{
+		{
+			// Exact-directory ownership: a subdirectory or lookalike path is a
+			// different package with its own Fail, Check, New and Error. Matching
+			// by prefix would flag every file here.
+			name: "subdirectories and lookalike directories own their names",
+			files: map[string]string{
+				"internal/runlog/helper/x.go":  "package p\n\nfunc a() error { return Fail(nil, \"x\", nil) }\n\nvar v = Check\n",
+				"internal/failure/helper/x.go": "package p\n\nfunc a() error { return New(\"x\", nil) }\n\nvar e = Error{Op: \"x\"}\n",
+				"internal/runlogextra/x.go":    "package p\n\nvar v = Check\n\nvar w = Fail\n",
+				"internal/failureextra/x.go":   "package p\n\nvar n = New\n\nvar e = Error{Op: \"x\"}\n",
+				"other/runlog/x.go":            "package p\n\nvar v = Check\n",
+				"other/failure/x.go":           "package p\n\nvar n = New\n\nvar e = Error{Op: \"x\"}\n",
+				"x.go":                         "package p\n\nvar v = Check\n\nvar n = New\n\nvar e = Error{Op: \"x\"}\n",
+			},
+		},
+		{
+			name:  "unqualified Fail call in runlog",
+			files: map[string]string{"internal/runlog/x.go": "package p\n\nfunc a() error { return Fail(nil, \"x\", nil) }\n"},
+			want:  []string{"internal/runlog/x.go:3: unqualified reference to Fail in internal/runlog"},
+		},
+		{
+			name:  "unqualified Check value in runlog",
+			files: map[string]string{"internal/runlog/x.go": "package p\n\nvar v = Check\n"},
+			want:  []string{"internal/runlog/x.go:3: unqualified reference to Check in internal/runlog"},
+		},
+		{
+			name:  "unqualified New call in failure",
+			files: map[string]string{"internal/failure/x.go": "package p\n\nfunc a() error { return New(\"x\", nil) }\n"},
+			want:  []string{"internal/failure/x.go:3: unqualified reference to New in internal/failure"},
+		},
+		{
+			name: "same-file Check call and value, before and after the declaration",
+			files: map[string]string{"internal/runlog/same.go": "package p\n\nvar before = Check\n\n" +
+				"func Check(a, b, c int) error { return nil }\n\nfunc use() error { return Check(1, 2, 3) }\n"},
+			want: []string{
+				"internal/runlog/same.go:3: unqualified reference to Check",
+				"internal/runlog/same.go:7: unqualified reference to Check",
+			},
+		},
+		{
+			name: "same-file Fail call and value, before and after the declaration",
+			files: map[string]string{"internal/runlog/same.go": "package p\n\nfunc use() error { return Fail(1, 2, 3) }\n\n" +
+				"func Fail(a, b, c int) error { return nil }\n\nvar after = Fail\n"},
+			want: []string{
+				"internal/runlog/same.go:3: unqualified reference to Fail",
+				"internal/runlog/same.go:7: unqualified reference to Fail",
+			},
+		},
+		{
+			name: "same-file New value and call, before and after the declaration",
+			files: map[string]string{"internal/failure/same.go": "package p\n\nvar before = New\n\n" +
+				"func New(op string, cause error) error { return nil }\n\nfunc use() error { return New(\"x\", nil) }\n"},
+			want: []string{
+				"internal/failure/same.go:3: unqualified reference to New",
+				"internal/failure/same.go:7: unqualified reference to New",
+			},
+		},
+		{
+			name:  "map key is an expression, not a field name",
+			files: map[string]string{"internal/runlog/m.go": "package p\n\nvar m = map[any]bool{Check: true}\n"},
+			want:  []string{"internal/runlog/m.go:3: unqualified reference to Check"},
+		},
+		{
+			name:  "array index key is an expression, not a field name",
+			files: map[string]string{"internal/runlog/m.go": "package p\n\nvar m = [2]int{Fail: 1}\n"},
+			want:  []string{"internal/runlog/m.go:3: unqualified reference to Fail"},
+		},
+		{
+			name:  "elided map-typed element keeps its keys as expressions",
+			files: map[string]string{"internal/runlog/m.go": "package p\n\nvar m = []map[any]bool{{Check: true}}\n"},
+			want:  []string{"internal/runlog/m.go:3: unqualified reference to Check"},
+		},
+		{
+			name:  "elided-type Error literal in the failure directory",
+			files: map[string]string{"internal/failure/x.go": "package p\n\nvar s = []*Error{{Op: \"x\"}}\n"},
+			want:  []string{"internal/failure/x.go:3: failure.Error composite literal is unsupported"},
+		},
+		{
+			name:  "extra unqualified Error literal in the failure directory",
+			files: map[string]string{"internal/failure/x.go": "package p\n\nvar e = Error{Op: \"x\"}\n"},
+			want:  []string{"internal/failure/x.go:3: failure.Error composite literal is unsupported"},
+		},
+		{
+			name: "exempt-shaped literal in another file of the directory",
+			files: map[string]string{
+				"internal/failure/error.go": opKindFailureCtor(""),
+				"internal/failure/other.go": "package p\n\nfunc New(op string) any { return &Error{Op: op} }\n",
+			},
+			want: []string{"internal/failure/other.go:3: failure.Error composite literal is unsupported"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			runOpKindScanCase(t, tt.files, 0, tt.want)
+		})
+	}
+}
+
+func TestOpKindScannerAcceptsLookalikes(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		files     map[string]string
+		wantSites int
+	}{
+		{
+			name: "methods, fields and keyed struct fields named like the targets",
+			files: map[string]string{
+				"internal/runlog/x.go":  "package p\n\ntype t struct{ Fail int }\n\nfunc (t) Check() {}\n\nvar v = t{Fail: 1}\n\nfunc a(x t) { x.Check(); _ = x.Fail }\n",
+				"internal/failure/x.go": "package p\n\ntype u struct{ New int }\n\nfunc (u) New() {}\n\nvar v = u{New: 1}\n\nfunc a(x u) { x.New() }\n",
+			},
+		},
+		{
+			name: "local function variables and parameters",
+			files: map[string]string{
+				"internal/runlog/x.go":  "package p\n\nfunc a(Fail func()) { Fail() }\n\nfunc b() { Check := func() {}; Check() }\n",
+				"internal/failure/x.go": "package p\n\nfunc a(New func()) { New() }\n",
+			},
+		},
+		{
+			name: "import alias named New and errors.New",
+			files: map[string]string{"internal/failure/x.go": "package p\n\nimport (\n\tNew \"errors\"\n\t\"errors\"\n)\n\n" +
+				"var a = New.New(\"x\")\n\nvar b = errors.New(\"y\")\n"},
+		},
+		{
+			name:  "local type Error shadowing the package type",
+			files: map[string]string{"internal/failure/x.go": "package p\n\nfunc a() any {\n\ttype Error struct{ Op string }\n\treturn Error{Op: \"x\"}\n}\n"},
+		},
+		{
+			name: "elided-type elements of local struct and shadow Error types",
+			files: map[string]string{
+				"internal/runlog/x.go":  "package p\n\ntype t struct{ Fail int }\n\nvar v = []t{{Fail: 1}}\n",
+				"internal/failure/x.go": "package p\n\nfunc a() any {\n\ttype Error struct{ Op string }\n\treturn []Error{{Op: \"x\"}}\n}\n",
+			},
+		},
+		{
+			name: "shadowed package names, unrelated selectors and a normal call",
+			files: map[string]string{"a.go": opKindFixtureHeader +
+				"func a() error {\n\trunlog, failure := local{}, local{}\n\tfn := runlog.Check\n\t_ = failure.Error{}\n\tg := fmt.Sprintf\n\t_, _ = fn, g\n\treturn nil\n}\n\n" +
+				"var p *failure.Error\n\nfunc b() error { return runlog.Check(nil, \"ok\", nil) }\n"},
+			wantSites: 1,
+		},
+		{
+			name:  "genuine failure constructor",
+			files: map[string]string{"internal/failure/error.go": opKindFailureCtor("")},
+		},
+		{
+			name:  "constructor-shaped file outside internal/failure gets no exemption and no rule",
+			files: map[string]string{"other/failure/error.go": opKindFailureCtor("")},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			runOpKindScanCase(t, tt.files, tt.wantSites, nil)
+		})
+	}
+}
+
+// opKindFailureCtor returns a copy of the real internal/failure/error.go shape.
+// extra is spliced into New just before its return, so a fixture can add a
+// literal or a shadow type inside the constructor.
+func opKindFailureCtor(extra string) string {
+	return "package p\n\nimport \"errors\"\n\ntype Error struct {\n\tOp  string\n\tErr error\n}\n\n" +
+		"func New(op string, cause error) *Error {\n\tif cause == nil {\n\t\tcause = errors.New(op)\n\t}\n" +
+		extra + "\treturn &Error{Op: op, Err: cause}\n}\n"
+}
+
+func TestOpKindScannerFailureConstructorExemption(t *testing.T) {
+	t.Parallel()
+	const file = "internal/failure/error.go"
+	genuine := opKindFailureCtor("")
+	tests := []struct {
+		name  string
+		files map[string]string
+		want  []string
+	}{
+		{name: "genuine constructor is exempt", files: map[string]string{file: genuine}},
+		{
+			name: "missing constructor literal is reported",
+			files: map[string]string{file: "package p\n\ntype Error struct{ Op string }\n\n" +
+				"func New(op string, cause error) *Error { return nil }\n"},
+			want: []string{file + ": expected exactly one &Error{Op: op, ...} constructor literal in New, found 0"},
+		},
+		{
+			name:  "second matching literal is reported by the counter only",
+			files: map[string]string{file: opKindFailureCtor("\tif op == \"\" {\n\t\treturn &Error{Op: op}\n\t}\n")},
+			want:  []string{file + ": expected exactly one &Error{Op: op, ...} constructor literal in New, found 2"},
+		},
+		{
+			name:  "exempt-shaped literal in another function",
+			files: map[string]string{file: genuine + "\nfunc Other(op string) *Error { return &Error{Op: op} }\n"},
+			want:  []string{file + ":17: failure.Error composite literal is unsupported"},
+		},
+		{
+			name:  "method named New gets no exemption",
+			files: map[string]string{file: genuine + "\nfunc (*Error) New(op string) *Error { return &Error{Op: op} }\n"},
+			want:  []string{file + ":17: failure.Error composite literal is unsupported"},
+		},
+		{
+			name:  "literal Op value is reported and does not count",
+			files: map[string]string{file: strings.Replace(genuine, "Op: op, Err", "Op: \"x\", Err", 1)},
+			want: []string{
+				file + ":14: failure.Error composite literal is unsupported",
+				file + ": expected exactly one &Error{Op: op, ...} constructor literal in New, found 0",
+			},
+		},
+		{
+			name:  "different identifier Op value is reported and does not count",
+			files: map[string]string{file: strings.Replace(genuine, "Op: op, Err", "Op: name, Err", 1)},
+			want: []string{
+				file + ":14: failure.Error composite literal is unsupported",
+				file + ": expected exactly one &Error{Op: op, ...} constructor literal in New, found 0",
+			},
+		},
+		{
+			name: "local shadow type inside New neither reports nor counts",
+			files: map[string]string{file: opKindFailureCtor(
+				"\t_ = func() any {\n\t\ttype Error struct{ Op string }\n\t\treturn Error{Op: op}\n\t}\n")},
+		},
+		{
+			name: "local shadow type alone does not satisfy the count",
+			files: map[string]string{file: "package p\n\ntype Error struct{ Op string }\n\n" +
+				"func New(op string, cause error) *Error {\n\ttype Error struct{ Op string }\n\t_ = Error{Op: op}\n\treturn nil\n}\n"},
+			want: []string{file + ": expected exactly one &Error{Op: op, ...} constructor literal in New, found 0"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			runOpKindScanCase(t, tt.files, 0, tt.want)
 		})
 	}
 }
