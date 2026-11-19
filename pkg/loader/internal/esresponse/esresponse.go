@@ -55,8 +55,12 @@ func IsRetryableTransportError(err error) bool {
 // IsUnsupportedEnrichAPI reports a generic 404 that carries no Elasticsearch
 // error object: a proxy or routing problem in front of the enrich API, not a
 // missing policy (resource_not_found_exception) or another ES error.
-func IsUnsupportedEnrichAPI(statusCode int, body []byte) bool {
-	if statusCode != http.StatusNotFound || Oversized(body) {
+//
+// A body whose read failed or was cut is not classifiable: the predicate decides
+// from the absence of ES error tokens, and missing bytes would read as a proxy
+// 404, so it returns false.
+func IsUnsupportedEnrichAPI(statusCode int, body []byte, readErr error) bool {
+	if statusCode != http.StatusNotFound || readErr != nil || Oversized(body) {
 		return false
 	}
 

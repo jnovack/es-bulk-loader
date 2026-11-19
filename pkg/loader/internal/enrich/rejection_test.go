@@ -319,3 +319,123 @@ func TestListPoliciesOversizedGeneric404Fails(t *testing.T) {
 		t.Fatalf("message %q lacks the oversize detail", err.Error())
 	}
 }
+
+// TestListPolicies404ReadErrorFails is the under-bound counterpart of the
+// oversize guard (FIX-404READERR-01): a 404 whose body read failed cannot be
+// told from a proxy 404, so it must fail the listing instead of reporting
+// "unsupported" and letting the run skip enrichment as a success.
+func TestListPolicies404ReadErrorFails(t *testing.T) {
+	t.Parallel()
+
+	const partial = `{"err`
+	boom := errors.New("injected read failure")
+	tr := &bodytransport.Transport{Replies: []func() bodytransport.Reply{
+		func() bodytransport.Reply {
+			return bodytransport.Reply{Status: http.StatusNotFound, Body: &bodytransport.Body{R: strings.NewReader(partial), Err: boom}}
+		},
+	}}
+	logger, buf := logbuf.New()
+	ctx := runlog.WithLogger(t.Context(), logger)
+
+	_, supported, err := ListPolicies(ctx, tr.Client(t))
+
+	const op = "Failed to get enrich policies"
+	var opErr *failure.Error
+	if !errors.As(err, &opErr) || opErr.Op != op {
+		t.Fatalf("ListPolicies = (supported %t, %v), want Op %q", supported, err, op)
+	}
+	if supported {
+		t.Fatal("supported = true, want false")
+	}
+	var rejection *esresponse.Rejection
+	if !errors.As(err, &rejection) {
+		t.Fatalf("cause = %T, want *esresponse.Rejection", opErr.Err)
+	}
+	const want = op + `: enrich policy list request rejected with HTTP 404: ES error detail unavailable (response body read failed)`
+	if err.Error() != want {
+		t.Fatalf("message mismatch\n got: %s\nwant: %s", err.Error(), want)
+	}
+	if !errors.Is(err, boom) {
+		t.Fatalf("errors.Is(err, boom) = false for %v", err)
+	}
+	if strings.Contains(err.Error(), boom.Error()) || strings.Contains(buf.String(), boom.Error()) {
+		t.Fatalf("injected error text leaked:\n%v\n%s", err, buf.String())
+	}
+	if got := tr.Paths(); len(got) != 1 || got[0] != "GET /_enrich/policy" {
+		t.Fatalf("paths = %v, want exactly [GET /_enrich/policy]", got)
+	}
+	var failures int
+	for _, line := range buf.Lines(t) {
+		if _, has := line["body"]; has {
+			t.Fatalf("log line %v carries a body field", line)
+		}
+		if msg, _ := line["message"].(string); strings.Contains(msg, "generic 404") {
+			t.Fatalf("log line %q is the generic-404 skip", msg)
+		}
+		if line["message"] == op {
+			failures++
+			if line["error"] != opErr.Err.Error() {
+				t.Fatalf("logged error %v != returned cause %q", line["error"], opErr.Err.Error())
+			}
+		}
+	}
+	if failures != 1 {
+		t.Fatalf("failure lines = %d, want 1\n%s", failures, buf.String())
+	}
+	b := tr.Bodies()[0]
+	if b.Served.Load() != int64(len(partial)) || b.Closes.Load() != 1 {
+		t.Fatalf("served %d, closed %d; want %d and 1", b.Served.Load(), b.Closes.Load(), len(partial))
+	}
+}
+
+// TestExecutePolicy404ReadErrorIsAFailureNotUnsupported guards that a
+// read-failed 404 on _execute is logged as the execution failure with the
+// bounded rejection, not as the misleading generic-404 proxy warning
+// (FIX-404READERR-01). The outcome (false, counted as failed) is unchanged.
+func TestExecutePolicy404ReadErrorIsAFailureNotUnsupported(t *testing.T) {
+	t.Parallel()
+
+	const partial = `{"err`
+	boom := errors.New("injected read failure")
+	tr := &bodytransport.Transport{Replies: []func() bodytransport.Reply{
+		bodytransport.Static(http.StatusNotFound, aliasMissingBody), // pre-kickoff alias read
+		func() bodytransport.Reply {
+			return bodytransport.Reply{Status: http.StatusNotFound, Body: &bodytransport.Body{R: strings.NewReader(partial), Err: boom}}
+		},
+	}}
+	logger, buf := logbuf.New()
+	ctx := runlog.WithLogger(t.Context(), logger)
+
+	if executePolicy(ctx, tr.Client(t), "policy-a", fixedEnrichSeams()) {
+		t.Fatal("executePolicy = true, want false")
+	}
+
+	wantPaths := []string{"GET /_alias/.enrich-policy-a", "PUT /_enrich/policy/policy-a/_execute"}
+	if got := tr.Paths(); strings.Join(got, "|") != strings.Join(wantPaths, "|") {
+		t.Fatalf("paths = %v, want %v", got, wantPaths)
+	}
+	lines := buf.Lines(t)
+	fails := enrichLogsWith(lines, "Enrich policy execution failed")
+	if len(fails) != 1 || fails[0]["level"] != "error" {
+		t.Fatalf("execution-failed lines = %v, want exactly one Error\n%s", fails, buf.String())
+	}
+	const want = `enrich policy "policy-a" rejected with HTTP 404: ES error detail unavailable (response body read failed)`
+	if fails[0]["es_error"] != want {
+		t.Fatalf("es_error = %v, want %q", fails[0]["es_error"], want)
+	}
+	for _, line := range lines {
+		if _, has := line["body"]; has {
+			t.Fatalf("log line %v carries a body field", line)
+		}
+		if msg, _ := line["message"].(string); strings.Contains(msg, "generic 404") {
+			t.Fatalf("log line %q is the generic-404 warning", msg)
+		}
+	}
+	if strings.Contains(buf.String(), boom.Error()) {
+		t.Fatalf("injected error text leaked:\n%s", buf.String())
+	}
+	bodies := tr.Bodies()
+	if bodies[1].Served.Load() != int64(len(partial)) || bodies[0].Closes.Load() != 1 || bodies[1].Closes.Load() != 1 {
+		t.Fatalf("served %d; closes %d/%d; want %d and 1/1", bodies[1].Served.Load(), bodies[0].Closes.Load(), bodies[1].Closes.Load(), len(partial))
+	}
+}

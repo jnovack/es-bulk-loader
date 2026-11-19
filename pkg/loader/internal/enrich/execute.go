@@ -118,7 +118,7 @@ func ListPolicies(ctx context.Context, es *elasticsearch.Client) ([]string, bool
 
 	if res.IsError() {
 		body, readErr := esresponse.ReadBounded(res.Body)
-		if esresponse.IsUnsupportedEnrichAPI(res.StatusCode, body) {
+		if esresponse.IsUnsupportedEnrichAPI(res.StatusCode, body, readErr) {
 			runlog.From(ctx).Warn().
 				Int("status_code", res.StatusCode).
 				Str("es_error", esresponse.NewRejection(
@@ -431,7 +431,7 @@ func executePolicy(ctx context.Context, es *elasticsearch.Client, policy string,
 
 	if res.IsError() {
 		body, readErr := esresponse.ReadBounded(res.Body)
-		if esresponse.IsUnsupportedEnrichAPI(res.StatusCode, body) {
+		if esresponse.IsUnsupportedEnrichAPI(res.StatusCode, body, readErr) {
 			runlog.From(ctx).Warn().
 				Str("policy", policy).
 				Int("status_code", res.StatusCode).

@@ -16,6 +16,7 @@ import (
 
 	"github.com/elastic/go-elasticsearch/v9"
 
+	"github.com/jnovack/es-bulk-loader/internal/testutil/bodytransport"
 	"github.com/jnovack/es-bulk-loader/internal/testutil/esstub"
 	"github.com/jnovack/es-bulk-loader/internal/testutil/logbuf"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/config"
@@ -503,5 +504,186 @@ func TestManagedErrorReadsAreBoundedAndClosedOnce(t *testing.T) {
 	requireOneClose(t, bodies.all(), 1)
 	if got := bodies.all()[0].served.Load(); got != esresponse.MaxRejectionBodyBytes+1 {
 		t.Fatalf("served %d bytes, want %d", got, esresponse.MaxRejectionBodyBytes+1)
+	}
+}
+
+// readFailed returns a reply factory for a 404 (or status) whose body serves
+// partial and then fails with boom instead of io.EOF.
+func readFailed(status int, partial string, boom error) func() bodytransport.Reply {
+	return func() bodytransport.Reply {
+		return bodytransport.Reply{Status: status, Body: &bodytransport.Body{R: strings.NewReader(partial), Err: boom}}
+	}
+}
+
+// requireReadFailedBody asserts the single served body delivered exactly its
+// partial bytes and was closed once, proving the under-bound read-error path.
+func requireReadFailedBody(t *testing.T, b *bodytransport.Body, partial string) {
+	t.Helper()
+	if got := b.Served.Load(); got != int64(len(partial)) {
+		t.Fatalf("served %d bytes, want %d", got, len(partial))
+	}
+	if got := b.Closes.Load(); got != 1 {
+		t.Fatalf("closes = %d, want 1", got)
+	}
+}
+
+// TestPolicy404ReadErrorFailsClosed is the under-bound counterpart of the
+// oversize guard (FIX-404READERR-01). A 404 whose body read failed carries no
+// bytes to tell a proxy 404 from a missing policy, and absence-based
+// classification would report success while skipping policy work. It must fail
+// with the existing Op, keep the read error in the chain and stop before any
+// retry or next policy. A "simplification" that drops the readErr guard
+// re-opens that silent success.
+func TestPolicy404ReadErrorFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	const detail = "ES error detail unavailable (response body read failed)"
+	boom := errors.New("injected read failure")
+	for _, partial := range []string{``, `{"err`} {
+		cases := []struct {
+			name     string
+			op       string
+			resource string
+			wantPath string
+			run      func(ctx context.Context, tr *bodytransport.Transport, t *testing.T) error
+		}{
+			{"delete nuke=false", "Failed to delete enrich policy", "first", "DELETE /_enrich/policy/first",
+				func(ctx context.Context, tr *bodytransport.Transport, t *testing.T) error {
+					return DeleteResources(ctx, tr.Client(t), nil, []string{"first", "second"}, nil, false)
+				}},
+			{"delete nuke=true", "Failed to delete enrich policy", "first", "DELETE /_enrich/policy/first",
+				func(ctx context.Context, tr *bodytransport.Transport, t *testing.T) error {
+					return DeleteResources(ctx, tr.Client(t), nil, []string{"first", "second"}, nil, true)
+				}},
+			{"create", "Failed to create enrich policy", "pol", "PUT /_enrich/policy/pol",
+				func(ctx context.Context, tr *bodytransport.Transport, t *testing.T) error {
+					defs := config.Definitions{"pol": []byte(`{"match":{}}`), "later": []byte(`{"match":{}}`)}
+					noSleep := func(context.Context, time.Duration) error {
+						t.Error("sleep called: a read-failed 404 must not retry")
+						return nil
+					}
+					return CreatePolicies(ctx, tr.Client(t), defs, []string{"pol", "later"}, noSleep)
+				}},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name+" partial="+partial, func(t *testing.T) {
+				t.Parallel()
+				tr := &bodytransport.Transport{Replies: []func() bodytransport.Reply{readFailed(http.StatusNotFound, partial, boom)}}
+				ctx, buf := bufferContext(t)
+
+				err := tc.run(ctx, tr, t)
+
+				want := tc.op + `: enrich policy "` + tc.resource + `" rejected with HTTP 404: ` + detail
+				requireRejection(t, err, tc.op, want)
+				requireLogCarriesCause(t, buf, err)
+				if !errors.Is(err, boom) {
+					t.Fatalf("errors.Is(err, boom) = false for %v", err)
+				}
+				if strings.Contains(err.Error(), boom.Error()) || strings.Contains(buf.String(), boom.Error()) {
+					t.Fatalf("injected error text leaked:\n%v\n%s", err, buf.String())
+				}
+				for _, line := range buf.Lines(t) {
+					msg, _ := line["message"].(string)
+					if strings.Contains(msg, "generic 404") || strings.Contains(msg, "Nothing to delete") {
+						t.Fatalf("log line %q is a silent-success classification", msg)
+					}
+				}
+				if got := tr.Paths(); len(got) != 1 || got[0] != tc.wantPath {
+					t.Fatalf("paths = %v, want exactly [%s]", got, tc.wantPath)
+				}
+				bodies := tr.Bodies()
+				if len(bodies) != 1 {
+					t.Fatalf("bodies = %d, want 1", len(bodies))
+				}
+				requireReadFailedBody(t, bodies[0], partial)
+			})
+		}
+	}
+}
+
+// TestDeletePolicy404ReadErrorWithMissingTokenStillFails guards the delete
+// half of the FIX-404READERR-01 decision: the token-presence exception is
+// create-only. A read-failed delete 404 whose partial bytes happen to contain
+// resource_not_found_exception must still fail, because the read error means
+// the rest of the response is unknown. Letting that token through as "Nothing
+// to delete" would skip the remaining policy deletes and report success.
+func TestDeletePolicy404ReadErrorWithMissingTokenStillFails(t *testing.T) {
+	t.Parallel()
+
+	const partial = `{"error":{"type":"resource_not_found_exception"`
+	const op = "Failed to delete enrich policy"
+	boom := errors.New("injected read failure")
+	tr := &bodytransport.Transport{Replies: []func() bodytransport.Reply{readFailed(http.StatusNotFound, partial, boom)}}
+	ctx, buf := bufferContext(t)
+
+	err := DeleteResources(ctx, tr.Client(t), nil, []string{"first", "second"}, nil, false)
+
+	var opErr *failure.Error
+	if !errors.As(err, &opErr) || opErr.Op != op {
+		t.Fatalf("error = %v, want Op %q", err, op)
+	}
+	if !errors.Is(err, boom) {
+		t.Fatalf("errors.Is(err, boom) = false for %v", err)
+	}
+	requireLogCarriesCause(t, buf, err)
+	for _, line := range buf.Lines(t) {
+		if msg, _ := line["message"].(string); strings.Contains(msg, "Nothing to delete") {
+			t.Fatalf("log line %q treats a read-failed 404 as an absent policy", msg)
+		}
+	}
+	if got := tr.Paths(); len(got) != 1 || got[0] != "DELETE /_enrich/policy/first" {
+		t.Fatalf("paths = %v, want exactly [DELETE /_enrich/policy/first]", got)
+	}
+	requireReadFailedBody(t, tr.Bodies()[0], partial)
+}
+
+// TestPolicy404ReadErrorPreservesTokenHandling guards the decided exception
+// (FIX-404READERR-01 option a): token-presence checks stay valid on the bytes
+// that arrived, so an under-bound read-failed body carrying the already-exists
+// or index-not-found token keeps its create handling. Blanket-failing every
+// read error before those branches would change that decision.
+func TestPolicy404ReadErrorPreservesTokenHandling(t *testing.T) {
+	t.Parallel()
+
+	boom := errors.New("injected read failure")
+	tests := []struct {
+		name       string
+		first      string
+		status     int
+		wantPaths  int
+		wantSleeps int
+	}{
+		{"already exists token succeeds", `{"error":{"type":"resource_already_exists_exception"`, http.StatusBadRequest, 1, 0},
+		{"index not found token retries", `{"error":{"type":"index_not_found_exception"`, http.StatusNotFound, 2, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			tr := &bodytransport.Transport{Replies: []func() bodytransport.Reply{
+				readFailed(tt.status, tt.first, boom),
+				bodytransport.Static(http.StatusOK, `{"acknowledged":true}`),
+			}}
+			ctx, buf := bufferContext(t)
+			sleeps := 0
+			sleep := func(context.Context, time.Duration) error { sleeps++; return nil }
+
+			err := CreatePolicies(ctx, tr.Client(t), config.Definitions{"pol": []byte(`{"match":{}}`)}, []string{"pol"}, sleep)
+
+			if err != nil {
+				t.Fatalf("CreatePolicies: %v", err)
+			}
+			if got := len(tr.Paths()); got != tt.wantPaths {
+				t.Fatalf("requests = %d, want %d", got, tt.wantPaths)
+			}
+			if sleeps != tt.wantSleeps {
+				t.Fatalf("sleeps = %d, want %d", sleeps, tt.wantSleeps)
+			}
+			requireReadFailedBody(t, tr.Bodies()[0], tt.first)
+			for _, line := range buf.Lines(t) {
+				if msg, _ := line["message"].(string); strings.Contains(msg, "generic 404") {
+					t.Fatalf("unexpected generic-404 warning: %q", msg)
+				}
+			}
+		})
 	}
 }

@@ -147,7 +147,9 @@ func ReadBounded(body io.Reader) ([]byte, error) {
 // byte and is therefore a cut body. Body classifiers must treat a cut body as
 // no match: they are substring checks, so a cut body could still match a token
 // in its first MaxRejectionBodyBytes bytes or lose the "error":{ marker they
-// look for.
+// look for. An absence-based classifier (IsUnsupportedEnrichAPI) must also
+// treat a failed read as no match; a token-presence classifier may still match
+// a token in the bytes that did arrive.
 func Oversized(data []byte) bool { return len(data) > MaxRejectionBodyBytes }
 
 // rejectionDetail selects the fallback or the extracted pairs, in the

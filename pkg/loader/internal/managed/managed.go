@@ -557,7 +557,7 @@ func CreatePolicies(ctx context.Context, es *elasticsearch.Client, definitions c
 			body, readErr := esresponse.ReadBounded(res.Body)
 			res.Body.Close()
 
-			if esresponse.IsUnsupportedEnrichAPI(res.StatusCode, body) {
+			if esresponse.IsUnsupportedEnrichAPI(res.StatusCode, body, readErr) {
 				runlog.From(ctx).Warn().
 					Int("status_code", res.StatusCode).
 					Str("es_error", esresponse.NewRejection(
@@ -630,11 +630,12 @@ func deletePolicies(ctx context.Context, es *elasticsearch.Client, names []strin
 			if res.StatusCode == http.StatusNotFound {
 				body, readErr := esresponse.ReadBounded(res.Body)
 				res.Body.Close()
-				if esresponse.Oversized(body) {
-					// A body past the read bound cannot be classified, and the
-					// classifier below would read "no ES error object" as an
-					// absent policy. An unclassifiable 404 must not be reported
-					// as success, so fail before the generic-404 and
+				if esresponse.Oversized(body) || readErr != nil {
+					// A body past the read bound, or one whose read failed,
+					// cannot be classified, and the checks below would read
+					// "no ES error object" as a generic 404 or an absent
+					// policy. An unclassifiable 404 must not be reported as
+					// success, so fail before the generic-404 and
 					// missing-policy split.
 					return runlog.Fail(runlog.FailureEvent(ctx).
 						Str("policy", name).
@@ -643,7 +644,7 @@ func deletePolicies(ctx context.Context, es *elasticsearch.Client, names []strin
 							"enrich policy", name, res.StatusCode, body, readErr,
 							esresponse.MaxPublicMessageBytes))
 				}
-				if esresponse.IsUnsupportedEnrichAPI(res.StatusCode, body) {
+				if esresponse.IsUnsupportedEnrichAPI(res.StatusCode, body, readErr) {
 					runlog.From(ctx).Warn().
 						Int("status_code", res.StatusCode).
 						Str("es_error", esresponse.NewRejection(

@@ -155,7 +155,7 @@ func TestClassifiersTreatACutBodyAsNoMatch(t *testing.T) {
 		want bool // result at exactly 64 KiB; false at 64 KiB + 1
 	}{
 		{"HasErrorType", func(b []byte) bool { return HasErrorType(b, "index_not_found_exception") }, typeMatch, true},
-		{"IsUnsupportedEnrichAPI", func(b []byte) bool { return IsUnsupportedEnrichAPI(404, b) }, `no es error here`, true},
+		{"IsUnsupportedEnrichAPI", func(b []byte) bool { return IsUnsupportedEnrichAPI(404, b, nil) }, `no es error here`, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

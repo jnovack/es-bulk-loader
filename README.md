@@ -119,8 +119,12 @@ secret keys (such as `password`, `api_key`, `token`, `secret`) are replaced
 with `[REDACTED]`. An unreadable, oversized (over 64 KiB), empty or non-JSON
 response yields a fixed explanation instead. An oversized body is treated as
 no match by the loader's body classifiers, so a body-dependent retry or
-recovery does not happen; an oversized 404 on an enrich-policy delete fails the
-run instead of being read as an absent policy. Status-only retries are
+recovery does not happen. An enrich-policy 404 whose body is oversized or could
+not be read never classifies as an unsupported enrich API. Delete fails rather
+than assuming the policy is absent, and list fails the run. Create fails unless
+an under-bound partial body contains a recognized retry or already-exists
+token; those token-based rules are unchanged. Execution counts the policy as
+failed and logs the rejection. Status-only retries are
 unchanged. Redaction recognizes structured credentials only: free-text reasons
 can still contain sensitive prose that generic redaction cannot recognize.
 Failure text parsed out of successful (2xx) responses, such as the first flush
