@@ -309,7 +309,7 @@ func Wait(ctx context.Context, get Getter, id string, cfg WaitConfig) (Stats, er
 			case Done:
 				return stats, nil
 			case Failed:
-				reason := stats.Reason
+				reason := esresponse.SanitizeText(stats.Reason, esresponse.MaxPublicMessageBytes)
 				if reason == "" {
 					reason = "no reason reported"
 				}

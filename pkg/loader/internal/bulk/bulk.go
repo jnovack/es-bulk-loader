@@ -438,8 +438,8 @@ func bulkInsert(
 					errorType := ""
 					errorReason := ""
 					if result.Error != nil {
-						errorType = result.Error.Type
-						errorReason = result.Error.Reason
+						errorType = esresponse.SanitizeText(result.Error.Type, esresponse.MaxPublicMessageBytes)
+						errorReason = esresponse.SanitizeText(result.Error.Reason, esresponse.MaxPublicMessageBytes)
 					}
 					runlog.From(ctx).Error().
 						Int("item", itemIdx).

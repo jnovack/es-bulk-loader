@@ -200,7 +200,7 @@ func TestSuccessfulResponsesLargerThanTheBoundStillDecode(t *testing.T) {
 		t.Parallel()
 		// The failures array sits after the padding: a truncated read could
 		// not parse, and would fail with a different Op.
-		body := `{"pad":"` + pad + `","failures":[{"shard":1}]}`
+		body := `{"pad":"` + pad + `","failures":[{"shard":1,"reason":{"type":"late_failure","reason":"after padding"}}]}`
 		tr := &bodytransport.Transport{Replies: []func() bodytransport.Reply{bodytransport.Static(200, body)}}
 		ctx := runlog.WithLogger(t.Context(), logbuf.Nop())
 
@@ -209,6 +209,9 @@ func TestSuccessfulResponsesLargerThanTheBoundStillDecode(t *testing.T) {
 		var opErr *failure.Error
 		if !errors.As(err, &opErr) || opErr.Op != "Index flush completed with shard-level failures" {
 			t.Fatalf("error = %#v, want the shard-failure Op (the full body was read)", err)
+		}
+		if !strings.Contains(err.Error(), "late_failure: after padding") {
+			t.Fatalf("error = %v, want the failure detail that follows the padding", err)
 		}
 	})
 	t.Run("mappings past the bound are decoded", func(t *testing.T) {

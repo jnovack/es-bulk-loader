@@ -384,11 +384,15 @@ func Flush(ctx context.Context, es *elasticsearch.Client, index string) error {
 		return runlog.Fail(runlog.FailureEvent(ctx).Str("index", index), "Unable to parse index flush response body", err)
 	}
 	if len(result.Failures) > 0 {
+		// The cause replaces the old raw first_failure log field: it is
+		// sanitized and bounded, and runlog.Fail logs it as the line's error.
+		detail := esresponse.ShardFailureDetail(result.Failures[0], esresponse.MaxPublicMessageBytes)
+		text := fmt.Sprintf("flush had %d shard failures; first: %s", len(result.Failures), detail)
+		cause := esresponse.NewDetail("index", index, text)
 		return runlog.Fail(runlog.FailureEvent(ctx).
 			Str("index", index).
-			Int("shard_failures", len(result.Failures)).
-			Str("first_failure", string(result.Failures[0])),
-			"Index flush completed with shard-level failures", nil)
+			Int("shard_failures", len(result.Failures)),
+			"Index flush completed with shard-level failures", cause)
 	}
 	return nil
 }

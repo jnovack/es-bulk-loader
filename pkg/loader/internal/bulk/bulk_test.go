@@ -2,6 +2,7 @@ package bulk
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -9,15 +10,20 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/elastic/go-elasticsearch/v9"
 
 	"github.com/jnovack/es-bulk-loader/internal/testutil/esstub"
+	"github.com/jnovack/es-bulk-loader/internal/testutil/logbuf"
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/esresponse"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/failure"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/progress"
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/runlog"
 )
 
 // TestBulkInsertRejectsUnsupportedDocumentBeforeRequest verifies that payload
@@ -521,4 +527,119 @@ func TestLoadRechecksFormatAfterPreflight(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestBulkItemFailureReasonsAreRedacted pins that the logged error_type and
+// error_reason of a failed bulk item (decoded from a 2xx response) are
+// sanitized and bounded, keep their string type, and keep the ten-item cap.
+func TestBulkItemFailureReasonsAreRedacted(t *testing.T) {
+	t.Parallel()
+
+	const secrets = `Preview of field's value: 'password=hunter2' at https://user:pw@host/x`
+	item := func(id string, status int, errObj map[string]string) map[string]any {
+		body := map[string]any{"_index": "cards", "_id": id, "status": status}
+		if errObj != nil {
+			body["error"] = errObj
+		}
+		return map[string]any{"index": body}
+	}
+	run := func(t *testing.T, items []map[string]any) ([]map[string]any, *logbuf.Buffer, int32, bulkInsertResult) {
+		t.Helper()
+		resp, err := json.Marshal(map[string]any{"errors": true, "items": items})
+		if err != nil {
+			t.Fatal(err)
+		}
+		stub := esstub.New(t)
+		var calls atomic.Int32
+		stub.Handle("POST /_bulk", func(w http.ResponseWriter, _ *http.Request) {
+			calls.Add(1)
+			_, _ = w.Write(resp)
+		})
+		docs := make([]map[string]interface{}, len(items))
+		for i := range docs {
+			docs[i] = map[string]interface{}{"id": fmt.Sprint(i)}
+		}
+		logger, buf := logbuf.New()
+		ctx := runlog.WithLogger(t.Context(), logger)
+		res, err := bulkInsert(ctx, stub.MustClient(t), "cards", docs, len(docs), len(docs), 1, time.Millisecond, time.Millisecond, "id",
+			func(context.Context, time.Duration) error { t.Error("no retry expected"); return nil })
+		if err != nil {
+			t.Fatalf("bulkInsert: %v", err)
+		}
+		var lines []map[string]any
+		for _, l := range buf.Lines(t) {
+			if l["message"] == "Bulk item failed" {
+				lines = append(lines, l)
+			}
+		}
+		return lines, buf, calls.Load(), res
+	}
+
+	t.Run("secrets and long values", func(t *testing.T) {
+		t.Parallel()
+		long := strings.Repeat("é", 3000)
+		lines, buf, calls, _ := run(t, []map[string]any{
+			item("1", 400, map[string]string{"type": "mapper_parsing_exception", "reason": secrets}),
+			item("2", 400, map[string]string{"type": "password=hunter2 " + long, "reason": long + " " + secrets}),
+		})
+		if calls != 1 || len(lines) != 2 {
+			t.Fatalf("calls=%d lines=%d, want 1 request and 2 failure lines", calls, len(lines))
+		}
+		for _, bad := range []string{"hunter2", "user:pw"} {
+			if strings.Contains(buf.String(), bad) {
+				t.Fatalf("%q leaked in log: %s", bad, buf.String())
+			}
+		}
+		for _, l := range lines {
+			for _, k := range []string{"error_type", "error_reason"} {
+				v, ok := l[k].(string)
+				if !ok {
+					t.Fatalf("%s is %T, want string", k, l[k])
+				}
+				if len(v) > esresponse.MaxPublicMessageBytes || !utf8.ValidString(v) || strings.ContainsAny(v, "\r\n") {
+					t.Fatalf("%s is %d bytes / invalid shape", k, len(v))
+				}
+			}
+		}
+		if got := lines[0]["error_type"]; got != "mapper_parsing_exception" {
+			t.Fatalf("harmless type changed: %v", got)
+		}
+		reason := lines[1]["error_reason"].(string)
+		if !strings.HasSuffix(reason, " [truncated]") {
+			t.Fatalf("long reason not marked truncated: %q", reason[len(reason)-20:])
+		}
+	})
+
+	t.Run("status-only failure and more than ten", func(t *testing.T) {
+		t.Parallel()
+		items := []map[string]any{item("0", 500, nil)}
+		for i := 1; i < 12; i++ {
+			items = append(items, item(fmt.Sprint(i), 400, map[string]string{"type": "t", "reason": secrets}))
+		}
+		lines, buf, calls, res := run(t, items)
+		if calls != 1 || len(lines) != 10 {
+			t.Fatalf("calls=%d detail lines=%d, want 1 request and exactly 10", calls, len(lines))
+		}
+		if lines[0]["error_type"] != "" || lines[0]["error_reason"] != "" {
+			t.Fatalf("nil-Error line = %v, want empty string fields", lines[0])
+		}
+		omitted := 0
+		for _, l := range buf.Lines(t) {
+			if f, ok := l["failed_items"]; ok {
+				omitted++
+				if f != float64(12) || l["logged_failures"] != float64(10) {
+					t.Fatalf("omission line = %v", l)
+				}
+			}
+		}
+		if omitted != 1 {
+			t.Fatalf("got %d omission lines, want 1: %s", omitted, buf.String())
+		}
+		if res.Failed != 12 {
+			t.Fatalf("result = %+v, want 12 failed", res)
+		}
+		if strings.Contains(buf.String(), "hunter2") {
+			t.Fatal("secret leaked")
+		}
+	})
 }

@@ -1,9 +1,10 @@
 // Package esresponse holds pure predicates over Elasticsearch HTTP responses
 // and transport errors that more than one owner package needs (bulk, enrich,
 // managed, transform), plus bounded, redacted rejection diagnostics
-// (NewRejection). Callers own requests, closing, retries, sleeps and
-// deadlines; the package does not log. ReadBounded is its only read, of a
-// caller-supplied body with a fixed bound.
+// (NewRejection) and failure text decoded from successful responses
+// (ErrorDetail, ShardFailureDetail, SanitizeText, NewDetail). Callers own
+// requests, closing, retries, sleeps and deadlines; the package does not log.
+// ReadBounded is its only read, of a caller-supplied body with a fixed bound.
 package esresponse
 
 import (

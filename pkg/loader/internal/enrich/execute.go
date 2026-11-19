@@ -557,7 +557,7 @@ func executePolicy(ctx context.Context, es *elasticsearch.Client, policy string,
 			runlog.From(ctx).Error().
 				Str("policy", policy).
 				Str("task", taskID).
-				RawJSON("task_error", task.Error).
+				Str("es_error", esresponse.ErrorDetail(task.Error, esresponse.MaxPublicMessageBytes)).
 				Float64("time_taken", cfg.Now().Sub(startTime).Seconds()).
 				Msg("Enrich policy execution failed")
 			return false

@@ -76,6 +76,11 @@
 //     as index deletion, keep their existing errors without richer causes.
 //     The mapping-fetch and transform _stats errors cap only that inner text and keep
 //     their longer outer context. Free-text reasons may still hold sensitive prose
-//     redaction cannot recognize, and failure text parsed from successful responses is
-//     not covered.
+//     redaction cannot recognize,
+//   - failure text reported inside successful responses is also sanitized and bounded
+//     at four sites: the flush shard-failure cause (whole message at most 2,048 bytes),
+//     the enrich task error (es_error), bulk item error_type/error_reason and the
+//     transform failure reason (each at most 2,048 bytes; the transform error keeps its
+//     outer context). The same free-text limitation applies, and other fields decoded
+//     from successful responses are not covered.
 package loader

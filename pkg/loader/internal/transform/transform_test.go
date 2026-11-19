@@ -313,6 +313,15 @@ func TestWaitErrors(t *testing.T) {
 	// fails at once. A plain errors.New would now be retried (FEAT-WAITRETRY-01).
 	transportErr := &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}
 
+	failedWith := func(reason string) Getter {
+		reasonJSON, err := json.Marshal(reason)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := statsBody(`{"id":"t1","state":"failed","reason":` + string(reasonJSON) + `}`)
+		return func(context.Context, string) (int, []byte, error) { return 200, body, nil }
+	}
+
 	tests := []struct {
 		name       string
 		get        Getter
@@ -320,6 +329,23 @@ func TestWaitErrors(t *testing.T) {
 		wantNotErr []string
 		wantIs     error
 	}{
+		{
+			name:       "failed reason is redacted",
+			get:        failedWith(`bad "password":"hunter2" at https://user:pw@host/x`),
+			wantErr:    []string{`transform "t1" failed: bad `},
+			wantNotErr: []string{"hunter2", "user:pw"},
+		},
+		{
+			name:       "failed reason is cut with the marker",
+			get:        failedWith(strings.Repeat("é", 3000)),
+			wantErr:    []string{`transform "t1" failed: ééé`, " [truncated]"},
+			wantNotErr: []string{strings.Repeat("é", 1100)},
+		},
+		{
+			name:    "whitespace-only reason falls back",
+			get:     failedWith(" \t\r\n\x00 "),
+			wantErr: []string{`transform "t1" failed: no reason reported`},
+		},
 		{
 			name:    "failed quotes the reason",
 			get:     func(context.Context, string) (int, []byte, error) { return 200, failedBody, nil },

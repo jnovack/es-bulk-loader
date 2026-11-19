@@ -20,7 +20,10 @@ const (
 	// MaxPublicMessageBytes bounds the complete public err.Error() at direct
 	// Rejection failure sites, operation prefix included (runlog.Fail applies
 	// the Op-relative bound). For the two wrapped diagnostic paths (mapping
-	// fetch and transform _stats) it bounds only the inner Rejection text.
+	// fetch and transform _stats) it bounds only the inner Rejection text. For
+	// failure text from 2xx responses it is the per-field budget (enrich
+	// es_error, bulk error_type/error_reason, transform reason) or, for the
+	// flush cause, the complete direct-cause bound.
 	MaxPublicMessageBytes = 2048
 
 	maxDiagnosticPairs   = 4
@@ -85,10 +88,7 @@ func NewRejection(
 	resource, name string, status int, data []byte,
 	readErr error, maxMessageBytes int,
 ) *Rejection {
-	displayName := sanitize(name)
-	if len(displayName) > maxResourceNameBytes {
-		displayName = truncateUTF8(displayName, maxResourceNameBytes-len(truncationMarker)) + truncationMarker
-	}
+	displayName := capDisplayName(name)
 
 	detail := rejectionDetail(data, readErr)
 	var msg string
@@ -101,6 +101,83 @@ func NewRejection(
 	}
 
 	return &Rejection{msg: boundMessage(msg, maxMessageBytes), err: readErr, resourceName: displayName}
+}
+
+// capDisplayName returns name sanitized and capped at maxResourceNameBytes.
+// It is shared by NewRejection and NewDetail so both display names agree.
+func capDisplayName(name string) string {
+	displayName := sanitize(name)
+	if len(displayName) > maxResourceNameBytes {
+		displayName = truncateUTF8(displayName, maxResourceNameBytes-len(truncationMarker)) + truncationMarker
+	}
+	return displayName
+}
+
+// NewDetail returns a Rejection for a failure reported inside a successful
+// response: `<resource> "<name>" <text>`, or `<resource> <text>` when name is
+// empty. text must already be sanitized (ErrorDetail, ShardFailureDetail,
+// SanitizeText); resource is an internal literal; name is sanitized and
+// capped like NewRejection's. It carries no read error. The message is capped
+// at MaxPublicMessageBytes and runlog.Fail bounds it again to its Op.
+func NewDetail(resource, name, text string) *Rejection {
+	displayName := capDisplayName(name)
+	var msg string
+	if name == "" {
+		msg = resource + " " + text
+	} else {
+		msg = fmt.Sprintf("%s %q %s", resource, displayName, text)
+	}
+	return &Rejection{msg: boundMessage(msg, MaxPublicMessageBytes), resourceName: displayName}
+}
+
+// ErrorDetail returns the sanitized "<type>: <reason>[; ...]" text of an
+// Elasticsearch error value carried inside a successful response (for example
+// a task's "error"), bounded to max bytes. raw is decoded here; a value that
+// does not decode, or yields no type/reason pair (a number, an array, an empty
+// object), returns the fixed "ES error detail unavailable (...)" text, never
+// the raw value. The 64 KiB HTTP-rejection input limit does not apply: the
+// successful body was already fully decoded by the caller.
+func ErrorDetail(raw json.RawMessage, max int) string {
+	v, ok := decodeSingleJSON(raw)
+	if !ok {
+		return boundMessage(detailNotJSON, max)
+	}
+	return boundMessage(errorValueDetail(v), max)
+}
+
+// ShardFailureDetail returns the sanitized detail of one delete-by-query
+// "failures" entry, bounded to max bytes. The error is taken from the entry's
+// "cause" object (bulk-phase failures), else its "reason" object or string
+// (search-phase failures); any other shape returns the fixed "ES error detail
+// unavailable (...)" text. A cause object wins even when it has no
+// recognizable pair; every other key is ignored.
+func ShardFailureDetail(raw json.RawMessage, max int) string {
+	v, ok := decodeSingleJSON(raw)
+	if !ok {
+		return boundMessage(detailNotJSON, max)
+	}
+	entry, ok := v.(map[string]any)
+	if !ok {
+		return boundMessage(detailUnrecognized, max)
+	}
+	if cause, ok := entry["cause"].(map[string]any); ok {
+		return boundMessage(errorValueDetail(cause), max)
+	}
+	switch reason := entry["reason"].(type) {
+	case map[string]any:
+		return boundMessage(errorValueDetail(reason), max)
+	case string:
+		return boundMessage(errorValueDetail(reason), max)
+	}
+	return boundMessage(detailUnrecognized, max)
+}
+
+// SanitizeText returns s with recognizable secrets redacted, as one line of
+// valid UTF-8, bounded to max bytes. It is for Elasticsearch reason strings
+// already decoded from a successful response; it does not recognize every
+// secret in free-text prose.
+func SanitizeText(s string, max int) string {
+	return boundMessage(sanitize(s), max)
 }
 
 // boundMessage cuts msg to at most max bytes at a rune boundary, ending with
@@ -170,7 +247,14 @@ func rejectionDetail(data []byte, readErr error) string {
 		return detailNotJSON
 	}
 	top, _ := v.(map[string]any)
-	pairs, more := extractErrorPairs(top["error"])
+	return errorValueDetail(top["error"])
+}
+
+// errorValueDetail renders an already-decoded Elasticsearch error value as
+// "<type>: <reason>[; ...]", or detailUnrecognized when it has no pair. It is
+// the one pair-to-text path for HTTP-error bodies and 2xx error values.
+func errorValueDetail(v any) string {
+	pairs, more := extractErrorPairs(v)
 	if len(pairs) == 0 {
 		return detailUnrecognized
 	}
@@ -263,8 +347,10 @@ func (c *pairCollector) chain(owner map[string]any) bool {
 // error value: a plain string is a reason; an object contributes its
 // root_cause objects in array order, itself, then each root's caused_by chain
 // followed by its own. Every other key and every wrong shape is ignored.
-// It is iterative and scans the already bounded decoded value in place, so
-// work and retained storage are bounded by the body limit and the pair cap.
+// It is iterative and scans the decoded value in place; retained storage is
+// bounded by the pair cap. HTTP-error bodies are bounded by the body limit,
+// but a 2xx field is not body-bounded, so scanning and sanitizing its strings
+// is work proportional to its input.
 func extractErrorPairs(errValue any) (pairs []errorPair, more bool) {
 	switch e := errValue.(type) {
 	case string:

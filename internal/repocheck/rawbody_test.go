@@ -2,18 +2,24 @@ package repocheck
 
 // LOG-RAWBODY-01 guard: production code under pkg/ and cmd/ must not put a raw
 // Elasticsearch response body in a log field or an error. The scan is a bounded
-// syntactic check, not a data-flow privacy proof. It flags two shapes only:
+// syntactic check, not a data-flow privacy proof. It flags three shapes only:
 //
 //   - a call to a method named Str whose first argument is the string literal
 //     "body" (the former Str("body", string(body)) log field);
 //   - a fmt.Errorf argument that is, or directly wraps through one call such as
 //     strings.TrimSpace, a string(x) conversion where x is an identifier named
-//     like a response body (body, responseBody, data, ...).
+//     like a response body (body, responseBody, data, ...);
+//   - (LOG-2XXFAIL-01) any selector call named RawJSON, the zerolog method
+//     that logs an unsanitized JSON value (the former task_error field). It
+//     matches by name only: without type information the AST cannot prove the
+//     receiver is a zerolog event.
 //
-// It does not track variable aliases, arbitrary nested formatting, RawJSON or
-// parsed fields: application-level failure text inside 2xx bodies is out of
-// scope and tracked as LOG-2XXFAIL-01. The reasonable fix for a finding is to
-// build an esresponse.Rejection from the bounded read and log or return that.
+// It does not track variable aliases, arbitrary nested formatting or parsed
+// fields; failure text from 2xx bodies is kept safe by routing it through the
+// esresponse helpers (ErrorDetail, ShardFailureDetail, SanitizeText), not by
+// this scan. The reasonable fix for a finding is to build an
+// esresponse.Rejection from the bounded read, or one of those helpers' output,
+// and log or return that.
 
 import (
 	"fmt"
@@ -79,6 +85,8 @@ func rawBodyFindings(fset *token.FileSet, file *ast.File) []string {
 		switch {
 		case sel.Sel.Name == "Str" && len(call.Args) > 0 && isStringLit(call.Args[0], "body"):
 			out = append(out, fmt.Sprintf("%s: Str(\"body\", ...) logs a raw response body; log an esresponse.Rejection (es_error) instead", at(call.Pos())))
+		case sel.Sel.Name == "RawJSON":
+			out = append(out, fmt.Sprintf("%s: RawJSON logs an unsanitized JSON value; log esresponse.ErrorDetail or a Rejection text as a string (es_error) instead", at(call.Pos())))
 		case sel.Sel.Name == "Errorf" && isFmtIdent(sel.X, fmtNames):
 			for _, arg := range call.Args {
 				if name, ok := bodyConversion(arg); ok {
@@ -234,6 +242,8 @@ func TestRawBodyFindings(t *testing.T) {
 		{"Str body of string(body)", `ev.Str("body", string(body))`, []string{"x.go:9: Str(\"body\""}},
 		{"raw string literal key", "ev.Str(`body`, string(body))", []string{"Str(\"body\""}},
 		{"parenthesized key", `ev.Str(("body"), "x")`, []string{"Str(\"body\""}},
+		{"RawJSON is flagged", `ev.RawJSON("task_error", body)`, []string{"x.go:9: RawJSON logs an unsanitized JSON value"}},
+		{"plain-identifier canonicalizeRawJSON passes", `_ = canonicalizeRawJSON(body)`, nil},
 		{"es_error passes", `ev.Str("es_error", "x")`, nil},
 		{"other key passes", `ev.Str("policy", string(name))`, nil},
 		{"Errorf of string(body)", `_ = fmt.Errorf("%s", string(body))`, []string{"x.go:9: fmt.Errorf formats string(body)"}},
@@ -248,7 +258,7 @@ func TestRawBodyFindings(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			fset, file := parseForTest(t, "x.go", head+tt.body+"\n}\ntype ev interface{ Str(k, v string) ev }\n")
+			fset, file := parseForTest(t, "x.go", head+tt.body+"\n}\ntype ev interface {\n\tStr(k, v string) ev\n\tRawJSON(k string, b []byte) ev\n}\nfunc canonicalizeRawJSON(b []byte) []byte { return b }\n")
 			got := rawBodyFindings(fset, file)
 			if len(got) != len(tt.want) {
 				t.Fatalf("findings = %q, want %d matching %q", got, len(tt.want), tt.want)

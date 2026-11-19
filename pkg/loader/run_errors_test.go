@@ -27,10 +27,13 @@ import (
 
 	"github.com/jnovack/es-bulk-loader/internal/testutil/esstub"
 	"github.com/jnovack/es-bulk-loader/internal/testutil/fixture"
+	"github.com/jnovack/es-bulk-loader/internal/testutil/logbuf"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/config"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/esresponse"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/failure"
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/indexops"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/managed"
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/runlog"
 )
 
 // TestRunErrorContract pins the public error contract at the Run boundary for
@@ -2603,6 +2606,82 @@ func TestRunWrappedRejectionTailsKeepOpKindAndCapInnerText(t *testing.T) {
 			}
 			if strings.Contains(err.Error(), longBody) {
 				t.Fatal("the raw body must not appear in the message")
+			}
+		})
+	}
+}
+
+// TestFlushShardFailurePublicError drives a real indexops.Flush shard failure
+// through runFailure and pins the public contract: Op and Kind unchanged, the
+// cause is the sanitized bounded Rejection (it replaced the raw first_failure
+// log field), the whole message fits 2,048 bytes and the log's error field is
+// that same cause. Secrets are synthetic.
+func TestFlushShardFailurePublicError(t *testing.T) {
+	t.Parallel()
+
+	const op = "Index flush completed with shard-level failures"
+	const secret = `"password":"hunter2" at https://user:pw@host/x`
+	tests := []struct {
+		name    string
+		reason  string
+		want    string // exact message; empty for the long row
+		wantCut bool
+	}{
+		{"short harmless detail", "disk is full", op + `: index "cards" flush had 1 shard failures; first: illegal_state_exception: disk is full`, false},
+		{"long multibyte detail with secrets", strings.Repeat("é", 3000) + " " + secret, "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			body, err := json.Marshal(map[string]any{"failures": []any{
+				map[string]any{"reason": map[string]string{"type": "illegal_state_exception", "reason": tt.reason}},
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			stub := esstub.New(t)
+			stub.Handle("POST /cards/_delete_by_query", esstub.JSON(http.StatusOK, string(body)))
+			logger, buf := logbuf.New()
+			ctx := runlog.WithLogger(t.Context(), logger)
+
+			internal := indexops.Flush(ctx, stub.MustClient(t), "cards")
+			got := runFailure(internal)
+
+			var runErr *RunError
+			if !errors.As(got, &runErr) || runErr.Op != op || !errors.Is(got, ErrIndexOperation) {
+				t.Fatalf("got %#v, want *RunError with Op %q and ErrIndexOperation", got, op)
+			}
+			var opErr *failure.Error
+			if !errors.As(internal, &opErr) || runErr.Err != opErr.Err {
+				t.Fatalf("public cause %v is not the internal operation cause", runErr.Err)
+			}
+			var rej *esresponse.Rejection
+			if !errors.As(got, &rej) {
+				t.Fatalf("cause is %T, want *esresponse.Rejection", runErr.Err)
+			}
+			msg := got.Error()
+			if tt.want != "" && msg != tt.want {
+				t.Fatalf("message = %q, want %q", msg, tt.want)
+			}
+			if len(msg) > esresponse.MaxPublicMessageBytes || !utf8.ValidString(msg) {
+				t.Fatalf("message is %d bytes, want <= %d valid UTF-8", len(msg), esresponse.MaxPublicMessageBytes)
+			}
+			if tt.wantCut && !strings.HasSuffix(msg, " [truncated]") {
+				t.Fatalf("long message not marked truncated")
+			}
+			var failLines []map[string]any
+			for _, l := range buf.Lines(t) {
+				if l["message"] == op {
+					failLines = append(failLines, l)
+				}
+			}
+			if len(failLines) != 1 || failLines[0]["error"] != runErr.Err.Error() || failLines[0]["shard_failures"] != float64(1) {
+				t.Fatalf("failure lines = %v, want one with error == %q and shard_failures 1", failLines, runErr.Err.Error())
+			}
+			for _, bad := range []string{"hunter2", "user:pw", "first_failure"} {
+				if strings.Contains(msg, bad) || strings.Contains(buf.String(), bad) {
+					t.Fatalf("%q leaked: message %q log %s", bad, msg, buf.String())
+				}
 			}
 		})
 	}

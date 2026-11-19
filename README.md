@@ -127,9 +127,29 @@ token; those token-based rules are unchanged. Execution counts the policy as
 failed and logs the rejection. Status-only retries are
 unchanged. Redaction recognizes structured credentials only: free-text reasons
 can still contain sensitive prose that generic redaction cannot recognize.
-Failure text parsed out of successful (2xx) responses, such as the first flush
-shard failure, enrich task errors, bulk item reasons and transform failure
-reasons, is not covered by this contract.
+
+Failure text that Elasticsearch reports inside a successful (2xx) response is
+sanitized and bounded the same way, at four sites only:
+
+- A flush that finishes with shard failures returns the same Op and Kind as
+  before; its cause now reads
+  `index "<index>" flush had <n> shard failures; first: <type>: <reason>`, at
+  most 2,048 bytes for the whole message, Op prefix included. The
+  `first_failure` log field is gone: the failure line's `error` field carries
+  that cause, next to `shard_failures`.
+- An enrich task that ends with an error logs it as the string `es_error`
+  (sanitized, at most 2,048 bytes). The former `task_error` JSON object field
+  is gone.
+- A failed bulk item logs `error_type` and `error_reason` as before, now
+  sanitized and each at most 2,048 bytes (still at most ten items per batch).
+- A failed transform's `transform "<id>" failed: <reason>` error keeps its
+  prefix; only the reason is sanitized and capped at 2,048 bytes, so the
+  complete message with its outer context can be longer.
+
+These limits apply to each field or reason, not to a whole log line. Successful
+response bodies are still read and decoded in full, and the same free-text
+limitation applies. Other fields decoded from successful responses are not
+covered.
 
 Full lifecycle run:
 

@@ -11,12 +11,15 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/elastic/go-elasticsearch/v9"
 	"github.com/rs/zerolog"
 
 	"github.com/jnovack/es-bulk-loader/internal/testutil/esstub"
+	"github.com/jnovack/es-bulk-loader/internal/testutil/logbuf"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/config"
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/esresponse"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/failure"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/runlog"
 )
@@ -516,12 +519,31 @@ func TestVerifyMappingsExpectedTargets(t *testing.T) {
 }
 
 // TestFlushValidatesDeleteByQueryResponse verifies that a flush fails
-// on shard failures or malformed responses while tolerating version conflicts.
+// on shard failures or malformed responses while tolerating version conflicts,
+// and that the shard-failure cause is sanitized and bounded (it replaced the
+// raw first_failure log field).
 func TestFlushValidatesDeleteByQueryResponse(t *testing.T) {
+	const shardOp = "Index flush completed with shard-level failures"
+	secretReason := `"password":"hunter2" at https://user:pw@host/x`
+	secretBody, err := json.Marshal(map[string]any{"failures": []any{
+		map[string]any{"reason": map[string]string{"type": "t", "reason": secretReason}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	longBody, err := json.Marshal(map[string]any{"failures": []any{
+		map[string]any{"reason": map[string]string{"type": "t", "reason": strings.Repeat("é", 3000) + " " + secretReason}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	tests := []struct {
-		name   string
-		body   string
-		wantOp string // empty: Flush must succeed
+		name            string
+		body            string
+		wantOp          string // empty: Flush must succeed
+		wantMsgContains []string
+		wantNotContain  []string
 	}{
 		{
 			name: "empty failures succeeds",
@@ -532,9 +554,54 @@ func TestFlushValidatesDeleteByQueryResponse(t *testing.T) {
 			body: `{"version_conflicts":2,"failures":[]}`,
 		},
 		{
-			name:   "shard failure fails",
-			body:   `{"failures":[{"shard":0,"reason":{"type":"illegal_state_exception","reason":"failed"}}]}`,
-			wantOp: "Index flush completed with shard-level failures",
+			name:            "shard failure fails",
+			body:            `{"failures":[{"shard":0,"reason":{"type":"illegal_state_exception","reason":"failed"}}]}`,
+			wantOp:          shardOp,
+			wantMsgContains: []string{`index "cards" flush had 1 shard failures; first: illegal_state_exception: failed`},
+		},
+		{
+			name:            "cause object entry",
+			body:            `{"failures":[{"index":"cards","id":"1","cause":{"type":"version_conflict_engine_exception","reason":"conflict"},"status":409}]}`,
+			wantOp:          shardOp,
+			wantMsgContains: []string{"first: version_conflict_engine_exception: conflict"},
+		},
+		{
+			name:            "reason string entry",
+			body:            `{"failures":[{"reason":"plain failure"}]}`,
+			wantOp:          shardOp,
+			wantMsgContains: []string{"first: plain failure"},
+		},
+		{
+			name:            "entry with neither cause nor reason",
+			body:            `{"failures":[{"shard":0}]}`,
+			wantOp:          shardOp,
+			wantMsgContains: []string{"ES error detail unavailable"},
+		},
+		{
+			name:            "non-object entry",
+			body:            `{"failures":["x"]}`,
+			wantOp:          shardOp,
+			wantMsgContains: []string{"ES error detail unavailable"},
+		},
+		{
+			name:            "secret-bearing reason is redacted",
+			body:            string(secretBody),
+			wantOp:          shardOp,
+			wantMsgContains: []string{"first: t: "},
+			wantNotContain:  []string{"hunter2", "user:pw"},
+		},
+		{
+			name:            "two failures",
+			body:            `{"failures":[{"reason":"a"},{"reason":"b"}]}`,
+			wantOp:          shardOp,
+			wantMsgContains: []string{"had 2 shard failures", "first: a"},
+		},
+		{
+			name:            "long multibyte reason is cut",
+			body:            string(longBody),
+			wantOp:          shardOp,
+			wantMsgContains: []string{"[truncated]"},
+			wantNotContain:  []string{"hunter2", "user:pw"},
 		},
 		{
 			name:   "malformed success body fails",
@@ -558,11 +625,18 @@ func TestFlushValidatesDeleteByQueryResponse(t *testing.T) {
 				_, _ = w.Write([]byte(tt.body))
 			})
 			es := stub.MustClient(t)
+			logger, buf := logbuf.New()
+			ctx := runlog.WithLogger(t.Context(), logger)
 
-			err := Flush(t.Context(), es, "cards")
+			err := Flush(ctx, es, "cards")
 			if tt.wantOp == "" {
 				if err != nil {
 					t.Fatalf("Flush returned error: %v", err)
+				}
+				for _, line := range buf.Lines(t) {
+					if line["level"] == "fatal" {
+						t.Fatalf("success logged a failure line: %v", line)
+					}
 				}
 				return
 			}
@@ -572,6 +646,42 @@ func TestFlushValidatesDeleteByQueryResponse(t *testing.T) {
 			var opErr *failure.Error
 			if !errors.As(err, &opErr) || opErr.Op != tt.wantOp {
 				t.Fatalf("Flush error = %#v, want operation error %q", err, tt.wantOp)
+			}
+			if tt.wantOp != shardOp {
+				return
+			}
+
+			var rej *esresponse.Rejection
+			if !errors.As(err, &rej) {
+				t.Fatalf("cause is %T, want *esresponse.Rejection", opErr.Err)
+			}
+			if len(err.Error()) > esresponse.MaxPublicMessageBytes || !utf8.ValidString(err.Error()) {
+				t.Fatalf("error is %d bytes / valid=%t, want <= %d and valid UTF-8", len(err.Error()), utf8.ValidString(err.Error()), esresponse.MaxPublicMessageBytes)
+			}
+			for _, want := range tt.wantMsgContains {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %q missing %q", err.Error(), want)
+				}
+			}
+			for _, bad := range append(tt.wantNotContain, "first_failure") {
+				if strings.Contains(err.Error(), bad) || strings.Contains(buf.String(), bad) {
+					t.Fatalf("%q leaked: error %q log %s", bad, err.Error(), buf.String())
+				}
+			}
+			var failureLines []map[string]any
+			for _, line := range buf.Lines(t) {
+				if line["message"] == shardOp {
+					failureLines = append(failureLines, line)
+				}
+			}
+			if len(failureLines) != 1 {
+				t.Fatalf("got %d failure lines, want exactly one: %s", len(failureLines), buf.String())
+			}
+			if got := failureLines[0]["error"]; got != rej.Error() {
+				t.Fatalf("logged error %q != returned cause %q", got, rej.Error())
+			}
+			if want := shardOp + ": " + rej.Error(); err.Error() != want {
+				t.Fatalf("error = %q, want %q", err.Error(), want)
 			}
 		})
 	}

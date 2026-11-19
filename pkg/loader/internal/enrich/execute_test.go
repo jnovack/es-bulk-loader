@@ -17,11 +17,14 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/elastic/go-elasticsearch/v9"
 	"github.com/rs/zerolog"
 
 	"github.com/jnovack/es-bulk-loader/internal/testutil/esstub"
+	"github.com/jnovack/es-bulk-loader/internal/testutil/logbuf"
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/esresponse"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/failure"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/progress"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/runlog"
@@ -1134,5 +1137,110 @@ func TestExecutePolicyExplicitOutcomesSkipAliasCheck(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestExecutePolicyTaskErrorIsRedacted pins that a task error reported inside
+// a 2xx task document is logged as a sanitized, bounded string es_error (it
+// replaced the raw task_error JSON object), and that the policy still fails
+// after a single poll. All secrets are synthetic.
+func TestExecutePolicyTaskErrorIsRedacted(t *testing.T) {
+	t.Parallel()
+
+	const secret = `"password":"hunter2" at https://user:pw@host/x`
+	long := strings.Repeat("é", 3000)
+	errJSON := func(v any) string {
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+
+	tests := []struct {
+		name      string
+		errField  string
+		completed bool
+		want      string // exact es_error; empty means check shape only
+		wantCut   bool
+	}{
+		{"caused_by chain", errJSON(map[string]any{"type": "t", "reason": "r", "caused_by": map[string]string{"type": "u", "reason": "s"}}), true, "t: r; u: s", false},
+		{"string error", `"plain failure"`, true, "plain failure", false},
+		{"number error", `42`, true, "ES error detail unavailable (no recognizable error field)", false},
+		{"array error", `["x"]`, true, "ES error detail unavailable (no recognizable error field)", false},
+		{"secret reason", errJSON(map[string]any{"type": "t", "reason": secret}), true, "", false},
+		{"error with completed false", errJSON(map[string]any{"type": "t", "reason": "r"}), false, "t: r", false},
+		{"long multibyte reason and secret type with ignored metadata", errJSON(map[string]any{"type": "password=hunter2", "reason": long, "header": map[string]string{"password": "hunter2"}, "stack_trace": secret}), true, "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var polls atomic.Int32
+			stub := esstub.New(t)
+			stub.Handle("GET /_alias/.enrich-policy-a", esstub.JSON(http.StatusNotFound, aliasMissingBody))
+			execute := esstub.JSON(http.StatusOK, `{"task":"node:1"}`)
+			stub.Handle("PUT /_enrich/policy/policy-a/_execute", execute)
+			stub.Handle("POST /_enrich/policy/policy-a/_execute", execute)
+			stub.Handle("GET /_tasks/node:1", func(w http.ResponseWriter, _ *http.Request) {
+				polls.Add(1)
+				_, _ = fmt.Fprintf(w, `{"completed":%t,"error":%s}`, tt.completed, tt.errField)
+			})
+			logger, buf := logbuf.New()
+			ctx := runlog.WithLogger(t.Context(), logger)
+
+			if executePolicy(ctx, stub.MustClient(t), "policy-a", fixedEnrichSeams()) {
+				t.Fatal("executePolicy = true, want false")
+			}
+
+			if polls.Load() != 1 {
+				t.Fatalf("polls = %d, want 1", polls.Load())
+			}
+			lines := enrichLogsWith(buf.Lines(t), "Enrich policy execution failed")
+			if len(lines) != 1 {
+				t.Fatalf("execution-failed lines = %d, want 1\n%s", len(lines), buf.String())
+			}
+			if _, has := lines[0]["task_error"]; has {
+				t.Fatalf("line still carries task_error: %v", lines[0])
+			}
+			got, ok := lines[0]["es_error"].(string)
+			if !ok {
+				t.Fatalf("es_error is %T, want string: %v", lines[0]["es_error"], lines[0])
+			}
+			if tt.want != "" && got != tt.want {
+				t.Fatalf("es_error = %q, want %q", got, tt.want)
+			}
+			if len(got) > esresponse.MaxPublicMessageBytes || !utf8.ValidString(got) {
+				t.Fatalf("es_error is %d bytes, want <= %d valid UTF-8", len(got), esresponse.MaxPublicMessageBytes)
+			}
+			if tt.wantCut && !strings.HasSuffix(got, " [truncated]") {
+				t.Fatalf("es_error not marked truncated")
+			}
+			for _, bad := range []string{"hunter2", "user:pw"} {
+				if strings.Contains(buf.String(), bad) {
+					t.Fatalf("%q leaked in log: %s", bad, buf.String())
+				}
+			}
+		})
+	}
+
+	// A null or absent task error is not a failure: no execution-failed line.
+	for _, field := range []string{`"error":null,`, ``} {
+		t.Run("control "+field, func(t *testing.T) {
+			t.Parallel()
+			stub := esstub.New(t)
+			stub.Handle("GET /_alias/.enrich-policy-a", esstub.JSON(http.StatusNotFound, aliasMissingBody))
+			execute := esstub.JSON(http.StatusOK, `{"task":"node:1"}`)
+			stub.Handle("PUT /_enrich/policy/policy-a/_execute", execute)
+			stub.Handle("POST /_enrich/policy/policy-a/_execute", execute)
+			stub.Handle("GET /_tasks/node:1", esstub.JSON(http.StatusOK, `{`+field+`"completed":true,"response":{"status":"COMPLETED"}}`))
+			logger, buf := logbuf.New()
+			ctx := runlog.WithLogger(t.Context(), logger)
+
+			executePolicy(ctx, stub.MustClient(t), "policy-a", fixedEnrichSeams())
+
+			if n := len(enrichLogsWith(buf.Lines(t), "Enrich policy execution failed")); n != 0 {
+				t.Fatalf("got %d execution-failed lines for a null/absent error: %s", n, buf.String())
+			}
+		})
 	}
 }

@@ -8,13 +8,18 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jnovack/es-bulk-loader/internal/testutil/esstub"
+	"github.com/jnovack/es-bulk-loader/internal/testutil/logbuf"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/config"
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/esresponse"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/failure"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/progress"
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/runlog"
 )
 
 // TestResolveForSourceFiltersBySourceIndex guards that only transform definitions for the run's source index are kept.
@@ -230,5 +235,80 @@ func TestReportStartedEmitsOneFinalPerTransform(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("snapshots = %+v, want %+v", got, want)
+	}
+}
+
+// TestWaitForCheckpointFailureReasonIsRedacted pins that a failed transform's
+// reason, decoded from a 2xx _stats body, reaches both the failure log and the
+// returned error sanitized, and that the cap applies to the reason alone.
+func TestWaitForCheckpointFailureReasonIsRedacted(t *testing.T) {
+	t.Parallel()
+
+	const secret = `"password":"hunter2" at https://user:pw@host/x`
+	tests := []struct {
+		name    string
+		reason  string
+		wantCut bool
+	}{
+		{"short secret-bearing reason", "bad " + secret, false},
+		{"long multibyte reason", strings.Repeat("é", 3000) + " " + secret, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			reasonJSON, err := json.Marshal(tt.reason)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var polls atomic.Int32
+			stub := esstub.New(t)
+			stub.Handle("GET /_transform/t1/_stats", func(w http.ResponseWriter, _ *http.Request) {
+				polls.Add(1)
+				esstub.JSON(http.StatusOK, `{"count":1,"transforms":[{"id":"t1","state":"failed","reason":`+string(reasonJSON)+`}]}`)(w, nil)
+			})
+			logger, buf := logbuf.New()
+			ctx := runlog.WithLogger(t.Context(), logger)
+			seams := progress.Seams{
+				Now:   func() time.Time { return time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC) },
+				Sleep: func(c context.Context, _ time.Duration) error { return c.Err() },
+			}
+
+			err = WaitForCheckpoint(ctx, stub.MustClient(t), config.Definitions{"t1": json.RawMessage("{}")}, []string{"t1"}, time.Hour, seams)
+
+			var opErr *failure.Error
+			if !errors.As(err, &opErr) || opErr.Op != "Transform wait failed" {
+				t.Fatalf("err = %v, want operation error %q", err, "Transform wait failed")
+			}
+			if polls.Load() != 1 {
+				t.Fatalf("polls = %d, want 1 (a failed state is terminal)", polls.Load())
+			}
+			for _, bad := range []string{"hunter2", "user:pw"} {
+				if strings.Contains(err.Error(), bad) || strings.Contains(buf.String(), bad) {
+					t.Fatalf("%q leaked: error %q log %s", bad, err, buf.String())
+				}
+			}
+			if !strings.Contains(err.Error(), `transform "t1" failed: `) {
+				t.Fatalf("error %q lost its prefix", err)
+			}
+			var failLines []map[string]any
+			for _, l := range buf.Lines(t) {
+				if l["message"] == "Transform wait failed" {
+					failLines = append(failLines, l)
+				}
+				if l["message"] == "Transform wait completed" {
+					t.Fatalf("completion line after a failure: %v", l)
+				}
+			}
+			if len(failLines) != 1 || failLines[0]["error"] != opErr.Err.Error() {
+				t.Fatalf("failure lines = %v, want one with error == %q", failLines, opErr.Err.Error())
+			}
+			reason := strings.TrimPrefix(opErr.Err.Error(), `transform "t1" failed: `)
+			if len(reason) > esresponse.MaxPublicMessageBytes || !utf8.ValidString(reason) {
+				t.Fatalf("reason is %d bytes, want <= %d valid UTF-8", len(reason), esresponse.MaxPublicMessageBytes)
+			}
+			if tt.wantCut != strings.HasSuffix(reason, " [truncated]") {
+				t.Fatalf("truncation marker = %t, want %t", !tt.wantCut, tt.wantCut)
+			}
+		})
 	}
 }
