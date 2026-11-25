@@ -49,6 +49,7 @@ type progressStubConfig struct {
 	children      []stubReply // GET _tasks?parent_task_id=..., in order, last repeats
 	bulkStatus    int         // 0 means 200
 	bulkFailItems int         // first N items of every bulk request fail
+	bulkReplies   []stubReply // n-th _bulk answer, last repeats; overrides bulkFailItems
 	statsStatus   int         // 0 means 200
 	// executeStatus is the HTTP status of the enrich execute (kickoff) answer,
 	// carrying executeBody; 0 means 200.
@@ -106,6 +107,21 @@ func withBulk(status, failItems int) progressStubOption {
 	return func(c *progressStubConfig) { c.bulkStatus, c.bulkFailItems = status, failItems }
 }
 
+// withStatsStatus makes every transform _stats answer carry status.
+func withStatsStatus(status int) progressStubOption {
+	return func(c *progressStubConfig) { c.statsStatus = status }
+}
+
+// withBulkReplies scripts the answer (status and body) of each _bulk request,
+// in order, last repeats, for tests that need distinct item IDs and error
+// fields across batches, or a hard failure after rejected batches.
+func withBulkReplies(replies ...stubReply) progressStubOption {
+	return func(c *progressStubConfig) { c.bulkReplies = replies }
+}
+
+// bulkOKReply is a 200 _bulk answer carrying body.
+func bulkOKReply(body string) stubReply { return stubReply{http.StatusOK, body} }
+
 // withEnrichAliasReplies sets the answers to policy's backing-alias reads (the
 // snapshot before kickoff, then the check after a task 404), in order, last
 // repeats. It overrides the enrichAliasMoved default for that policy only.
@@ -160,6 +176,7 @@ func newProgressStub(t *testing.T, statsSequence []string, opts ...progressStubO
 		mu                              sync.Mutex
 		present                         bool
 		taskCalls, childCalls, statCall int
+		bulkCall                        int
 	)
 	next := func(seq []stubReply, calls *int) stubReply {
 		mu.Lock()
@@ -193,6 +210,11 @@ func newProgressStub(t *testing.T, statsSequence []string, opts ...progressStubO
 	stub.Handle("POST /_bulk", rec.recorded("bulk", func(w http.ResponseWriter, r *http.Request) {
 		if cfg.bulkStatus != 0 && cfg.bulkStatus != http.StatusOK {
 			write(w, cfg.bulkStatus, `{"error":{"type":"stub_bulk_failure"}}`)
+			return
+		}
+		if len(cfg.bulkReplies) > 0 {
+			reply := next(cfg.bulkReplies, &bulkCall)
+			write(w, reply.status, reply.body)
 			return
 		}
 		payload, err := io.ReadAll(r.Body)

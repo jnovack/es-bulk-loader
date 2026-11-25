@@ -31,7 +31,7 @@ func TestBulkRequestFailureCarriesNamelessRejection(t *testing.T) {
 	logger, buf := logbuf.New()
 	ctx := runlog.WithLogger(t.Context(), logger)
 
-	_, err := bulkInsert(ctx, stub.MustClient(t), "cards", []map[string]interface{}{{"id": "1"}}, 0, 1, 3, time.Millisecond, time.Millisecond, "", noSleep)
+	_, err := bulkInsert(ctx, stub.MustClient(t), "cards", []map[string]interface{}{{"id": "1"}}, 0, 1, 3, time.Millisecond, time.Millisecond, "", noSleep, 0)
 
 	want := "Bulk API request failed: bulk request rejected with HTTP 400: x: rejected password=[REDACTED] now"
 	rejectiontest.RequireRejection(t, err, "Bulk API request failed", want)
@@ -61,7 +61,7 @@ func TestBulkRetryWarnLogsESError(t *testing.T) {
 			logger, buf := logbuf.New()
 			ctx := runlog.WithLogger(t.Context(), logger)
 
-			_, err := bulkInsert(ctx, stub.MustClient(t), "cards", []map[string]interface{}{{"id": "1"}}, 0, 1, 3, time.Millisecond, time.Millisecond, "", noSleep)
+			_, err := bulkInsert(ctx, stub.MustClient(t), "cards", []map[string]interface{}{{"id": "1"}}, 0, 1, 3, time.Millisecond, time.Millisecond, "", noSleep, 0)
 
 			if err == nil {
 				t.Fatal("expected the budget to be exhausted")
@@ -102,7 +102,7 @@ func TestBulkErrorReadIsBoundedAndClosedOnce(t *testing.T) {
 	nop := zerolog.Nop()
 	ctx := runlog.WithLogger(t.Context(), &nop)
 
-	_, err := bulkInsert(ctx, tr.Client(t), "cards", []map[string]interface{}{{"id": "1"}}, 0, 1, 3, time.Millisecond, time.Millisecond, "", noSleep)
+	_, err := bulkInsert(ctx, tr.Client(t), "cards", []map[string]interface{}{{"id": "1"}}, 0, 1, 3, time.Millisecond, time.Millisecond, "", noSleep, 0)
 
 	if err == nil {
 		t.Fatal("expected a failure")

@@ -64,7 +64,9 @@
 //
 // Failure modes:
 //   - option validation and template preflight fail before any cluster write with ErrInvalidOptions,
-//   - a bulk item rejection is counted in Result.DocumentsFailed and does not fail Run,
+//   - a bulk item rejection is counted in Result.DocumentsFailed and does not fail Run;
+//     the first MaxBulkFailureSample rejected items are in Result.BulkFailures
+//     (see BulkItemFailure) and the rest in Result.BulkFailuresOmitted,
 //   - a failed enrich policy is counted in Result.EnrichFailed and the run continues;
 //     its status and cause are in Result.EnrichOutcomes (see EnrichOutcome),
 //   - every other run-ending error is returned as a *RunError whose Kind is chosen

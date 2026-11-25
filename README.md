@@ -215,6 +215,8 @@ in `Result.EnrichOutcomes` (see [Enrich outcomes](#enrich-outcomes)), and
 `EnrichOutcome.Err` and the enrich Final `ProgressEvent.Err` also reach an
 `*ElasticsearchError` with `errors.As` when that cause is an HTTP rejection or
 a task `error`.
+Bulk item rejections are sampled in `Result.BulkFailures` (see
+[Bulk failure sample](#bulk-failure-sample)).
 
 ### Enrich outcomes
 
@@ -250,6 +252,42 @@ cluster has no enrich policies, or listing policies failed (then `Run` returns
 the error). An unsupported execute endpoint produces an `unsupported` policy
 outcome. The enrich Final `ProgressEvent.Err` text is
 `enrich policy "<name>" failed: <cause>`; earlier versions ended at `failed`.
+
+### Bulk failure sample
+
+`Result.DocumentsFailed` counts every bulk item Elasticsearch rejected. A
+bounded sample of them is in `Result.BulkFailures []BulkItemFailure`: the
+first rejected items in response order across batches, at most
+`MaxBulkFailureSample` (100). `Result.BulkFailuresOmitted` counts the rest, so
+`len(BulkFailures) + BulkFailuresOmitted == DocumentsFailed`. The loader does
+not retain every rejected document. An item is rejected when its response
+status is 300 or higher or it carries an error.
+
+```go
+for _, f := range result.BulkFailures {
+    log.Printf("%s %s: HTTP %d %s: %s", f.Index, f.ID, f.Status, f.Type, f.Reason)
+}
+if result.BulkFailuresOmitted > 0 {
+    log.Printf("%d more rejected items not sampled", result.BulkFailuresOmitted)
+}
+```
+
+| Field | Shape |
+| --- | --- |
+| `Index string` | The concrete index the response named for the item. |
+| `ID string` | The document `_id` the response named. |
+| `Action string` | The bulk action key of the response item, for example `index`. |
+| `Status int` | The item's status from the bulk response. |
+| `Type string`, `Reason string` | The Elasticsearch error type and reason; empty when the failed item had a null `error`. |
+
+Every string field is sanitized single-line UTF-8 with recognizable
+credentials redacted, at most 2,048 bytes (a longer value ends with the
+`[truncated]` marker). The sample is filled when the bulk stage completes and
+is kept if a later stage fails. It is nil, with `BulkFailuresOmitted` zero,
+when no data action ran, when nothing was rejected, or when the bulk stage
+itself failed (`Run` then returns the error). Build and compare
+`BulkItemFailure` with keyed fields. The failed-item log lines are unchanged:
+they still log the raw `_index` and `_id`.
 
 Full lifecycle run:
 

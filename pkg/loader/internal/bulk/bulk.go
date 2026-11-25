@@ -55,10 +55,60 @@ type bulkItemError struct {
 	Reason string `json:"reason"`
 }
 
-// bulkInsertResult counts one batch's succeeded and failed items.
+// ItemFailure is one failed bulk item: the sanitized, bounded response fields
+// of a rejected document. Index, ID, Action, Type and Reason each pass
+// esresponse.SanitizeText at MaxPublicMessageBytes; Type and Reason are empty
+// for a failed item whose response carried a null error. Package loader maps
+// it to its public BulkItemFailure.
+type ItemFailure struct {
+	Index  string
+	ID     string
+	Action string
+	Status int
+	Type   string
+	Reason string
+}
+
+// bulkInsertResult counts one batch's succeeded and failed items and carries
+// up to the caller's budget of the failed items, in response order.
 type bulkInsertResult struct {
 	Succeeded int
 	Failed    int
+	Sample    []ItemFailure
+}
+
+// accumulator is the running total shared by loadJSONArray and loadNDJSON so
+// the two loaders cannot diverge. limit is the whole-load sample bound.
+type accumulator struct {
+	succeeded int
+	failed    int
+	processed int
+	limit     int
+	sample    []ItemFailure
+}
+
+// budget is how many more failed items the sample may take; never negative.
+func (a *accumulator) budget() int {
+	return max(0, a.limit-len(a.sample))
+}
+
+// add folds one successful batch into the totals. Each batch is added once.
+// bulkInsert already honored budget(), so Sample fits the remaining room.
+func (a *accumulator) add(r bulkInsertResult) {
+	a.succeeded += r.Succeeded
+	a.failed += r.Failed
+	a.sample = append(a.sample, r.Sample...)
+}
+
+// itemErrorText returns a failed item's error type and reason sanitized the
+// way the log line and the sample both need them; a null error yields empty
+// strings. It is the one place that text is produced.
+func itemErrorText(e *bulkItemError) (errorType, errorReason string) {
+	if e == nil {
+		return "", ""
+	}
+	return esresponse.SanitizeText(e.Type, esresponse.MaxPublicMessageBytes),
+		esresponse.SanitizeText(e.Reason, esresponse.MaxPublicMessageBytes)
 }
 
 // peekFirstByte opens path and returns the first non-whitespace byte without
@@ -121,7 +171,7 @@ func loadJSONArray(
 	retryAttempts int,
 	retryBackoffBase, retryBackoffMax time.Duration,
 	idField string,
-	succeededTotal, failedTotal, processed *int,
+	acc *accumulator,
 	seams progress.Seams,
 ) error {
 	start := seams.Now()
@@ -170,21 +220,21 @@ func loadJSONArray(
 				es,
 				index,
 				batch,
-				*processed+len(batch),
+				acc.processed+len(batch),
 				total,
 				retryAttempts,
 				retryBackoffBase,
 				retryBackoffMax,
 				idField,
 				seams.Sleep,
+				acc.budget(),
 			)
 			if err != nil {
 				return err
 			}
-			*processed += len(batch)
-			reportBatch(seams, index, *processed, total, start)
-			*succeededTotal += batchResult.Succeeded
-			*failedTotal += batchResult.Failed
+			acc.processed += len(batch)
+			reportBatch(seams, index, acc.processed, total, start)
+			acc.add(batchResult)
 			batch = batch[:0]
 		}
 	}
@@ -194,21 +244,21 @@ func loadJSONArray(
 			es,
 			index,
 			batch,
-			*processed+len(batch),
+			acc.processed+len(batch),
 			total,
 			retryAttempts,
 			retryBackoffBase,
 			retryBackoffMax,
 			idField,
 			seams.Sleep,
+			acc.budget(),
 		)
 		if err != nil {
 			return err
 		}
-		*processed += len(batch)
-		reportBatch(seams, index, *processed, total, start)
-		*succeededTotal += batchResult.Succeeded
-		*failedTotal += batchResult.Failed
+		acc.processed += len(batch)
+		reportBatch(seams, index, acc.processed, total, start)
+		acc.add(batchResult)
 	}
 	return nil
 }
@@ -226,7 +276,7 @@ func loadNDJSON(
 	retryAttempts int,
 	retryBackoffBase, retryBackoffMax time.Duration,
 	idField string,
-	succeededTotal, failedTotal, processed *int,
+	acc *accumulator,
 	seams progress.Seams,
 ) error {
 	start := seams.Now()
@@ -257,21 +307,21 @@ func loadNDJSON(
 				es,
 				index,
 				batch,
-				*processed+len(batch),
+				acc.processed+len(batch),
 				total,
 				retryAttempts,
 				retryBackoffBase,
 				retryBackoffMax,
 				idField,
 				seams.Sleep,
+				acc.budget(),
 			)
 			if err != nil {
 				return err
 			}
-			*processed += len(batch)
-			reportBatch(seams, index, *processed, total, start)
-			*succeededTotal += batchResult.Succeeded
-			*failedTotal += batchResult.Failed
+			acc.processed += len(batch)
+			reportBatch(seams, index, acc.processed, total, start)
+			acc.add(batchResult)
 			batch = batch[:0]
 		}
 	}
@@ -282,21 +332,21 @@ func loadNDJSON(
 			es,
 			index,
 			batch,
-			*processed+len(batch),
+			acc.processed+len(batch),
 			total,
 			retryAttempts,
 			retryBackoffBase,
 			retryBackoffMax,
 			idField,
 			seams.Sleep,
+			acc.budget(),
 		)
 		if err != nil {
 			return err
 		}
-		*processed += len(batch)
-		reportBatch(seams, index, *processed, total, start)
-		*succeededTotal += batchResult.Succeeded
-		*failedTotal += batchResult.Failed
+		acc.processed += len(batch)
+		reportBatch(seams, index, acc.processed, total, start)
+		acc.add(batchResult)
 	}
 	return nil
 }
@@ -312,6 +362,7 @@ func bulkInsert(
 	retryBackoffBase, retryBackoffMax time.Duration,
 	idField string,
 	sleep func(context.Context, time.Duration) error,
+	sampleBudget int,
 ) (bulkInsertResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -430,17 +481,26 @@ func bulkInsert(
 
 	failed := 0
 	logged := 0
+	var sample []ItemFailure
 	for itemIdx, item := range parsed.Items {
 		for action, result := range item {
 			if result.Status >= 300 || result.Error != nil {
 				failed++
+				// The sample cap is independent of the ten-per-batch log cap
+				// below: sampling must not change counts, retries or logs.
+				if len(sample) < sampleBudget {
+					errorType, errorReason := itemErrorText(result.Error)
+					sample = append(sample, ItemFailure{
+						Index:  esresponse.SanitizeText(result.Index, esresponse.MaxPublicMessageBytes),
+						ID:     esresponse.SanitizeText(result.ID, esresponse.MaxPublicMessageBytes),
+						Action: esresponse.SanitizeText(action, esresponse.MaxPublicMessageBytes),
+						Status: result.Status,
+						Type:   errorType,
+						Reason: errorReason,
+					})
+				}
 				if logged < 10 {
-					errorType := ""
-					errorReason := ""
-					if result.Error != nil {
-						errorType = esresponse.SanitizeText(result.Error.Type, esresponse.MaxPublicMessageBytes)
-						errorReason = esresponse.SanitizeText(result.Error.Reason, esresponse.MaxPublicMessageBytes)
-					}
+					errorType, errorReason := itemErrorText(result.Error)
 					runlog.From(ctx).Error().
 						Int("item", itemIdx).
 						Str("action", action).
@@ -473,7 +533,7 @@ func bulkInsert(
 		Float64("time_taken", duration.Seconds()).
 		Msg("Processed batch")
 
-	return bulkInsertResult{Succeeded: succeeded, Failed: failed}, nil
+	return bulkInsertResult{Succeeded: succeeded, Failed: failed, Sample: sample}, nil
 }
 
 // shouldRetryBulkRequest centralizes retryability checks for bulk request
@@ -521,15 +581,23 @@ type Config struct {
 	RetryBackoffBase time.Duration
 	RetryBackoffMax  time.Duration
 	IDField          string
+	// SampleLimit bounds Totals.Sample for the whole load. <= 0 keeps no
+	// sample. The caller owns the value (loader.MaxBulkFailureSample), so
+	// this package holds no literal bound.
+	SampleLimit int
 }
 
 // Totals is a completed load: documents processed, succeeded and failed (per
-// bulk item), and the time from format detection to the last batch.
+// bulk item), and the time from format detection to the last batch. Sample is
+// the first failed items in response order, at most Config.SampleLimit, and
+// SampleOmitted is Failed minus len(Sample).
 type Totals struct {
-	Processed int
-	Succeeded int
-	Failed    int
-	Elapsed   time.Duration
+	Processed     int
+	Succeeded     int
+	Failed        int
+	Sample        []ItemFailure
+	SampleOmitted int
+	Elapsed       time.Duration
 }
 
 // detectDataFormat returns the data file's format byte, '[' (JSON array)
@@ -570,9 +638,7 @@ func Load(ctx context.Context, es *elasticsearch.Client, cfg Config, seams progr
 	}
 
 	overallStart := seams.Now()
-	succeededTotal := 0
-	failedTotal := 0
-	processed := 0
+	acc := &accumulator{limit: cfg.SampleLimit}
 
 	// detectDataFormat returned only '[' or '{'. Load still calls it itself
 	// because the file can change between preflight and load.
@@ -588,9 +654,7 @@ func Load(ctx context.Context, es *elasticsearch.Client, cfg Config, seams progr
 			cfg.RetryBackoffBase,
 			cfg.RetryBackoffMax,
 			cfg.IDField,
-			&succeededTotal,
-			&failedTotal,
-			&processed,
+			acc,
 			seams,
 		)
 	case '{':
@@ -604,9 +668,7 @@ func Load(ctx context.Context, es *elasticsearch.Client, cfg Config, seams progr
 			cfg.RetryBackoffBase,
 			cfg.RetryBackoffMax,
 			cfg.IDField,
-			&succeededTotal,
-			&failedTotal,
-			&processed,
+			acc,
 			seams,
 		)
 	}
@@ -615,9 +677,11 @@ func Load(ctx context.Context, es *elasticsearch.Client, cfg Config, seams progr
 	}
 
 	return Totals{
-		Processed: processed,
-		Succeeded: succeededTotal,
-		Failed:    failedTotal,
-		Elapsed:   seams.Now().Sub(overallStart),
+		Processed:     acc.processed,
+		Succeeded:     acc.succeeded,
+		Failed:        acc.failed,
+		Sample:        acc.sample,
+		SampleOmitted: acc.failed - len(acc.sample),
+		Elapsed:       seams.Now().Sub(overallStart),
 	}, nil
 }

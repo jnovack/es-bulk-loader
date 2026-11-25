@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -50,6 +51,7 @@ func TestBulkInsertRejectsUnsupportedDocumentBeforeRequest(t *testing.T) {
 		time.Millisecond,
 		"id",
 		func(context.Context, time.Duration) error { t.Fatal("no retry expected"); return nil },
+		0,
 	)
 	// Kind for this op is pinned by TestOperationKindsOfMovedHelpers in loader.
 	var opErr *failure.Error
@@ -175,7 +177,7 @@ func TestLoadRejectsUnreadableOrUnknownFormatBeforeRequest(t *testing.T) {
 			if !errors.As(err, &opErr) || opErr.Op != tt.wantOp {
 				t.Fatalf("Load error = %#v, want operation error %q", err, tt.wantOp)
 			}
-			if totals != (Totals{}) {
+			if !reflect.DeepEqual(totals, Totals{}) {
 				t.Fatalf("totals = %+v, want zero Totals on a hard failure", totals)
 			}
 		})
@@ -363,6 +365,7 @@ func TestBulkInsertTransportRetryPolicy(t *testing.T) {
 				time.Millisecond,
 				"id",
 				sleep,
+				0,
 			)
 
 			if n := int(attempts.Load()); n != tt.wantAttempts {
@@ -390,7 +393,7 @@ func TestBulkInsertTransportRetryPolicy(t *testing.T) {
 				if err != nil {
 					t.Fatalf("bulkInsert returned error: %v", err)
 				}
-				if want := (bulkInsertResult{Succeeded: tt.wantSucceeded}); got != want {
+				if want := (bulkInsertResult{Succeeded: tt.wantSucceeded}); !reflect.DeepEqual(got, want) {
 					t.Fatalf("bulkInsert result = %+v, want %+v", got, want)
 				}
 				return
@@ -403,7 +406,7 @@ func TestBulkInsertTransportRetryPolicy(t *testing.T) {
 			if !errors.Is(err, tt.wantCause) {
 				t.Fatalf("bulkInsert error = %v, want cause %v", err, tt.wantCause)
 			}
-			if got != (bulkInsertResult{}) {
+			if !reflect.DeepEqual(got, bulkInsertResult{}) {
 				t.Fatalf("bulkInsert result = %+v, want zero on failure", got)
 			}
 		})
@@ -516,7 +519,7 @@ func TestLoadRechecksFormatAfterPreflight(t *testing.T) {
 			if opErr.Err == nil {
 				t.Fatal("want non-nil substituted cause")
 			}
-			if totals != (Totals{}) {
+			if !reflect.DeepEqual(totals, Totals{}) {
 				t.Fatalf("totals = %+v, want zero Totals", totals)
 			}
 			if got := progressCalls.Load(); got != 0 {
@@ -562,7 +565,7 @@ func TestBulkItemFailureReasonsAreRedacted(t *testing.T) {
 		logger, buf := logbuf.New()
 		ctx := runlog.WithLogger(t.Context(), logger)
 		res, err := bulkInsert(ctx, stub.MustClient(t), "cards", docs, len(docs), len(docs), 1, time.Millisecond, time.Millisecond, "id",
-			func(context.Context, time.Duration) error { t.Error("no retry expected"); return nil })
+			func(context.Context, time.Duration) error { t.Error("no retry expected"); return nil }, 0)
 		if err != nil {
 			t.Fatalf("bulkInsert: %v", err)
 		}

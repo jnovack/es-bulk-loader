@@ -3,6 +3,7 @@ package loader
 import (
 	"errors"
 
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/bulk"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/enrich"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/esresponse"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/progress"
@@ -258,4 +259,48 @@ func wrapEnrichSnapshot(next func(progress.Snapshot)) func(progress.Snapshot) {
 		s.Err = wrapEnrichErr(s.Err)
 		next(s)
 	}
+}
+
+// MaxBulkFailureSample is the most rejected bulk items Result.BulkFailures
+// holds: 100. The loader does not retain every rejected document; the rest are
+// only counted in Result.BulkFailuresOmitted.
+const MaxBulkFailureSample = 100
+
+// BulkItemFailure is one bulk item Elasticsearch rejected, in
+// Result.BulkFailures. An item is rejected when its response status is 300 or
+// higher or it carries an error. Build and compare it with keyed fields.
+//
+// Every string field is sanitized single-line UTF-8 with recognizable
+// credentials redacted and is at most 2,048 bytes (a
+// longer value ends with " [truncated]"). A rejected item whose response had a
+// null error has empty Type and Reason.
+type BulkItemFailure struct {
+	// Index is the concrete index the response named for the item.
+	Index string
+	// ID is the document _id the response named; the id Elasticsearch
+	// generated when the loader sent none.
+	ID string
+	// Action is the bulk action key of the response item, for example "index".
+	Action string
+	// Status is the item's HTTP-style status from the bulk response.
+	Status int
+	// Type is the Elasticsearch error type, for example
+	// "mapper_parsing_exception"; empty for a null error.
+	Type string
+	// Reason is the Elasticsearch error reason; empty for a null error.
+	Reason string
+}
+
+// bulkFailuresFrom is the one adapter from the internal bulk sample to the
+// public Result.BulkFailures. It returns nil for no sample and copies the
+// values, so the Result never aliases loader-owned memory.
+func bulkFailuresFrom(sample []bulk.ItemFailure) []BulkItemFailure {
+	if len(sample) == 0 {
+		return nil
+	}
+	out := make([]BulkItemFailure, len(sample))
+	for i, f := range sample {
+		out[i] = BulkItemFailure{Index: f.Index, ID: f.ID, Action: f.Action, Status: f.Status, Type: f.Type, Reason: f.Reason}
+	}
+	return out
 }

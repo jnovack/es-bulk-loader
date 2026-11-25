@@ -318,6 +318,19 @@ type Result struct {
 	// DocumentsFailed counts bulk items Elasticsearch rejected. Item failures do
 	// not make Run return an error, so callers must check this field.
 	DocumentsFailed int
+	// BulkFailures is a sample of the bulk items Elasticsearch rejected: the
+	// first rejected items in response order, at most MaxBulkFailureSample (100),
+	// in the order the batches ran. The loader does not retain every rejected
+	// document. len(BulkFailures)+BulkFailuresOmitted == DocumentsFailed.
+	// It is filled only when the bulk stage completes (and kept if a later
+	// stage fails); it is nil when no data action ran, when nothing was
+	// rejected, and when the bulk stage itself failed. Every string field is
+	// sanitized and bounded to at most 2,048 bytes; see BulkItemFailure.
+	BulkFailures []BulkItemFailure
+	// BulkFailuresOmitted counts rejected items beyond the sample, so
+	// len(BulkFailures)+BulkFailuresOmitted == DocumentsFailed. It is zero
+	// whenever DocumentsFailed is zero.
+	BulkFailuresOmitted int
 	// EnrichSelected lists the managed policy names Run executed.
 	EnrichSelected []string
 	// EnrichMissing lists requested policy names absent from a cluster that has
@@ -1003,6 +1016,7 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 			RetryBackoffBase: *bulkRetryBackoffBase,
 			RetryBackoffMax:  *bulkRetryBackoffMax,
 			IDField:          *idField,
+			SampleLimit:      MaxBulkFailureSample,
 		}, progress.Seams{Now: progressNow, Sleep: sleepWithContext, OnProgress: bulkProgress})
 		if err != nil {
 			return result, runFailure(err)
@@ -1031,6 +1045,8 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 		result.DocumentsProcessed = processed
 		result.DocumentsSucceeded = succeededTotal
 		result.DocumentsFailed = failedTotal
+		result.BulkFailures = bulkFailuresFrom(totals.Sample)
+		result.BulkFailuresOmitted = totals.SampleOmitted
 	}
 
 	if *aliasMode && shouldCreateIndex {
