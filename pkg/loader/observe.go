@@ -3,11 +3,15 @@ package loader
 import (
 	"errors"
 
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/enrich"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/esresponse"
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/progress"
 )
 
-// ElasticsearchError is the structured Elasticsearch cause of a run-ending
-// failure. Reach it from Run's error with errors.As:
+// ElasticsearchError is the structured Elasticsearch cause of a failure: a
+// run-ending one (Run's error), or an enrich policy failure that does not end
+// the run (EnrichOutcome.Err and the enrich Final ProgressEvent.Err; see
+// EnrichOutcome). Reach it with errors.As:
 //
 //	var esErr *loader.ElasticsearchError
 //	if errors.As(err, &esErr) {
@@ -19,6 +23,11 @@ import (
 // (including the mapping fetch before a bulk insert and a non-retryable
 // transform _stats status, both wrapped in outer context) and the flush
 // shard-failure cause reported inside a successful response (StatusCode 0).
+// For an enrich policy it is present when the cause is an HTTP rejection of
+// the execute request or a task poll, a task "error" reported inside a
+// successful poll response (StatusCode 0, Resource "enrich task"), or a
+// backing-alias read rejected during task-404 verification (Resource "alias").
+//
 // It is absent, and errors.As returns false, for:
 //
 //   - status-only paths, such as index deletion, whose errors carry no richer
@@ -131,4 +140,122 @@ func elasticsearchErrorFrom(err error) (*ElasticsearchError, bool) {
 		msg:        rejection.Error(),
 		err:        rejection.Unwrap(),
 	}, true
+}
+
+// asElasticsearchError is the one target handler behind every public error
+// path that offers an ElasticsearchError through errors.As: RunError.As and
+// the enrich error wrapper. For a **ElasticsearchError target it sets the
+// target to a new projection of the first rejection in err's chain and
+// reports true. Any other target, a nil target pointer, a nil err or a chain
+// without a rejection reports false and leaves the target unchanged. Callers
+// pass the inner error, never the value whose As is running: errors.As on that
+// value would call its As again.
+func asElasticsearchError(err error, target any) bool {
+	esTarget, ok := target.(**ElasticsearchError)
+	if !ok || esTarget == nil {
+		return false
+	}
+	esErr, ok := elasticsearchErrorFrom(err)
+	if !ok {
+		return false
+	}
+	*esTarget = esErr
+	return true
+}
+
+// enrichErr makes an enrich failure reachable with errors.As as an
+// *ElasticsearchError while leaving its text and errors.Is/Unwrap chain
+// unchanged. It is unexported and applied in exactly two places: Run's enrich
+// progress callback (the Final ProgressEvent.Err) and the EnrichOutcome
+// adapter. It cannot live in internal/enrich (import cycle), and
+// progressEmitter.stage must keep passing Err by identity.
+type enrichErr struct{ err error }
+
+// wrapEnrichErr wraps err, returning a nil error interface (not a typed nil
+// wrapper) for a nil err so success keeps Err == nil.
+func wrapEnrichErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &enrichErr{err: err}
+}
+
+func (w *enrichErr) Error() string { return w.err.Error() }
+func (w *enrichErr) Unwrap() error { return w.err }
+
+// As offers the ElasticsearchError projection; every other target falls
+// through to errors.As's normal Unwrap traversal.
+func (w *enrichErr) As(target any) bool { return asElasticsearchError(w.err, target) }
+
+// EnrichStatus is the outcome of one enrich policy in Result.EnrichOutcomes.
+// The values are the strings "succeeded", "failed", "unsupported",
+// "cancelled" and "missing". The prefix keeps them distinct from the int
+// fields Result.EnrichSucceeded and Result.EnrichFailed.
+type EnrichStatus string
+
+// The EnrichStatus values.
+const (
+	// EnrichStatusSucceeded ("succeeded"): the policy executed and completed.
+	EnrichStatusSucceeded = EnrichStatus(enrich.StatusSucceeded)
+	// EnrichStatusFailed ("failed"): the policy was attempted and did not
+	// complete: a transport or decode error, an HTTP rejection, a task error,
+	// a FAILED or CANCELLED task phase reported by Elasticsearch (that
+	// CANCELLED is deliberately "failed": "cancelled" below means this Run's
+	// context ended), or an unverifiable or unmoved backing alias. An
+	// unreadable backing alias is "failed" even when the read failed because
+	// this Run's context ended, so errors.Is(Err, context.Canceled) can hold
+	// for a "failed" policy: Status, not errors.Is, is the classification.
+	EnrichStatusFailed = EnrichStatus(enrich.StatusFailed)
+	// EnrichStatusUnsupported ("unsupported"): the execute endpoint answered
+	// with a generic 404, so the enrich API is not served at this URL.
+	EnrichStatusUnsupported = EnrichStatus(enrich.StatusUnsupported)
+	// EnrichStatusCancelled ("cancelled"): this Run's context was cancelled or
+	// its deadline passed while the policy was being executed or polled.
+	EnrichStatusCancelled = EnrichStatus(enrich.StatusCancelled)
+	// EnrichStatusMissing ("missing"): the policy was requested but absent
+	// from a cluster that has policies. No execution was attempted.
+	EnrichStatusMissing = EnrichStatus(enrich.StatusMissing)
+)
+
+// EnrichOutcome is the result of one requested enrich policy, in
+// Result.EnrichOutcomes. Build and compare it with keyed fields.
+//
+// Err is nil for "succeeded" and "missing". For every other status it is the
+// real cause (the cause text and chain, not the "enrich policy %q failed"
+// prefix the enrich Final ProgressEvent.Err adds). errors.Is and errors.As
+// reach the underlying error, for example context.Canceled for a "cancelled"
+// policy, and errors.As reaches an *ElasticsearchError when the cause is an
+// HTTP rejection or a task "error" (see ElasticsearchError). The failure does
+// not end the run: Run returns no error for it.
+type EnrichOutcome struct {
+	// Policy is the managed policy name Run executed. For "missing" it is the
+	// requested name, or the declared name for an All selection, in
+	// Result.EnrichMissing order.
+	Policy string
+	// Status is how the policy ended.
+	Status EnrichStatus
+	// Err is the cause of a non-success status; nil for "succeeded" and
+	// "missing".
+	Err error
+}
+
+// enrichOutcomesFrom is the one adapter from the internal enrich outcomes to
+// the public Result.EnrichOutcomes. It returns nil for no outcomes.
+func enrichOutcomesFrom(outcomes []enrich.Outcome) []EnrichOutcome {
+	if len(outcomes) == 0 {
+		return nil
+	}
+	out := make([]EnrichOutcome, len(outcomes))
+	for i, o := range outcomes {
+		out[i] = EnrichOutcome{Policy: o.Policy, Status: EnrichStatus(o.Status), Err: wrapEnrichErr(o.Cause)}
+	}
+	return out
+}
+
+// wrapEnrichSnapshot is Run's pre-transform for the enrich progress callback.
+func wrapEnrichSnapshot(next func(progress.Snapshot)) func(progress.Snapshot) {
+	return func(s progress.Snapshot) {
+		s.Err = wrapEnrichErr(s.Err)
+		next(s)
+	}
 }

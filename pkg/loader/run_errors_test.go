@@ -1976,6 +1976,8 @@ func TestPublicTypeIdentity(t *testing.T) {
 		{TransformOptions{}, "TransformOptions"},
 		{ElasticsearchError{}, "ElasticsearchError"},
 		{ElasticsearchCause{}, "ElasticsearchCause"},
+		{EnrichStatus(""), "EnrichStatus"},
+		{EnrichOutcome{}, "EnrichOutcome"},
 	}
 	for _, tt := range tests {
 		typ := reflect.TypeOf(tt.value)

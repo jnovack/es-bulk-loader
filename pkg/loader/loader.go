@@ -149,17 +149,8 @@ func (e *RunError) As(target any) bool {
 	if e == nil {
 		return false
 	}
-	esTarget, ok := target.(**ElasticsearchError)
-	if !ok || esTarget == nil {
-		return false
-	}
 	// e.Err, never e: errors.As on e would call this method again.
-	esErr, ok := elasticsearchErrorFrom(e.Err)
-	if !ok {
-		return false
-	}
-	*esTarget = esErr
-	return true
+	return asElasticsearchError(e.Err, target)
 }
 
 // EnrichOptions selects enrich policies for execution. When Policies is
@@ -340,6 +331,17 @@ type Result struct {
 	// EnrichFailed counts enrich policies that failed. The run continues after a
 	// failed policy, so callers must check this field.
 	EnrichFailed int
+	// EnrichOutcomes holds one EnrichOutcome per requested enrich policy: the
+	// selected policies in execution order, then one "missing" entry per name
+	// in EnrichMissing. A failed policy does not stop the run, so each failure
+	// and its cause are listed here; see EnrichOutcome and the EnrichStatus
+	// values ("succeeded", "failed", "unsupported", "cancelled", "missing").
+	// EnrichFailed counts every selected outcome that is not "succeeded".
+	// Outcomes are recorded whether or not Options.Progress is set. It is empty
+	// when enrich is not requested, the policy-list API is unsupported, the
+	// cluster has no enrich policies or listing them failed (Run then returns
+	// an error). An unsupported execute endpoint produces a policy outcome.
+	EnrichOutcomes []EnrichOutcome
 	// Warnings holds, in order, the messages Run routes through its internal
 	// warning helper. Other Warn-level logs, such as the nuke deletion notices and
 	// skipped missing policies, are logged but not listed here.
@@ -1055,9 +1057,11 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 			return result, runFailure(err)
 		}
 		enrichResult, err := enrich.Execute(ctx, es, enrichSelection, policyNames, progress.Seams{
-			Now:        progressNow,
-			Sleep:      sleepWithContext,
-			OnProgress: emit.stage(ProgressStageEnrich),
+			Now:   progressNow,
+			Sleep: sleepWithContext,
+			// Wrapped so errors.As reaches an ElasticsearchError through the
+			// Final event's Err; emit.stage itself must stay a pure mapping.
+			OnProgress: wrapEnrichSnapshot(emit.stage(ProgressStageEnrich)),
 		})
 		if err != nil {
 			return result, runFailure(err)
@@ -1066,6 +1070,7 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 		result.EnrichMissing = enrichResult.Missing
 		result.EnrichSucceeded = enrichResult.Succeeded
 		result.EnrichFailed = enrichResult.Failed
+		result.EnrichOutcomes = enrichOutcomesFrom(enrichResult.Outcomes)
 	}
 	if effectiveSyncManaged && len(transformSyncNames) > 0 {
 		// ADR: Keep transform readiness local to this stage; see

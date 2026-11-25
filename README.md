@@ -210,7 +210,46 @@ It is absent, and `errors.As` returns false, in these cases:
 - Transport, validation, file and other non-Elasticsearch failures.
 
 Failures that do not end the run, such as a failed enrich policy or a bulk
-item rejection, are not returned as errors.
+item rejection, are not returned from `Run`. A failed enrich policy's cause is
+in `Result.EnrichOutcomes` (see [Enrich outcomes](#enrich-outcomes)), and
+`EnrichOutcome.Err` and the enrich Final `ProgressEvent.Err` also reach an
+`*ElasticsearchError` with `errors.As` when that cause is an HTTP rejection or
+a task `error`.
+
+### Enrich outcomes
+
+`Result.EnrichOutcomes []EnrichOutcome` has one entry per requested enrich
+policy: the selected policies in execution order, then one `missing` entry per
+name in `Result.EnrichMissing`, following its order (request order, or declared
+order for an All selection). A failed policy never stops
+the run, so check the outcomes, not just `Run`'s error. Recording does not
+need `Options.Progress`.
+
+```go
+for _, o := range result.EnrichOutcomes {
+    if o.Err != nil {
+        var esErr *loaderpkg.ElasticsearchError
+        if errors.As(o.Err, &esErr) {
+            log.Printf("%s: HTTP %d %v", o.Policy, esErr.StatusCode, esErr.Causes)
+        }
+    }
+}
+```
+
+| Field | Shape |
+| --- | --- |
+| `Policy string` | The managed policy name Run executed, or, for `missing`, the requested name (the declared name for an All selection). |
+| `Status EnrichStatus` | `succeeded` (`EnrichStatusSucceeded`), `failed` (`EnrichStatusFailed`), `unsupported` (`EnrichStatusUnsupported`: the execute endpoint answered a generic 404), `cancelled` (`EnrichStatusCancelled`: the Run's context was cancelled or timed out) or `missing` (`EnrichStatusMissing`: requested but absent from a cluster that has policies; nothing was attempted). An Elasticsearch `CANCELLED` task phase is `failed`, not `cancelled`. An unreadable backing alias is `failed` even when the read failed because the context ended, so `errors.Is(Err, context.Canceled)` can hold for a `failed` policy: `Status`, not `errors.Is`, is the classification. |
+| `Err error` | The real cause; nil for `succeeded` and `missing`. `errors.Is` and `errors.As` traverse it, for example `context.Canceled`. |
+
+`Result.EnrichFailed` counts every selected outcome that is not `succeeded`
+(`failed`, `unsupported` and `cancelled`); `Result.EnrichSucceeded` plus
+`Result.EnrichFailed` equals the number of selected outcomes. The list is
+empty when enrich is not requested, the policy-list API is unsupported, the
+cluster has no enrich policies, or listing policies failed (then `Run` returns
+the error). An unsupported execute endpoint produces an `unsupported` policy
+outcome. The enrich Final `ProgressEvent.Err` text is
+`enrich policy "<name>" failed: <cause>`; earlier versions ended at `failed`.
 
 Full lifecycle run:
 
@@ -326,7 +365,7 @@ result, err := loaderpkg.Run(ctx, loaderpkg.Options{
 | `Done`, `Total` | `bulk`: documents processed and in the file. `enrich`: documents done and total from the child reindex task during the `reindex` step, otherwise -1. `transform`: `Done` is cumulative `documents_processed`, `Total` is the current checkpoint's `total_docs`. -1 always means unknown, never an estimate |
 | `Elapsed` | Time since the loader began tracking the resource |
 | `Final` | Last event for this `(Stage, Resource)` in this Run |
-| `Err` | Set only on a Final event for a resource that failed while the Run continued (an enrich policy). 9.3.1 stores no result for an async enrich task, so its task GET usually ends with HTTP 404; the loader then reads the policy's `.enrich-<policy>` alias, once before kickoff and once after the 404. It counts the policy as succeeded only if the alias moved to a new, non-empty target set. An unchanged or absent alias, or an alias read that fails (the credentials need alias metadata read access), sets `Err`. A concurrent execution of the same policy by another client also moves the alias and cannot be told apart. See [ADR 0004](docs/decisions/0004-progress-reporting-and-transform-wait.md) |
+| `Err` | Set only on a Final event for a resource that failed while the Run continued (an enrich policy). 9.3.1 stores no result for an async enrich task, so its task GET usually ends with HTTP 404; the loader then reads the policy's `.enrich-<policy>` alias, once before kickoff and once after the 404. It counts the policy as succeeded only if the alias moved to a new, non-empty target set. An unchanged or absent alias, or an alias read that fails (the credentials need alias metadata read access), sets `Err`. A concurrent execution of the same policy by another client also moves the alias and cannot be told apart. See [ADR 0004](docs/decisions/0004-progress-reporting-and-transform-wait.md). The text is `enrich policy "<name>" failed: <cause>`, the same cause as the policy's `EnrichOutcome.Err` ([Enrich outcomes](#enrich-outcomes)); `errors.Is` and `errors.As` reach it, including an `*ElasticsearchError` for an HTTP rejection or a task `error`. A succeeded policy's Final event has a nil `Err`, and a missing policy gets no event; every selected policy gets exactly one Final event and the Run continues after a failure |
 
 Delivery contract:
 

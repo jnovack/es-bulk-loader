@@ -50,6 +50,12 @@ type progressStubConfig struct {
 	bulkStatus    int         // 0 means 200
 	bulkFailItems int         // first N items of every bulk request fail
 	statsStatus   int         // 0 means 200
+	// executeStatus is the HTTP status of the enrich execute (kickoff) answer,
+	// carrying executeBody; 0 means 200.
+	executeStatus int
+	// executeDrop and taskDrop answer the kickoff or the task poll by closing
+	// the connection before any header, a transport failure for the client.
+	executeDrop, taskDrop bool
 	// aliasReplies answers GET _alias/.enrich-<policy>, per policy, in order,
 	// last repeats. A policy without an entry gets enrichAliasMoved: absent
 	// before kickoff, then a new backing index, as a successful execution.
@@ -73,6 +79,23 @@ func withEnrichTask(tasks ...stubReply) progressStubOption {
 
 func withExecuteBody(body string) progressStubOption {
 	return func(c *progressStubConfig) { c.executeBody = body }
+}
+
+// withExecuteReply makes the kickoff answer status with body, on the existing
+// execute route.
+func withExecuteReply(status int, body string) progressStubOption {
+	return func(c *progressStubConfig) { c.executeStatus, c.executeBody = status, body }
+}
+
+// withExecuteDrop makes the kickoff a transport failure.
+func withExecuteDrop() progressStubOption {
+	return func(c *progressStubConfig) { c.executeDrop = true }
+}
+
+// withTaskDrop makes the task poll (a task id must be offered by
+// withEnrichTask) a transport failure; the stub's task replies are unused.
+func withTaskDrop() progressStubOption {
+	return func(c *progressStubConfig) { c.taskDrop = true }
 }
 
 func withChildren(children ...stubReply) progressStubOption {
@@ -202,7 +225,15 @@ func newProgressStub(t *testing.T, statsSequence []string, opts ...progressStubO
 	stub.Handle("GET /_enrich/policy", listPolicies)
 	stub.Handle("GET /_enrich/policy/{$}", listPolicies)
 	executePolicy := rec.recorded("enrich.execute", func(w http.ResponseWriter, _ *http.Request) {
-		write(w, http.StatusOK, cfg.executeBody)
+		if cfg.executeDrop {
+			dropConnection(t, w)
+			return
+		}
+		status := cfg.executeStatus
+		if status == 0 {
+			status = http.StatusOK
+		}
+		write(w, status, cfg.executeBody)
 	})
 	stub.Handle("POST /_enrich/policy/{name}/_execute", executePolicy)
 	stub.Handle("PUT /_enrich/policy/{name}/_execute", executePolicy)
@@ -220,6 +251,10 @@ func newProgressStub(t *testing.T, statsSequence []string, opts ...progressStubO
 		}))
 	}
 	stub.Handle("GET /_tasks/"+progressTaskID, rec.recorded("enrich.task", func(w http.ResponseWriter, _ *http.Request) {
+		if cfg.taskDrop {
+			dropConnection(t, w)
+			return
+		}
 		if len(cfg.tasks) == 0 {
 			t.Errorf("unexpected task poll with no task replies configured")
 			w.WriteHeader(http.StatusInternalServerError)

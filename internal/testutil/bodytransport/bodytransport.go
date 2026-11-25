@@ -54,10 +54,13 @@ func (Endless) Read(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// Reply is one canned response.
+// Reply is one canned response. A non-nil Err makes RoundTrip fail with it (a
+// transport failure) instead of returning a response. Bodies still records the
+// configured Body for that request, which may be nil.
 type Reply struct {
 	Status int
 	Body   *Body
+	Err    error
 }
 
 // Transport answers the Nth request with Replies[N] (the last reply repeats)
@@ -84,6 +87,9 @@ func (tr *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	tr.bodies = append(tr.bodies, reply.Body)
 	tr.mu.Unlock()
 
+	if reply.Err != nil {
+		return nil, reply.Err
+	}
 	header := http.Header{}
 	header.Set("X-Elastic-Product", "Elasticsearch")
 	header.Set("Content-Type", "application/json")

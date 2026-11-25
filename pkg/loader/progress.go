@@ -58,6 +58,18 @@ const (
 //     set, and the Run continues. A concurrent execution of the same policy
 //     by another client also moves the alias; the check cannot tell them
 //     apart. See ADR 0004.
+//   - A failed enrich policy's Err reads `enrich policy "<name>" failed:
+//     <cause>`, where <cause> is the same cause as the policy's
+//     EnrichOutcome.Err in Result.EnrichOutcomes: an HTTP rejection, a task
+//     error, a transport or decode error, an Elasticsearch FAILED or CANCELLED
+//     phase, an unreadable or unmoved backing alias, or the context error when
+//     the Run's context ended. The suffix after the colon was added in a minor
+//     release; earlier versions ended at "failed". errors.Is and errors.As
+//     reach the cause, and errors.As reaches an *ElasticsearchError when it is
+//     an HTTP rejection or a task error. A succeeded policy and a policy
+//     reported "missing" have a nil Err; a missing policy gets no event. Every
+//     selected policy gets exactly one Final event, and the Run continues with
+//     the next policy after a failure.
 //   - When Run returns an error, the resource that caused it gets no Final
 //     event, and no events follow. Run's error is the single authoritative
 //     failure signal. This covers a hard bulk failure, a transform wait
@@ -78,7 +90,9 @@ type ProgressEvent struct {
 	Elapsed time.Duration
 	// Final is true on the last event for this (Stage, Resource) in this Run.
 	Final bool
-	// Err is non-nil only on a Final event for a resource that failed without failing the Run.
+	// Err is non-nil only on a Final event for a resource that failed without
+	// failing the Run. For an enrich policy it is `enrich policy "<name>"
+	// failed: <cause>`; see the Final notes above and EnrichOutcome.
 	Err error
 }
 

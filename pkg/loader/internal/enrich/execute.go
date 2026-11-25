@@ -3,6 +3,7 @@ package enrich
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -69,13 +70,88 @@ type taskGetResponse struct {
 	Error json.RawMessage `json:"error,omitempty"`
 }
 
+// Status is the per-policy result vocabulary. These five strings are the one
+// source of the public loader.EnrichStatus values, which convert them.
+type Status string
+
+// The Status values. StatusCancelled means this Run's own context ended (or
+// its deadline passed); an Elasticsearch CANCELLED task phase is
+// StatusFailed. StatusUnsupported is the generic-404 "enrich API is not
+// served here" answer to a policy execution. StatusMissing is a requested
+// policy absent from a cluster that has policies; no execution was attempted.
+const (
+	StatusSucceeded   Status = "succeeded"
+	StatusFailed      Status = "failed"
+	StatusUnsupported Status = "unsupported"
+	StatusCancelled   Status = "cancelled"
+	StatusMissing     Status = "missing"
+)
+
+// policyOutcome is how one policy execution ended: a Status and, for every
+// non-success status, the real cause. The caller owns the Final event.
+type policyOutcome struct {
+	status Status
+	cause  error
+}
+
+// succeeded reports whether the policy completed.
+func (o policyOutcome) succeeded() bool { return o.status == StatusSucceeded }
+
+// okOutcome is a completed policy; its cause is nil.
+func okOutcome() policyOutcome { return policyOutcome{status: StatusSucceeded} }
+
+// failOutcome is a failed policy with its cause.
+func failOutcome(cause error) policyOutcome {
+	return policyOutcome{status: StatusFailed, cause: cause}
+}
+
+// causeOutcome classifies a cause: StatusCancelled when the error chain
+// carries context.Canceled or context.DeadlineExceeded (so a cancelled body
+// read inside a Rejection counts), otherwise StatusFailed. It classifies the
+// actual cause, never a later ctx.Err() that could mask an unrelated failure.
+func causeOutcome(cause error) policyOutcome {
+	if errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded) {
+		return policyOutcome{status: StatusCancelled, cause: cause}
+	}
+	return failOutcome(cause)
+}
+
+// boundedCause is a cause whose text was rendered once here, sanitized and
+// bounded to MaxPublicMessageBytes, while the underlying error (if any) stays
+// reachable through Unwrap for errors.Is and errors.As.
+type boundedCause struct {
+	msg string
+	err error
+}
+
+func (c *boundedCause) Error() string { return c.msg }
+func (c *boundedCause) Unwrap() error { return c.err }
+
+// newBoundedCause sanitizes and bounds text and keeps err reachable.
+func newBoundedCause(text string, err error) error {
+	return &boundedCause{msg: esresponse.SanitizeText(text, esresponse.MaxPublicMessageBytes), err: err}
+}
+
+// Outcome is one policy's result in Summary.Outcomes. Cause is nil for
+// StatusSucceeded and StatusMissing.
+type Outcome struct {
+	Policy string
+	Status Status
+	Cause  error
+}
+
 // Summary is the outcome of Execute: the selected and missing policies in
-// order, and how many selected policies succeeded or failed.
+// order, how many selected policies succeeded or failed (Failed counts every
+// non-success selected status), and Outcomes: one entry per selected policy in
+// execution order, then one StatusMissing entry per missing policy. Outcomes
+// is empty on the early returns that never resolve a selection (enrich
+// unsupported or the cluster has no policies).
 type Summary struct {
 	Selected  []string
 	Missing   []string
 	Succeeded int
 	Failed    int
+	Outcomes  []Outcome
 }
 
 // ExplicitPolicies returns the trimmed, de-duplicated names of an explicit
@@ -224,6 +300,7 @@ func Execute(ctx context.Context, es *elasticsearch.Client, enrichSelection *Sel
 	}
 
 	if len(targets) == 0 {
+		summary.Outcomes = appendMissing(summary.Outcomes, missing)
 		runlog.From(ctx).Warn().Msg("No enrich policies matched the request")
 		return summary, nil
 	}
@@ -244,7 +321,8 @@ func Execute(ctx context.Context, es *elasticsearch.Client, enrichSelection *Sel
 			Msg("Executing enrich policy")
 
 		policyStart := cfg.Now()
-		ok := executePolicy(ctx, es, policy, cfg)
+		outcome := executePolicy(ctx, es, policy, cfg)
+		summary.Outcomes = append(summary.Outcomes, Outcome{Policy: policy, Status: outcome.status, Cause: outcome.cause})
 		final := progress.Snapshot{
 			Resource: policy,
 			Done:     -1,
@@ -252,14 +330,20 @@ func Execute(ctx context.Context, es *elasticsearch.Client, enrichSelection *Sel
 			Elapsed:  cfg.Now().Sub(policyStart),
 			Final:    true,
 		}
-		if ok {
+		if outcome.succeeded() {
 			succeeded++
 		} else {
 			failed++
-			final.Err = fmt.Errorf("enrich policy %q failed", policy)
+			if outcome.cause != nil {
+				final.Err = fmt.Errorf("enrich policy %q failed: %w", policy, outcome.cause)
+			} else {
+				// Defensive: every failure class carries a cause.
+				final.Err = fmt.Errorf("enrich policy %q failed", policy)
+			}
 		}
 		cfg.Report(final)
 	}
+	summary.Outcomes = appendMissing(summary.Outcomes, missing)
 
 	event := runlog.From(ctx).Info()
 	if failed > 0 {
@@ -277,10 +361,26 @@ func Execute(ctx context.Context, es *elasticsearch.Client, enrichSelection *Sel
 	return summary, nil
 }
 
+// appendMissing appends one StatusMissing outcome (nil Cause) per missing
+// policy, after every selected outcome.
+func appendMissing(outcomes []Outcome, missing []string) []Outcome {
+	for _, policy := range missing {
+		outcomes = append(outcomes, Outcome{Policy: policy, Status: StatusMissing})
+	}
+	return outcomes
+}
+
 // logResult emits the final success/failure log for an enrich policy
-// execution. Success is Info, not Debug: it is the stage-end line that makes a
-// finished policy visible at the default level.
-func logResult(ctx context.Context, policy string, status *phaseStatus, startTime time.Time, now func() time.Time) bool {
+// execution and maps the task phase to the outcome, so synchronous and async
+// completion share one mapping. Success is Info, not Debug: it is the
+// stage-end line that makes a finished policy visible at the default level.
+// An Elasticsearch FAILED or CANCELLED phase is deliberately StatusFailed:
+// StatusCancelled means this Run's context ended, not that Elasticsearch
+// cancelled the task (guarded by the "async CANCELLED phase stays failed,
+// never cancelled" case of TestExecutePolicyOutcomeClasses and the
+// "asynchronous CANCELLED phase stays failed" row of
+// TestRunEnrichFailureClassesProjectStatusAndCause).
+func logResult(ctx context.Context, policy string, status *phaseStatus, startTime time.Time, now func() time.Time) policyOutcome {
 	phase, isFailure := "", false
 	if status != nil {
 		phase = status.Phase
@@ -299,7 +399,10 @@ func logResult(ctx context.Context, policy string, status *phaseStatus, startTim
 		msg = "Enrich policy execution failed"
 	}
 	entry.Msg(msg)
-	return !isFailure
+	if isFailure {
+		return failOutcome(newBoundedCause(fmt.Sprintf("enrich policy ended in phase %q", phase), nil))
+	}
+	return okOutcome()
 }
 
 // enrichAlias returns the alias Elasticsearch points at the newest backing
@@ -325,7 +428,7 @@ func verifyEnrichOutcome(
 	ctx context.Context, es *elasticsearch.Client, policy, taskID string,
 	before []string, beforeErr error, startTime time.Time,
 	now func() time.Time,
-) bool {
+) policyOutcome {
 	alias := enrichAlias(policy)
 	after, afterErr := aliasops.ResolveTargets(ctx, es, alias)
 	elapsed := now().Sub(startTime).Seconds()
@@ -355,7 +458,8 @@ func verifyEnrichOutcome(
 			event = event.Str("after_error", afterErr.Error())
 		}
 		event.Msg("Enrich policy outcome could not be verified")
-		return false
+		// firstErr stays reachable (errors.Is/As), not flattened to text.
+		return failOutcome(newBoundedCause("enrich backing alias unreadable: "+firstErr.Error(), firstErr))
 	}
 
 	// ResolveTargets sorts, so slices.Equal compares sets regardless of the
@@ -369,7 +473,8 @@ func verifyEnrichOutcome(
 			Strs("after", after).
 			Float64("time_taken", elapsed).
 			Msg("Enrich policy execution failed: the backing alias did not move")
-		return false
+		return failOutcome(newBoundedCause(fmt.Sprintf(
+			"enrich backing alias %q did not move (before %q, after %q)", alias, before, after), nil))
 	}
 
 	runlog.From(ctx).Debug().
@@ -404,10 +509,11 @@ func withBodyErrors(event *zerolog.Event, readErr, closeErr error) *zerolog.Even
 }
 
 // executePolicy starts one policy and polls its task until it finishes.
-// It reports whether the policy succeeded; the caller owns the Final event.
+// It reports how the policy ended, with the real cause of any failure; the
+// caller owns the Final event.
 // Transient task-poll statuses are retried up to maxConsecutivePollFailures;
 // a task 404 is still decided by verifyEnrichOutcome.
-func executePolicy(ctx context.Context, es *elasticsearch.Client, policy string, cfg progress.Seams) bool {
+func executePolicy(ctx context.Context, es *elasticsearch.Client, policy string, cfg progress.Seams) policyOutcome {
 	startTime := cfg.Now()
 	// The backing alias is read before kickoff, never after: a fast execution
 	// could repoint it before a later read, and the task-404 check would then
@@ -425,37 +531,41 @@ func executePolicy(ctx context.Context, es *elasticsearch.Client, policy string,
 	)
 	if err != nil {
 		runlog.From(ctx).Error().Err(err).Str("policy", policy).Msg("Failed to execute enrich policy")
-		return false
+		return causeOutcome(err)
 	}
 	defer res.Body.Close()
 
 	if res.IsError() {
 		body, readErr := esresponse.ReadBounded(res.Body)
 		if esresponse.IsUnsupportedEnrichAPI(res.StatusCode, body, readErr) {
+			// One Rejection feeds both the log text and the cause, so they
+			// cannot drift.
+			rejection := esresponse.NewRejection(
+				"enrich API", "", res.StatusCode, body, readErr,
+				esresponse.MaxPublicMessageBytes)
 			runlog.From(ctx).Warn().
 				Str("policy", policy).
 				Int("status_code", res.StatusCode).
-				Str("es_error", esresponse.NewRejection(
-					"enrich API", "", res.StatusCode, body, readErr,
-					esresponse.MaxPublicMessageBytes).Error()).
+				Str("es_error", rejection.Error()).
 				Msg("Enrich execute endpoint returned a generic 404; check proxy or routing for /_enrich/policy/<name>/_execute and confirm this URL matches the backend used by Dev Tools")
-			return false
+			return policyOutcome{status: StatusUnsupported, cause: rejection}
 		}
+		rejection := esresponse.NewRejection(
+			"enrich policy", policy, res.StatusCode, body, readErr,
+			esresponse.MaxPublicMessageBytes)
 		runlog.From(ctx).Error().
 			Str("policy", policy).
 			Int("status_code", res.StatusCode).
-			Str("es_error", esresponse.NewRejection(
-				"enrich policy", policy, res.StatusCode, body, readErr,
-				esresponse.MaxPublicMessageBytes).Error()).
+			Str("es_error", rejection.Error()).
 			Float64("time_taken", cfg.Now().Sub(startTime).Seconds()).
 			Msg("Enrich policy execution failed")
-		return false
+		return causeOutcome(rejection)
 	}
 
 	var kickoff executeResponse
 	if err := json.NewDecoder(res.Body).Decode(&kickoff); err != nil {
 		runlog.From(ctx).Error().Err(err).Str("policy", policy).Msg("Unable to parse enrich policy execution response")
-		return false
+		return causeOutcome(err)
 	}
 
 	// Synchronous completion — small policy or ES returned immediately.
@@ -475,13 +585,14 @@ func executePolicy(ctx context.Context, es *elasticsearch.Client, policy string,
 	for pollCount := 1; ; pollCount++ {
 		if err := cfg.Sleep(ctx, progress.PollInterval(pollCount)); err != nil {
 			runlog.From(ctx).Warn().Err(err).Str("policy", policy).Msg("Context cancelled while polling enrich task")
-			return false
+			// The Sleep error was only logged before; it is now the cause.
+			return policyOutcome{status: StatusCancelled, cause: err}
 		}
 
 		taskRes, err := es.Tasks.Get(taskID, es.Tasks.Get.WithContext(ctx))
 		if err != nil {
 			runlog.From(ctx).Error().Err(err).Str("policy", policy).Str("task", taskID).Msg("Failed to poll enrich policy task")
-			return false
+			return causeOutcome(err)
 		}
 
 		// 404 means ES has already removed the task record. On 9.3.1 an async
@@ -525,19 +636,20 @@ func executePolicy(ctx context.Context, es *elasticsearch.Client, policy string,
 				warn.Msg("Enrich policy task poll failed; retrying")
 				continue
 			}
+			rejection := esresponse.NewRejection(
+				"enrich task", taskID, taskRes.StatusCode, body, readErr,
+				esresponse.MaxPublicMessageBytes)
 			event := runlog.From(ctx).Error().
 				Str("policy", policy).
 				Str("task", taskID).
 				Int("status_code", taskRes.StatusCode).
-				Str("es_error", esresponse.NewRejection(
-					"enrich task", taskID, taskRes.StatusCode, body, readErr,
-					esresponse.MaxPublicMessageBytes).Error())
+				Str("es_error", rejection.Error())
 			if retryable {
 				event = event.Int("attempt", failures)
 			}
 			event = withBodyErrors(event, readErr, closeErr)
 			event.Msg("Enrich policy task poll returned an error")
-			return false
+			return causeOutcome(rejection)
 		}
 
 		var task taskGetResponse
@@ -545,7 +657,7 @@ func executePolicy(ctx context.Context, es *elasticsearch.Client, policy string,
 		taskRes.Body.Close()
 		if decodeErr != nil {
 			runlog.From(ctx).Error().Err(decodeErr).Str("policy", policy).Str("task", taskID).Msg("Unable to parse enrich policy task response")
-			return false
+			return causeOutcome(decodeErr)
 		}
 		// A decoded task document ends the failure streak: the budget caps
 		// consecutive transient failures, not total polls.
@@ -554,13 +666,16 @@ func executePolicy(ctx context.Context, es *elasticsearch.Client, policy string,
 		// A task that ended with an error is reported next to completed:true;
 		// without this check it would be logged as a success.
 		if len(task.Error) > 0 && string(task.Error) != "null" {
+			// Decode once: the log text and the cause's retained pairs come from
+			// the same extraction.
+			detail := esresponse.ParseErrorValue(task.Error)
 			runlog.From(ctx).Error().
 				Str("policy", policy).
 				Str("task", taskID).
-				Str("es_error", esresponse.ErrorDetail(task.Error, esresponse.MaxPublicMessageBytes)).
+				Str("es_error", detail.Text(esresponse.MaxPublicMessageBytes)).
 				Float64("time_taken", cfg.Now().Sub(startTime).Seconds()).
 				Msg("Enrich policy execution failed")
-			return false
+			return failOutcome(esresponse.NewDetailFrom("enrich task", taskID, "failed: ", detail))
 		}
 
 		phase, step := "", ""

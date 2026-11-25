@@ -80,7 +80,7 @@ func TestEnrichLogOnlyLinesCarryESError(t *testing.T) {
 		logger, buf := logbuf.New()
 		ctx := runlog.WithLogger(t.Context(), logger)
 
-		if executePolicy(ctx, stub.MustClient(t), "policy-a", fixedEnrichSeams()) {
+		if executePolicy(ctx, stub.MustClient(t), "policy-a", fixedEnrichSeams()).succeeded() {
 			t.Fatal("executePolicy = true, want false")
 		}
 
@@ -108,7 +108,7 @@ func TestEnrichLogOnlyLinesCarryESError(t *testing.T) {
 		logger, buf := logbuf.New()
 		ctx := runlog.WithLogger(t.Context(), logger)
 
-		if executePolicy(ctx, stub.MustClient(t), "policy-a", fixedEnrichSeams()) {
+		if executePolicy(ctx, stub.MustClient(t), "policy-a", fixedEnrichSeams()).succeeded() {
 			t.Fatal("executePolicy = true, want false")
 		}
 
@@ -241,7 +241,7 @@ func TestTaskPollOversizedErrorBodyKeepsStatusOnlyRetry(t *testing.T) {
 	logger, buf := logbuf.New()
 	ctx := runlog.WithLogger(t.Context(), logger)
 
-	if executePolicy(ctx, tr.Client(t), "policy-a", fixedEnrichSeams()) {
+	if executePolicy(ctx, tr.Client(t), "policy-a", fixedEnrichSeams()).succeeded() {
 		t.Fatal("executePolicy = true, want false after the third consecutive 503")
 	}
 
@@ -377,7 +377,7 @@ func TestExecutePolicy404ReadErrorIsAFailureNotUnsupported(t *testing.T) {
 	logger, buf := logbuf.New()
 	ctx := runlog.WithLogger(t.Context(), logger)
 
-	if executePolicy(ctx, tr.Client(t), "policy-a", fixedEnrichSeams()) {
+	if executePolicy(ctx, tr.Client(t), "policy-a", fixedEnrichSeams()).succeeded() {
 		t.Fatal("executePolicy = true, want false")
 	}
 

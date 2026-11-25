@@ -62,7 +62,7 @@ func TestExecutePolicyCancellationStopsPolling(t *testing.T) {
 
 	result := make(chan bool, 1)
 	go func() {
-		result <- executePolicy(ctx, es, "policy-a", cfg)
+		result <- executePolicy(ctx, es, "policy-a", cfg).succeeded()
 	}()
 
 	select {
@@ -431,7 +431,7 @@ func TestExecutePolicyVerifiesTask404(t *testing.T) {
 			logger := zerolog.New(&buf).Level(zerolog.DebugLevel)
 			ctx := runlog.WithLogger(t.Context(), &logger)
 
-			got := executePolicy(ctx, es, tt.policy, fixedEnrichSeams())
+			got := executePolicy(ctx, es, tt.policy, fixedEnrichSeams()).succeeded()
 			if want := tt.want == verified; got != want {
 				t.Fatalf("executePolicy = %v, want %v\nlogs:\n%s", got, want, buf.String())
 			}
@@ -889,7 +889,7 @@ func TestExecutePolicyPollRetries(t *testing.T) {
 				return c.Err()
 			}
 
-			got := executePolicy(ctx, es, "policy-a", cfg)
+			got := executePolicy(ctx, es, "policy-a", cfg).succeeded()
 			if got != tt.want {
 				t.Fatalf("executePolicy = %v, want %v\nlogs:\n%s", got, tt.want, buf.String())
 			}
@@ -1113,7 +1113,7 @@ func TestExecutePolicyExplicitOutcomesSkipAliasCheck(t *testing.T) {
 				logger := zerolog.New(&buf).Level(zerolog.DebugLevel)
 				ctx := runlog.WithLogger(t.Context(), &logger)
 
-				if got := executePolicy(ctx, stub.MustClient(t), "policy-a", fixedEnrichSeams()); got != outcome.want {
+				if got := executePolicy(ctx, stub.MustClient(t), "policy-a", fixedEnrichSeams()).succeeded(); got != outcome.want {
 					t.Fatalf("executePolicy = %v, want %v\nlogs:\n%s", got, outcome.want, buf.String())
 				}
 
@@ -1188,7 +1188,7 @@ func TestExecutePolicyTaskErrorIsRedacted(t *testing.T) {
 			logger, buf := logbuf.New()
 			ctx := runlog.WithLogger(t.Context(), logger)
 
-			if executePolicy(ctx, stub.MustClient(t), "policy-a", fixedEnrichSeams()) {
+			if executePolicy(ctx, stub.MustClient(t), "policy-a", fixedEnrichSeams()).succeeded() {
 				t.Fatal("executePolicy = true, want false")
 			}
 
