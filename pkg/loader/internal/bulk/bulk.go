@@ -423,6 +423,7 @@ func bulkInsert(
 			}
 			if shouldRetryBulkRequest(0, err) && attempt < retryAttempts {
 				nextBackoff := computeExponentialBackoff(attempt, retryBackoffBase, retryBackoffMax)
+				// No notice: a transient retry, not an actionable condition.
 				runlog.From(ctx).Warn().
 					Err(err).
 					Int("attempt", attempt).
@@ -442,6 +443,7 @@ func bulkInsert(
 			_ = res.Body.Close()
 			if shouldRetryBulkRequest(res.StatusCode, nil) && attempt < retryAttempts {
 				nextBackoff := computeExponentialBackoff(attempt, retryBackoffBase, retryBackoffMax)
+				// No notice: a transient retry, not an actionable condition.
 				runlog.From(ctx).Warn().
 					Int("status_code", res.StatusCode).
 					Str("es_error", esresponse.NewRejection(

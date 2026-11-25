@@ -55,6 +55,8 @@ func nextAvailableTimestampedIndexNameWithCheck(ctx context.Context, alias strin
 			return candidate, nil
 		}
 
+		// No notice: advancing past a taken timestamped name is routine, not an
+		// actionable condition.
 		runlog.From(ctx).Warn().
 			Str("alias", alias).
 			Str("index", candidate).

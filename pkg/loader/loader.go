@@ -19,6 +19,7 @@ import (
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/failure"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/indexops"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/managed"
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/observe"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/progress"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/runlog"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/template"
@@ -357,8 +358,23 @@ type Result struct {
 	EnrichOutcomes []EnrichOutcome
 	// Warnings holds, in order, the messages Run routes through its internal
 	// warning helper. Other Warn-level logs, such as the nuke deletion notices and
-	// skipped missing policies, are logged but not listed here.
+	// skipped missing policies, are logged but not listed here. Notices is the
+	// structured, more complete list.
 	Warnings []string
+	// Notices holds one Notice per actionable condition this Run reported, in
+	// the order first reported: every Warnings entry (same Message, in the same
+	// order) plus the conditions Warnings omits, such as a missing enrich
+	// policy, an unsupported enrich API, a failed policy garbage collection,
+	// replicas defaulted after a failed _nodes query and an unresolved pipeline
+	// policy reference; see the NoticeCode values. A condition is listed once
+	// per Run for each (Code, ResourceKind, Name), keeping the first Message,
+	// however many times or places it was detected. Transient retries, the
+	// timestamped-name collision advance, nuke deletion lines, the bulk
+	// failed-items summary and enrich cancellation are not notices; the last
+	// two are covered by DocumentsFailed, BulkFailures and EnrichOutcomes. It
+	// is nil when nothing was reported, and notices reported before a
+	// run-ending error are kept.
+	Notices []Notice
 }
 
 // dataAction is the data action chosen by -add, -flush or -delete. dataActionNone means the run loads no data file.
@@ -500,6 +516,10 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 	// serialize Runs behind a mutex. The logger travels on ctx instead.
 	logger := runlog.Resolve(opts.Logger)
 	ctx = runlog.WithLogger(ctx, &logger)
+	// This Run's notice sink, on the same ctx, replacing any the caller's ctx
+	// carries. Installing calls nothing; every emit happens after the recover
+	// below is active.
+	ctx = withRunSink(ctx, &result)
 
 	url := &opts.URL
 	insecure := &opts.InsecureSkipVerify
@@ -568,9 +588,13 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 		}
 	}()
 
-	warn := func(message string) {
+	// warn appends message to Warnings, logs it and reports it as one notice
+	// with the same Message. Warnings stays byte-identical: the notice goes to
+	// Result.Notices through the sink, never to Warnings a second time.
+	warn := func(code, kind, name, message string) {
 		result.Warnings = append(result.Warnings, message)
 		runlog.From(ctx).Warn().Msg(message)
+		observe.Notify(ctx, observe.Notice{Code: code, Message: message, Kind: kind, Name: name})
 	}
 
 	if (*user != "" || *pass != "") && *apiKey != "" {
@@ -611,17 +635,17 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 		return result, &RunError{Kind: ErrInvalidOptions, Op: "validating replicas", Err: fmt.Errorf("replicas must be 0 or greater")}
 	}
 	if *keepLast > 0 && !*aliasMode {
-		warn("Ignoring -keep-last because -alias is not enabled")
+		warn(observe.CodeKeepLastIgnored, "", "", "Ignoring -keep-last because -alias is not enabled")
 	}
 	if *aliasMode && action == dataActionDelete && !*syncManaged {
 		effectiveSyncManaged = true
-		warn("Alias delete detected without -sync-managed; assuming -sync-managed for this run. Add -sync-managed explicitly on the command line.")
+		warn(observe.CodeSyncManagedAssumed, "", "", "Alias delete detected without -sync-managed; assuming -sync-managed for this run. Add -sync-managed explicitly on the command line.")
 	}
 	if *aliasMode && action == dataActionDelete && *keepLast == 0 {
-		warn("Alias delete detected without -keep-last; no old timestamped indices will be deleted and storage usage can grow over time.")
+		warn(observe.CodeKeepLastMissing, "", "", "Alias delete detected without -keep-last; no old timestamped indices will be deleted and storage usage can grow over time.")
 	}
 	if strings.TrimSpace(*transformsFile) != "" && !effectiveSyncManaged {
-		warn("Ignoring -transforms because -sync-managed is not enabled")
+		warn(observe.CodeTransformsIgnored, "", "", "Ignoring -transforms because -sync-managed is not enabled")
 	}
 	// -nuke with sync but no data action and no -settings/-mappings creates no
 	// index afterwards (see shouldCreateIndex), so the managed-upsert gate
@@ -630,11 +654,11 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 	// comparisons mirror shouldCreateIndex: do not trim. Warn here, before any
 	// cluster request, and keep the reset itself unchanged (decided 2026-11-01).
 	if *nuke && effectiveSyncManaged && action == dataActionNone && *settingsFile == "" && *mappingsFile == "" {
-		target := fmt.Sprintf("index %q", *index)
+		target, targetKind := fmt.Sprintf("index %q", *index), observe.KindIndex
 		if *aliasMode {
-			target = fmt.Sprintf("alias %q's target indices and timestamped generations", *index)
+			target, targetKind = fmt.Sprintf("alias %q's target indices and timestamped generations", *index), observe.KindAlias
 		}
-		warn(fmt.Sprintf(nukeResetWarning, target))
+		warn(observe.CodeNukeResetOnly, targetKind, *index, fmt.Sprintf(nukeResetWarning, target))
 	}
 
 	cfg := elasticsearch.Config{
@@ -773,7 +797,7 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 			}
 			if indexPresent {
 				aliasTargets = []string{*index}
-				warn(fmt.Sprintf("Found concrete index with alias name %q; treating it as the current write target", *index))
+				warn(observe.CodeAliasIsConcreteIndex, observe.KindIndex, *index, fmt.Sprintf("Found concrete index with alias name %q; treating it as the current write target", *index))
 			}
 		}
 		exists = len(aliasTargets) > 0
@@ -806,13 +830,15 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 	if *nuke {
 		if *aliasMode {
 			if len(aliasTargets) > 0 {
+				// No notice: a nuke intent line records a requested cluster change,
+				// not an actionable condition.
 				runlog.From(ctx).Warn().Str("alias", *index).Strs("indices", aliasTargets).Msg("Nuke deleting alias target indices and declared managed resources")
 				if err := aliasops.DeleteIndices(ctx, es, aliasTargets); err != nil {
 					return result, runFailure(err)
 				}
 				aliasTargets = nil
 			} else {
-				warn(fmt.Sprintf("Alias %q does not currently resolve to an index. Nuke will still remove declared managed resources", *index))
+				warn(observe.CodeNukeTargetMissing, observe.KindAlias, *index, fmt.Sprintf("Alias %q does not currently resolve to an index. Nuke will still remove declared managed resources", *index))
 			}
 			generations, err := aliasops.ListTimestampedIndices(ctx, es, *index)
 			if err != nil {
@@ -823,6 +849,8 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 				for _, generation := range generations {
 					names = append(names, generation.Name)
 				}
+				// No notice: a nuke intent line records a requested cluster change,
+				// not an actionable condition.
 				runlog.From(ctx).Warn().Str("alias", *index).Strs("indices", names).Msg("Nuke deleting timestamped indices that match alias pattern")
 				if err := aliasops.DeleteIndices(ctx, es, names); err != nil {
 					return result, runFailure(err)
@@ -831,13 +859,15 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 			exists = false
 		} else {
 			if exists {
+				// No notice: a nuke intent line records a requested cluster change,
+				// not an actionable condition.
 				runlog.From(ctx).Warn().Str("index", *index).Msg("Nuke deleting index and declared managed resources")
 				if err := indexops.Delete(ctx, es, *index); err != nil {
 					return result, runFailure(err)
 				}
 				exists = false
 			} else {
-				warn(fmt.Sprintf("Index %q does not exist. Nuke will still remove declared managed resources", *index))
+				warn(observe.CodeNukeTargetMissing, observe.KindIndex, *index, fmt.Sprintf("Index %q does not exist. Nuke will still remove declared managed resources", *index))
 			}
 		}
 
@@ -864,7 +894,7 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 			if len(aliasTargets) > 0 {
 				runlog.From(ctx).Info().Str("alias", *index).Strs("indices", aliasTargets).Msg("Alias mode delete will roll forward to a new timestamped index")
 			} else {
-				warn(fmt.Sprintf("Alias %q has no indices. Nothing to delete.", *index))
+				warn(observe.CodeDeleteTargetMissing, observe.KindAlias, *index, fmt.Sprintf("Alias %q has no indices. Nothing to delete.", *index))
 			}
 			exists = false
 		} else {
@@ -875,7 +905,7 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 				}
 				exists = false
 			} else {
-				warn(fmt.Sprintf("Index %q does not exist. Nothing to delete.", *index))
+				warn(observe.CodeDeleteTargetMissing, observe.KindIndex, *index, fmt.Sprintf("Index %q does not exist. Nothing to delete.", *index))
 			}
 		}
 
@@ -897,7 +927,7 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 				}
 				exists = true
 			} else {
-				warn(fmt.Sprintf("Alias %q has no indices. Nothing to flush.", *index))
+				warn(observe.CodeFlushTargetMissing, observe.KindAlias, *index, fmt.Sprintf("Alias %q has no indices. Nothing to flush.", *index))
 				exists = false
 			}
 		} else {
@@ -907,7 +937,7 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 					return result, runFailure(err)
 				}
 			} else {
-				warn(fmt.Sprintf("Index %q does not exist. Nothing to flush.", *index))
+				warn(observe.CodeFlushTargetMissing, observe.KindIndex, *index, fmt.Sprintf("Index %q does not exist. Nothing to flush.", *index))
 			}
 		}
 	case dataActionAdd:
@@ -1037,6 +1067,8 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 		})
 
 		if failedTotal > 0 {
+			// No notice: DocumentsFailed and the BulkFailures sample already
+			// report rejected items.
 			runlog.From(ctx).Warn().
 				Int("failed", failedTotal).
 				Msg("Bulk load completed with failed items")
@@ -1112,7 +1144,7 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 			transform.ReportStarted(transformSeams, transformSyncNames)
 		}
 	} else if opts.Transforms.Wait {
-		warn("Ignoring transform wait because no transforms were synced for this run")
+		warn(observe.CodeTransformWaitIgnored, "", "", "Ignoring transform wait because no transforms were synced for this run")
 	}
 
 	return result, nil

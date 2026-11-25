@@ -20,6 +20,7 @@ import (
 
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/config"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/esresponse"
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/observe"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/runlog"
 )
 
@@ -420,12 +421,16 @@ func ClusterReplicaCount(ctx context.Context, es *elasticsearch.Client) int {
 	}
 	res, err := es.Nodes.Info()
 	if err != nil {
-		runlog.From(ctx).Warn().Err(err).Msg("Could not query cluster nodes; defaulting to 0 replicas")
+		const queryFailed = "Could not query cluster nodes; defaulting to 0 replicas"
+		runlog.From(ctx).Warn().Err(err).Msg(queryFailed)
+		notifyReplicasDefaulted(ctx, queryFailed)
 		return 0
 	}
 	defer res.Body.Close()
 	if res.IsError() {
-		runlog.From(ctx).Warn().Int("status_code", res.StatusCode).Msg("Cluster nodes query failed; defaulting to 0 replicas")
+		const statusFailed = "Cluster nodes query failed; defaulting to 0 replicas"
+		runlog.From(ctx).Warn().Int("status_code", res.StatusCode).Msg(statusFailed)
+		notifyReplicasDefaulted(ctx, statusFailed)
 		return 0
 	}
 
@@ -433,7 +438,9 @@ func ClusterReplicaCount(ctx context.Context, es *elasticsearch.Client) int {
 		Nodes map[string]json.RawMessage `json:"nodes"`
 	}
 	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
-		runlog.From(ctx).Warn().Err(err).Msg("Could not parse cluster nodes response; defaulting to 0 replicas")
+		const decodeFailed = "Could not parse cluster nodes response; defaulting to 0 replicas"
+		runlog.From(ctx).Warn().Err(err).Msg(decodeFailed)
+		notifyReplicasDefaulted(ctx, decodeFailed)
 		return 0
 	}
 
@@ -441,6 +448,13 @@ func ClusterReplicaCount(ctx context.Context, es *elasticsearch.Client) int {
 		return 1
 	}
 	return 0
+}
+
+// notifyReplicasDefaulted reports the one replicas_defaulted condition from
+// whichever _nodes failure path ClusterReplicaCount took; message is that
+// path's fixed log message, never the error.
+func notifyReplicasDefaulted(ctx context.Context, message string) {
+	observe.Notify(ctx, observe.Notice{Code: observe.CodeReplicasDefaulted, Message: message})
 }
 
 // FindIndicesUsingDefaultPipeline lists, sorted, every index whose
@@ -510,6 +524,8 @@ func ClearDefaultPipeline(ctx context.Context, es *elasticsearch.Client, indices
 		}
 		res.Body.Close()
 
+		// No notice: an acknowledged settings change made for nuke cleanup, a
+		// requested cluster change rather than an actionable condition.
 		runlog.From(ctx).Warn().Str("index", index).Msg("Cleared index.default_pipeline to allow nuke cleanup")
 	}
 	return nil

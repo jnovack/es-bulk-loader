@@ -320,6 +320,7 @@ func Wait(ctx context.Context, get Getter, id string, cfg WaitConfig) (Stats, er
 		// A valid poll cleared lastFailure above, so a non-nil value here is
 		// this poll's retried failure.
 		if lastFailure != nil {
+			// No notice: a transient retry, not an actionable condition.
 			retry := runlog.From(ctx).Warn().
 				Str("transform", id).
 				Int("attempt", poll)

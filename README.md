@@ -289,6 +289,70 @@ itself failed (`Run` then returns the error). Build and compare
 `BulkItemFailure` with keyed fields. The failed-item log lines are unchanged:
 they still log the raw `_index` and `_id`.
 
+### Notices
+
+`Result.Notices []Notice` lists every actionable condition a Run reported,
+so a caller running with `zerolog.Nop()` sees what would otherwise be only a
+Warn log line. It holds every `Result.Warnings` entry, with the same
+`Message` in the same order, plus conditions `Warnings` omits.
+`Result.Warnings` itself is unchanged.
+
+```go
+for _, n := range result.Notices {
+    switch n.Code {
+    case loaderpkg.NoticeEnrichAPIUnsupported:
+        log.Printf("enrich API not served at this URL: %s", n.Message)
+    case loaderpkg.NoticeEnrichPolicyMissing:
+        log.Printf("requested %s %q is missing", n.ResourceKind, n.Name)
+    default:
+        log.Printf("%s: %s", n.Code, n.Message)
+    }
+}
+```
+
+| Field | Shape |
+| --- | --- |
+| `Code NoticeCode` | The condition; one of the codes below. Compare against the constants, never against `Message`. |
+| `Message string` | Human-readable text, not a contract. For a `Warnings` condition it equals that entry; otherwise it is the fixed text of the loader's log line. It never holds an Elasticsearch response or error. |
+| `ResourceKind ResourceKind` | `index` (`ResourceKindIndex`), `alias` (`ResourceKindAlias`), `pipeline` (`ResourceKindPipeline`), `policy` (`ResourceKindPolicy`) or `transform` (`ResourceKindTransform`); empty when the condition names no single resource. |
+| `Name string` | The resource's name, or empty. Sanitized single-line UTF-8 with recognizable credentials redacted, at most 2,048 bytes (a longer name ends with the `[truncated]` marker). |
+
+| Code | Constant | Kind and Name | Meaning |
+| --- | --- | --- | --- |
+| `keep_last_ignored` | `NoticeKeepLastIgnored` | none | `KeepLast` was set without `AliasMode` and is ignored. |
+| `sync_managed_assumed` | `NoticeSyncManagedAssumed` | none | An alias `-delete` without `SyncManaged` runs as if it were set. |
+| `keep_last_missing` | `NoticeKeepLastMissing` | none | An alias `-delete` without `KeepLast` deletes no old generations; storage can grow. |
+| `transforms_ignored` | `NoticeTransformsIgnored` | none | `TransformsFile` was set without `SyncManaged` and is ignored. |
+| `nuke_reset_only` | `NoticeNukeResetOnly` | `alias` in `AliasMode`, else `index`; `Index` | `Nuke` with `SyncManaged` and no data action, settings or mappings deletes and recreates nothing. |
+| `alias_is_concrete_index` | `NoticeAliasIsConcreteIndex` | `index`; `Index` | In `AliasMode` a concrete index has the alias name and is used as the write target. |
+| `nuke_target_missing` | `NoticeNukeTargetMissing` | `alias` or `index`; `Index` | The nuke target resolves to no index or does not exist; declared managed resources are still deleted. |
+| `delete_target_missing` | `NoticeDeleteTargetMissing` | `alias` or `index`; `Index` | The `-delete` target has no indices or does not exist; nothing was deleted. |
+| `flush_target_missing` | `NoticeFlushTargetMissing` | `alias` or `index`; `Index` | The `-flush` target has no indices or does not exist; nothing was flushed. |
+| `transform_wait_ignored` | `NoticeTransformWaitIgnored` | none | `Transforms.Wait` was set but no transforms were synced. |
+| `enrich_policy_missing` | `NoticeEnrichPolicyMissing` | `policy`; the requested name | A requested policy is absent from a cluster that has policies; it is skipped (outcome `missing`). |
+| `enrich_no_policies` | `NoticeEnrichNoPolicies` | none | Enrich was requested but the cluster has no enrich policies. |
+| `enrich_no_match` | `NoticeEnrichNoMatch` | none | No requested policy exists on the cluster; nothing was executed. |
+| `enrich_api_unsupported` | `NoticeEnrichAPIUnsupported` | none | An enrich endpoint (policy list, create, delete or execute) answered a generic 404, so the enrich API is not served at this URL. Create and delete then skip every policy without an error. One notice per Run however many requests detected it; an unsupported execute also gives that policy the `unsupported` outcome. |
+| `policy_gc_failed` | `NoticePolicyGCFailed` | `policy`; the policy | Garbage collection could not delete an unreferenced managed policy version (transport failure or a non-404 rejection); the run continues. |
+| `replicas_defaulted` | `NoticeReplicasDefaulted` | none | The `_nodes` query failed (transport, HTTP status or undecodable body), so a created index got 0 replicas. Never reported when `Options.Replicas` is set. |
+| `pipeline_policy_unresolved` | `NoticePipelinePolicyUnresolved` | `policy`; the referenced name | A pipeline references an enrich policy that is neither declared nor on the cluster under its exact or managed name; the reference is left as written. |
+
+A condition is listed once per Run for each `(Code, ResourceKind, Name)`,
+compared after `Name` is sanitized: the first occurrence and its `Message`
+are kept, in the order first reported. The de-duplication state belongs to
+one Run, so separate or concurrent Runs never share it. `Notices` is nil when
+nothing was reported, and notices reported before a run-ending error are kept
+in the returned `Result`, even when the bulk fields stay zero.
+
+These Warn log lines are deliberately not notices: transient retries (bulk
+request, enrich task poll, enrich policy create while its source index is not
+yet visible, transform `_stats`), the timestamped index name advancing past a
+taken name, the nuke deletion lines (including the referencing-pipeline delete
+and the `index.default_pipeline` clear), `Bulk load completed with failed
+items` (see `DocumentsFailed` and `BulkFailures`) and enrich cancellation (see
+the `cancelled` outcome). A terminal rejection is `Run`'s error, not a notice.
+Build and compare `Notice` with keyed fields.
+
 Full lifecycle run:
 
 ```go
@@ -427,7 +491,7 @@ Delivery contract:
   transport errors, and the third consecutive one fails the policy (`Err`
   set, the Run continues). A decoded task poll resets that count. A task 404
   after retries is still verified through the backing alias. Retries log a
-  Warn and do not add to `Result.Warnings`. See
+  Warn and add nothing to `Result.Warnings` or `Result.Notices`. See
   [Waiting for transforms](#waiting-for-transforms).
 
 ### Logging levels

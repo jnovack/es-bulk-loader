@@ -1,11 +1,13 @@
 package loader
 
 import (
+	"context"
 	"errors"
 
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/bulk"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/enrich"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/esresponse"
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/observe"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/progress"
 )
 
@@ -303,4 +305,166 @@ func bulkFailuresFrom(sample []bulk.ItemFailure) []BulkItemFailure {
 		out[i] = BulkItemFailure{Index: f.Index, ID: f.ID, Action: f.Action, Status: f.Status, Type: f.Type, Reason: f.Reason}
 	}
 	return out
+}
+
+// ResourceKind is the kind of cluster resource a Notice names. The values are
+// the strings "index", "alias", "pipeline", "policy" and "transform"; a Notice
+// that names no single resource has an empty ResourceKind.
+type ResourceKind string
+
+// The ResourceKind values.
+const (
+	// ResourceKindIndex ("index"): a concrete index.
+	ResourceKindIndex = ResourceKind(observe.KindIndex)
+	// ResourceKindAlias ("alias"): an alias, the logical name in AliasMode.
+	ResourceKindAlias = ResourceKind(observe.KindAlias)
+	// ResourceKindPipeline ("pipeline"): an ingest pipeline.
+	ResourceKindPipeline = ResourceKind(observe.KindPipeline)
+	// ResourceKindPolicy ("policy"): an enrich policy.
+	ResourceKindPolicy = ResourceKind(observe.KindPolicy)
+	// ResourceKindTransform ("transform"): a transform.
+	ResourceKindTransform = ResourceKind(observe.KindTransform)
+)
+
+// NoticeCode identifies the condition a Notice reports. Each value is a
+// stable snake_case string, written out on its constant; compare against the
+// constants, never against Message.
+type NoticeCode string
+
+// The NoticeCode values. The first ten are the conditions Run also reports in
+// Result.Warnings; the rest are reported only as notices.
+const (
+	// NoticeKeepLastIgnored ("keep_last_ignored"): KeepLast was set without
+	// AliasMode and is ignored.
+	NoticeKeepLastIgnored = NoticeCode(observe.CodeKeepLastIgnored)
+	// NoticeSyncManagedAssumed ("sync_managed_assumed"): an alias -delete
+	// without SyncManaged runs as if SyncManaged were set.
+	NoticeSyncManagedAssumed = NoticeCode(observe.CodeSyncManagedAssumed)
+	// NoticeKeepLastMissing ("keep_last_missing"): an alias -delete without
+	// KeepLast deletes no old generations, so storage can grow.
+	NoticeKeepLastMissing = NoticeCode(observe.CodeKeepLastMissing)
+	// NoticeTransformsIgnored ("transforms_ignored"): TransformsFile was set
+	// without SyncManaged and is ignored.
+	NoticeTransformsIgnored = NoticeCode(observe.CodeTransformsIgnored)
+	// NoticeNukeResetOnly ("nuke_reset_only"): Nuke with SyncManaged and no
+	// data action, SettingsFile or MappingsFile deletes and recreates nothing.
+	// ResourceKind is "alias" in AliasMode, otherwise "index"; Name is Index.
+	NoticeNukeResetOnly = NoticeCode(observe.CodeNukeResetOnly)
+	// NoticeAliasIsConcreteIndex ("alias_is_concrete_index"): in AliasMode a
+	// concrete index has the alias name and is treated as the write target.
+	// ResourceKind "index", Name is Index.
+	NoticeAliasIsConcreteIndex = NoticeCode(observe.CodeAliasIsConcreteIndex)
+	// NoticeNukeTargetMissing ("nuke_target_missing"): the Nuke target alias
+	// resolves to no index, or the target index does not exist; the declared
+	// managed resources are still deleted. ResourceKind "alias" or "index",
+	// Name is Index.
+	NoticeNukeTargetMissing = NoticeCode(observe.CodeNukeTargetMissing)
+	// NoticeDeleteTargetMissing ("delete_target_missing"): the -delete target
+	// alias has no indices, or the target index does not exist, so nothing was
+	// deleted. ResourceKind "alias" or "index", Name is Index.
+	NoticeDeleteTargetMissing = NoticeCode(observe.CodeDeleteTargetMissing)
+	// NoticeFlushTargetMissing ("flush_target_missing"): the -flush target
+	// alias has no indices, or the target index does not exist, so nothing was
+	// flushed. ResourceKind "alias" or "index", Name is Index.
+	NoticeFlushTargetMissing = NoticeCode(observe.CodeFlushTargetMissing)
+	// NoticeTransformWaitIgnored ("transform_wait_ignored"):
+	// Transforms.Wait was set but no transforms were synced, so nothing was
+	// awaited.
+	NoticeTransformWaitIgnored = NoticeCode(observe.CodeTransformWaitIgnored)
+	// NoticeEnrichPolicyMissing ("enrich_policy_missing"): a requested enrich
+	// policy is absent from a cluster that has policies and was skipped (its
+	// EnrichOutcome is "missing"). ResourceKind "policy", Name is the
+	// requested name.
+	NoticeEnrichPolicyMissing = NoticeCode(observe.CodeEnrichPolicyMissing)
+	// NoticeEnrichNoPolicies ("enrich_no_policies"): enrich was requested but
+	// the cluster has no enrich policies, so nothing was executed.
+	NoticeEnrichNoPolicies = NoticeCode(observe.CodeEnrichNoPolicies)
+	// NoticeEnrichNoMatch ("enrich_no_match"): no requested enrich policy
+	// exists on the cluster, so nothing was executed.
+	NoticeEnrichNoMatch = NoticeCode(observe.CodeEnrichNoMatch)
+	// NoticeEnrichAPIUnsupported ("enrich_api_unsupported"): an enrich
+	// endpoint (policy list, create, delete or execute) answered with a
+	// generic 404, so the enrich API is not served at this URL. Policy create
+	// and delete are then skipped without an error, and an unsupported
+	// listing skips enrich resolution and execution. Reported once per Run
+	// with no ResourceKind or Name, however many requests detected it; a
+	// policy whose execute was unsupported also has the "unsupported"
+	// EnrichOutcome.
+	NoticeEnrichAPIUnsupported = NoticeCode(observe.CodeEnrichAPIUnsupported)
+	// NoticePolicyGCFailed ("policy_gc_failed"): garbage collection could not
+	// delete an unreferenced managed policy version (a transport failure or
+	// an HTTP rejection other than 404); the run continues and the version
+	// remains. ResourceKind "policy", Name is that policy.
+	NoticePolicyGCFailed = NoticeCode(observe.CodePolicyGCFailed)
+	// NoticeReplicasDefaulted ("replicas_defaulted"): the cluster _nodes query
+	// failed (transport, HTTP status or an undecodable response), so an index
+	// this run created got number_of_replicas 0. Not reported when
+	// Options.Replicas is set.
+	NoticeReplicasDefaulted = NoticeCode(observe.CodeReplicasDefaulted)
+	// NoticePipelinePolicyUnresolved ("pipeline_policy_unresolved"): a
+	// pipeline references an enrich policy that is neither declared nor on
+	// the cluster under its exact or managed name, so the reference is left
+	// as written. ResourceKind "policy", Name is the referenced name.
+	NoticePipelinePolicyUnresolved = NoticeCode(observe.CodePipelinePolicyUnresolved)
+)
+
+// Notice is one actionable condition a Run reported, in Result.Notices. Build
+// and compare it with keyed fields; fields may be added in minor releases.
+type Notice struct {
+	// Code identifies the condition; see the NoticeCode values.
+	Code NoticeCode
+	// Message is human-readable text, not a contract. For the conditions also
+	// in Result.Warnings it equals that entry; otherwise it is the fixed text
+	// of the loader's log line for the condition. It never holds an
+	// Elasticsearch response or error.
+	Message string
+	// ResourceKind is the kind of resource Name names, or "" when the
+	// condition names no single resource.
+	ResourceKind ResourceKind
+	// Name is the resource's name, or "". It is sanitized single-line UTF-8
+	// with recognizable credentials redacted, at most 2,048 bytes (a longer
+	// name ends with " [truncated]").
+	Name string
+}
+
+// noticeKey is the de-duplication tuple of a public Notice: Message is left
+// out, so reworded text can never report one condition twice.
+type noticeKey struct {
+	code NoticeCode
+	kind ResourceKind
+	name string
+}
+
+// noticeFrom is the one adapter from an internal notice to the public Notice.
+// It sanitizes and bounds Name once, before the value is de-duplicated or
+// stored, so a raw Elasticsearch name never reaches Result.Notices.
+func noticeFrom(n observe.Notice) Notice {
+	return Notice{
+		Code:         NoticeCode(n.Code),
+		Message:      n.Message,
+		ResourceKind: ResourceKind(n.Kind),
+		Name:         esresponse.SanitizeText(n.Name, esresponse.MaxPublicMessageBytes),
+	}
+}
+
+// withRunSink installs this Run's observation sink on ctx, replacing any sink
+// ctx already carries, and returns the child. Its OnNotice appends each
+// notice to result.Notices once per (Code, ResourceKind, Name), keeping the
+// first occurrence and its order; the seen set lives in this closure, so it
+// belongs to one Run and never to the package or the caller's context.
+// Installing invokes no callback. OnEvent stays nil until lifecycle events
+// ship.
+func withRunSink(ctx context.Context, result *Result) context.Context {
+	seen := make(map[noticeKey]struct{})
+	return observe.WithSink(ctx, &observe.Sink{
+		OnNotice: func(n observe.Notice) {
+			notice := noticeFrom(n)
+			key := noticeKey{code: notice.Code, kind: notice.ResourceKind, name: notice.Name}
+			if _, dup := seen[key]; dup {
+				return
+			}
+			seen[key] = struct{}{}
+			result.Notices = append(result.Notices, notice)
+		},
+	})
 }

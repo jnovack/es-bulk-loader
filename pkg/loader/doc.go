@@ -50,7 +50,10 @@
 // Concurrency and callbacks. Options.Progress is a plain function field, called
 // synchronously on Run's goroutine and never concurrently. A resource that causes
 // a run-ending error gets no Final event, because Run's error is the only failure
-// signal. See ProgressEvent and docs/decisions/0004.
+// signal. See ProgressEvent and docs/decisions/0004. Result.Notices is filled
+// the same way: each internal step reports an actionable condition inline on
+// Run's goroutine, through a per-Run sink carried on the context (never package
+// state), so concurrent Runs keep separate notices and de-duplication state.
 //
 // Logging. Run resolves its logger from Options.Logger and carries it on the
 // context under a private key, not zerolog's WithContext, which silently drops a
@@ -91,5 +94,13 @@
 //     the enrich task error (es_error), bulk item error_type/error_reason and the
 //     transform failure reason (each at most 2,048 bytes; the transform error keeps its
 //     outer context). The same free-text limitation applies, and other fields decoded
-//     from successful responses are not covered.
+//     from successful responses are not covered,
+//   - an actionable condition that does not end the run (an ignored option, a missing
+//     target, a missing enrich policy, an unsupported enrich API, a failed policy
+//     garbage collection, defaulted replicas, an unresolved pipeline policy reference)
+//     is listed once per Run in Result.Notices (see Notice and the NoticeCode values),
+//     including the Result.Warnings entries with the same Message; notices reported
+//     before a run-ending error are kept. Transient retries, the timestamped-name
+//     collision advance, nuke deletion lines, the bulk failed-items summary and enrich
+//     cancellation are not notices.
 package loader

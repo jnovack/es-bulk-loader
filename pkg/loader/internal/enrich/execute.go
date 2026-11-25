@@ -17,9 +17,20 @@ import (
 
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/aliasops"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/esresponse"
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/observe"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/progress"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/runlog"
 )
+
+// UnsupportedPolicyAPIMessage is the Warn log message, and the
+// enrich_api_unsupported notice Message, when a policy list, create or delete
+// request gets a generic 404. One constant keeps the three sites (here and in
+// package managed) and their notices identical.
+const UnsupportedPolicyAPIMessage = "Enrich policy endpoint returned a generic 404; check proxy or routing for /_enrich/policy and confirm this URL matches the backend used by Dev Tools"
+
+// unsupportedExecuteAPIMessage is the execute request's counterpart of
+// UnsupportedPolicyAPIMessage.
+const unsupportedExecuteAPIMessage = "Enrich execute endpoint returned a generic 404; check proxy or routing for /_enrich/policy/<name>/_execute and confirm this URL matches the backend used by Dev Tools"
 
 // Selection is the requested enrich policy selection after the public
 // EnrichOptions precedence has been applied by package loader. Enabled turns
@@ -200,7 +211,8 @@ func ListPolicies(ctx context.Context, es *elasticsearch.Client) ([]string, bool
 				Str("es_error", esresponse.NewRejection(
 					"enrich API", "", res.StatusCode, body, readErr,
 					esresponse.MaxPublicMessageBytes).Error()).
-				Msg("Enrich policy endpoint returned a generic 404; check proxy or routing for /_enrich/policy and confirm this URL matches the backend used by Dev Tools")
+				Msg(UnsupportedPolicyAPIMessage)
+			observe.Notify(ctx, observe.Notice{Code: observe.CodeEnrichAPIUnsupported, Message: UnsupportedPolicyAPIMessage})
 			return nil, false, nil
 		}
 		return nil, false, runlog.Fail(runlog.FailureEvent(ctx).
@@ -288,7 +300,9 @@ func Execute(ctx context.Context, es *elasticsearch.Client, enrichSelection *Sel
 		return summary, nil
 	}
 	if len(availablePolicies) == 0 {
-		runlog.From(ctx).Warn().Msg("No enrich policies found; skipping enrich execution")
+		const noPolicies = "No enrich policies found; skipping enrich execution"
+		runlog.From(ctx).Warn().Msg(noPolicies)
+		observe.Notify(ctx, observe.Notice{Code: observe.CodeEnrichNoPolicies, Message: noPolicies})
 		return summary, nil
 	}
 
@@ -296,12 +310,16 @@ func Execute(ctx context.Context, es *elasticsearch.Client, enrichSelection *Sel
 	summary.Selected = append(summary.Selected, targets...)
 	summary.Missing = append(summary.Missing, missing...)
 	for _, policy := range missing {
-		runlog.From(ctx).Warn().Str("policy", policy).Msg("Enrich policy not found; skipping")
+		const notFound = "Enrich policy not found; skipping"
+		runlog.From(ctx).Warn().Str("policy", policy).Msg(notFound)
+		observe.Notify(ctx, observe.Notice{Code: observe.CodeEnrichPolicyMissing, Message: notFound, Kind: observe.KindPolicy, Name: policy})
 	}
 
 	if len(targets) == 0 {
 		summary.Outcomes = appendMissing(summary.Outcomes, missing)
-		runlog.From(ctx).Warn().Msg("No enrich policies matched the request")
+		const noMatch = "No enrich policies matched the request"
+		runlog.From(ctx).Warn().Msg(noMatch)
+		observe.Notify(ctx, observe.Notice{Code: observe.CodeEnrichNoMatch, Message: noMatch})
 		return summary, nil
 	}
 
@@ -547,7 +565,11 @@ func executePolicy(ctx context.Context, es *elasticsearch.Client, policy string,
 				Str("policy", policy).
 				Int("status_code", res.StatusCode).
 				Str("es_error", rejection.Error()).
-				Msg("Enrich execute endpoint returned a generic 404; check proxy or routing for /_enrich/policy/<name>/_execute and confirm this URL matches the backend used by Dev Tools")
+				Msg(unsupportedExecuteAPIMessage)
+			// No kind or name: one notice per Run reports the unsupported API
+			// (de-duplicated across every detecting request); the per-policy
+			// fact is this policy's StatusUnsupported outcome.
+			observe.Notify(ctx, observe.Notice{Code: observe.CodeEnrichAPIUnsupported, Message: unsupportedExecuteAPIMessage})
 			return policyOutcome{status: StatusUnsupported, cause: rejection}
 		}
 		rejection := esresponse.NewRejection(
@@ -584,6 +606,7 @@ func executePolicy(ctx context.Context, es *elasticsearch.Client, policy string,
 	failures := 0
 	for pollCount := 1; ; pollCount++ {
 		if err := cfg.Sleep(ctx, progress.PollInterval(pollCount)); err != nil {
+			// No notice: cancellation is this policy's StatusCancelled outcome.
 			runlog.From(ctx).Warn().Err(err).Str("policy", policy).Msg("Context cancelled while polling enrich task")
 			// The Sleep error was only logged before; it is now the cause.
 			return policyOutcome{status: StatusCancelled, cause: err}
@@ -624,6 +647,7 @@ func executePolicy(ctx context.Context, es *elasticsearch.Client, policy string,
 				failures++
 			}
 			if retryable && failures < maxConsecutivePollFailures {
+				// No notice: a transient retry, not an actionable condition.
 				warn := runlog.From(ctx).Warn().
 					Str("policy", policy).
 					Str("task", taskID).

@@ -24,6 +24,7 @@ import (
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/enrich"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/esresponse"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/indexops"
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/observe"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/runlog"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/transform"
 )
@@ -184,7 +185,9 @@ func ResolvePipelinePolicyFallbacks(ctx context.Context, es *elasticsearch.Clien
 			}
 		}
 		if len(matches) == 0 {
-			runlog.From(ctx).Warn().Str("logical_policy", policy).Msg("Pipeline references enrich policy that does not exist as exact or managed policy name")
+			const unresolved = "Pipeline references enrich policy that does not exist as exact or managed policy name"
+			runlog.From(ctx).Warn().Str("logical_policy", policy).Msg(unresolved)
+			observe.Notify(ctx, observe.Notice{Code: observe.CodePipelinePolicyUnresolved, Message: unresolved, Kind: observe.KindPolicy, Name: policy})
 			continue
 		}
 
@@ -438,16 +441,20 @@ func deletePolicyBestEffort(ctx context.Context, es *elasticsearch.Client, polic
 		}),
 	)
 	if err != nil {
-		runlog.From(ctx).Warn().Err(err).Str("policy", policy).Msg("Managed policy GC failed while deleting policy")
+		const transportFailed = "Managed policy GC failed while deleting policy"
+		runlog.From(ctx).Warn().Err(err).Str("policy", policy).Msg(transportFailed)
+		observe.Notify(ctx, observe.Notice{Code: observe.CodePolicyGCFailed, Message: transportFailed, Kind: observe.KindPolicy, Name: policy})
 		return
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode == http.StatusNotFound {
+		// No notice: an already-absent policy is the outcome GC wanted.
 		runlog.From(ctx).Trace().Str("policy", policy).Msg("Managed policy GC found policy already deleted")
 		return
 	}
 	if res.IsError() {
+		const rejected = "Managed policy GC could not delete policy"
 		body, readErr := esresponse.ReadBounded(res.Body)
 		runlog.From(ctx).Warn().
 			Str("policy", policy).
@@ -455,7 +462,8 @@ func deletePolicyBestEffort(ctx context.Context, es *elasticsearch.Client, polic
 			Str("es_error", esresponse.NewRejection(
 				"enrich policy", policy, res.StatusCode, body, readErr,
 				esresponse.MaxPublicMessageBytes).Error()).
-			Msg("Managed policy GC could not delete policy")
+			Msg(rejected)
+		observe.Notify(ctx, observe.Notice{Code: observe.CodePolicyGCFailed, Message: rejected, Kind: observe.KindPolicy, Name: policy})
 		return
 	}
 
@@ -563,10 +571,12 @@ func CreatePolicies(ctx context.Context, es *elasticsearch.Client, definitions c
 					Str("es_error", esresponse.NewRejection(
 						"enrich API", "", res.StatusCode, body, readErr,
 						esresponse.MaxPublicMessageBytes).Error()).
-					Msg("Enrich policy endpoint returned a generic 404; check proxy or routing for /_enrich/policy and confirm this URL matches the backend used by Dev Tools")
+					Msg(enrich.UnsupportedPolicyAPIMessage)
+				observe.Notify(ctx, observe.Notice{Code: observe.CodeEnrichAPIUnsupported, Message: enrich.UnsupportedPolicyAPIMessage})
 				return nil
 			}
 			if esresponse.HasErrorType(body, "index_not_found_exception") && attempt < 5 {
+				// No notice: a transient retry, not an actionable condition.
 				runlog.From(ctx).Warn().
 					Str("policy", name).
 					Int("attempt", attempt).
@@ -650,7 +660,8 @@ func deletePolicies(ctx context.Context, es *elasticsearch.Client, names []strin
 						Str("es_error", esresponse.NewRejection(
 							"enrich API", "", res.StatusCode, body, readErr,
 							esresponse.MaxPublicMessageBytes).Error()).
-						Msg("Enrich policy endpoint returned a generic 404; check proxy or routing for /_enrich/policy and confirm this URL matches the backend used by Dev Tools")
+						Msg(enrich.UnsupportedPolicyAPIMessage)
+					observe.Notify(ctx, observe.Notice{Code: observe.CodeEnrichAPIUnsupported, Message: enrich.UnsupportedPolicyAPIMessage})
 					return nil
 				}
 				runlog.From(ctx).Debug().Str("policy", name).Msg("Enrich policy does not exist. Nothing to delete.")
@@ -673,6 +684,8 @@ func deletePolicies(ctx context.Context, es *elasticsearch.Client, names []strin
 								esresponse.MaxPublicMessageBytes))
 					}
 
+					// No notice: a nuke intent line records a requested cluster
+					// change, not an actionable condition.
 					runlog.From(ctx).Warn().
 						Str("policy", name).
 						Strs("pipelines", referencing).
@@ -760,6 +773,8 @@ func deletePipelinesForNuke(ctx context.Context, es *elasticsearch.Client, names
 							esresponse.MaxPublicMessageBytes))
 				}
 
+				// No notice: a nuke intent line records a requested cluster
+				// change, not an actionable condition.
 				runlog.From(ctx).Warn().
 					Str("pipeline", name).
 					Strs("indices", indices).

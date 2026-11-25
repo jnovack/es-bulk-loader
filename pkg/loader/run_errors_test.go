@@ -1979,6 +1979,9 @@ func TestPublicTypeIdentity(t *testing.T) {
 		{EnrichStatus(""), "EnrichStatus"},
 		{EnrichOutcome{}, "EnrichOutcome"},
 		{BulkItemFailure{}, "BulkItemFailure"},
+		{ResourceKind(""), "ResourceKind"},
+		{NoticeCode(""), "NoticeCode"},
+		{Notice{}, "Notice"},
 	}
 	for _, tt := range tests {
 		typ := reflect.TypeOf(tt.value)
