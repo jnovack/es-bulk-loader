@@ -1974,6 +1974,8 @@ func TestPublicTypeIdentity(t *testing.T) {
 		{ProgressEvent{}, "ProgressEvent"},
 		{ProgressStage(""), "ProgressStage"},
 		{TransformOptions{}, "TransformOptions"},
+		{ElasticsearchError{}, "ElasticsearchError"},
+		{ElasticsearchCause{}, "ElasticsearchCause"},
 	}
 	for _, tt := range tests {
 		typ := reflect.TypeOf(tt.value)

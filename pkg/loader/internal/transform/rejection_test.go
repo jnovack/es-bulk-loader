@@ -247,6 +247,13 @@ func TestStatsGetterBoundsErrorBodiesButReadsSuccessInFull(t *testing.T) {
 			if code != 0 || body != nil || !errors.Is(err, boom) || !strings.HasPrefix(err.Error(), "reading _stats response: ") {
 				t.Fatalf("status %d: got (%d, %q, %v), want (0, nil, wrapped read error)", status, code, body, err)
 			}
+			// The documented ElasticsearchError exclusion (README "Error
+			// messages", loader.ElasticsearchError GoDoc): a _stats read failure
+			// carries no rejection, so no structured cause reaches the caller.
+			var rejection *esresponse.Rejection
+			if errors.As(err, &rejection) {
+				t.Fatalf("status %d: read failure carries a rejection %q; the documented exclusion says none", status, rejection.Error())
+			}
 		}
 	})
 }

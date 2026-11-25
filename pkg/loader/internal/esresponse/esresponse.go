@@ -2,7 +2,10 @@
 // and transport errors that more than one owner package needs (bulk, enrich,
 // managed, transform), plus bounded, redacted rejection diagnostics
 // (NewRejection) and failure text decoded from successful responses
-// (ErrorDetail, ShardFailureDetail, SanitizeText, NewDetail). Callers own
+// (ErrorDetail, ShardFailureDetail, SanitizeText, NewDetail, and the
+// pair-retaining ParseErrorValue, ParseShardFailure and NewDetailFrom). A
+// Rejection retains its resource literal, status and sanitized pairs for
+// package loader's public ElasticsearchError projection. Callers own
 // requests, closing, retries, sleeps and deadlines; the package does not log.
 // ReadBounded is its only read, of a caller-supplied body with a fixed bound.
 package esresponse

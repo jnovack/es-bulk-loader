@@ -77,6 +77,12 @@
 //     The mapping-fetch and transform _stats errors cap only that inner text and keep
 //     their longer outer context. Free-text reasons may still hold sensitive prose
 //     redaction cannot recognize,
+//   - errors.As reaches an *ElasticsearchError (resource, name, HTTP status or 0, and up
+//     to four bounded type/reason causes) from every run-ending error that builds such a
+//     rejection cause, including the wrapped mapping-fetch and transform _stats errors and
+//     the flush shard failure; status-only paths, a retryable _stats wait timeout,
+//     body-read failures on those two wrapped paths and a transform's failed state
+//     reported in a 2xx _stats body carry none,
 //   - failure text reported inside successful responses is also sanitized and bounded
 //     at four sites: the flush shard-failure cause (whole message at most 2,048 bytes),
 //     the enrich task error (es_error), bulk item error_type/error_reason and the

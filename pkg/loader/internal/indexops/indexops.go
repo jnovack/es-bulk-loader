@@ -386,9 +386,12 @@ func Flush(ctx context.Context, es *elasticsearch.Client, index string) error {
 	if len(result.Failures) > 0 {
 		// The cause replaces the old raw first_failure log field: it is
 		// sanitized and bounded, and runlog.Fail logs it as the line's error.
-		detail := esresponse.ShardFailureDetail(result.Failures[0], esresponse.MaxPublicMessageBytes)
-		text := fmt.Sprintf("flush had %d shard failures; first: %s", len(result.Failures), detail)
-		cause := esresponse.NewDetail("index", index, text)
+		// NewDetailFrom keeps the first failure's decoded pairs on the cause
+		// (status 0) so loader.ElasticsearchError can expose them; the
+		// message is byte-identical to the former ShardFailureDetail text.
+		detail := esresponse.ParseShardFailure(result.Failures[0])
+		prefix := fmt.Sprintf("flush had %d shard failures; first: ", len(result.Failures))
+		cause := esresponse.NewDetailFrom("index", index, prefix, detail)
 		return runlog.Fail(runlog.FailureEvent(ctx).
 			Str("index", index).
 			Int("shard_failures", len(result.Failures)),

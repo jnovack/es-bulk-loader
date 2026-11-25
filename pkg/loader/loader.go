@@ -136,6 +136,32 @@ func (e *RunError) Is(target error) bool {
 	return errors.Is(e.Kind, target)
 }
 
+// As lets errors.As reach the structured Elasticsearch cause: for a
+// **ElasticsearchError target it sets the target to a new projection of the
+// first Elasticsearch rejection in Err's chain and reports true. Every other
+// target, a nil receiver or a chain without a rejection reports false and
+// leaves the target unchanged, so errors.As keeps unwrapping Err as before.
+//
+// The method exists so the internal rejection type stays unexported; removing
+// it breaks errors.As(err, &esErr) for every caller. It adds a projection, not
+// a replacement chain: Err, Is, Unwrap and Error are unchanged.
+func (e *RunError) As(target any) bool {
+	if e == nil {
+		return false
+	}
+	esTarget, ok := target.(**ElasticsearchError)
+	if !ok || esTarget == nil {
+		return false
+	}
+	// e.Err, never e: errors.As on e would call this method again.
+	esErr, ok := elasticsearchErrorFrom(e.Err)
+	if !ok {
+		return false
+	}
+	*esTarget = esErr
+	return true
+}
+
 // EnrichOptions selects enrich policies for execution. When Policies is
 // non-empty, it enables enrich and takes precedence over All and Raw.
 // Otherwise Enabled must be true; All, or an empty Raw value, selects all

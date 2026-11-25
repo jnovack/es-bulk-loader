@@ -151,6 +151,67 @@ response bodies are still read and decoded in full, and the same free-text
 limitation applies. Other fields decoded from successful responses are not
 covered.
 
+**Structured Elasticsearch cause.** The same rejection is also available as a
+typed value, so a caller running with `zerolog.Nop()` does not have to parse
+the message. `errors.As` reaches a `*loader.ElasticsearchError` from Run's
+error:
+
+```go
+_, err := loader.Run(ctx, opts)
+var esErr *loader.ElasticsearchError
+if errors.As(err, &esErr) {
+    log.Printf("%s %q: HTTP %d", esErr.Resource, esErr.Name, esErr.StatusCode)
+    for _, cause := range esErr.Causes {
+        log.Printf("  %s: %s", cause.Type, cause.Reason)
+    }
+}
+```
+
+| Field | Shape |
+| --- | --- |
+| `Resource string` | The request noun: `pipeline`, `enrich policy`, `enrich policy list request`, `bulk request`, `transform`, `index`, and so on. It names the request, not a resource kind, and is not a closed set. |
+| `Name string` | The sanitized display name, at most 256 bytes (a longer name is cut and ends with the `[truncated]` marker). Empty when the request had no single resource, such as the bulk or a list request. |
+| `StatusCode int` | The HTTP status. `0` means the failure was reported inside a successful (2xx) response. |
+| `Causes []ElasticsearchCause` | Up to four `{Type, Reason}` pairs, in the message's order: `root_cause` entries, the top-level error, then each one's `caused_by` chain. Each field is at most 2,048 bytes of sanitized, single-line UTF-8. |
+
+`esErr.Error()` is the inner rejection text, for example
+`pipeline "p" rejected with HTTP 400: parse_exception: <reason>`. The
+`*RunError` keeps the outer operation context: its message is
+`<Op>: <that text>`, or `<Op>: <wrapper>: <that text>` for the two wrapped
+errors. Op, Kind, message and `errors.Is` results are unchanged.
+`esErr.Unwrap()` returns the body-read error when one ended the read, so
+`errors.Is(err, context.Canceled)` holds through both values. An unreadable,
+oversized, empty, non-JSON or unrecognized body keeps its resource, name and
+status, has no `Causes`, and `Error()` holds the fixed explanation. Every
+string is redacted as described above; each call returns a fresh value, so
+changing its `Causes` affects nothing else.
+
+It is present for every run-ending failure that builds a rejection cause:
+
+- every direct HTTP rejection listed above;
+- the mapping fetch before a bulk insert, which keeps Kind `ErrBulkFailure`
+  and Op `Mapping preflight failed before bulk insert`;
+- a non-retryable transform `_stats` status, which keeps Kind
+  `ErrManagedResource` and Op `Transform wait failed`;
+- the flush shard failure, with `StatusCode` 0 and the first failure's pairs.
+
+It is absent, and `errors.As` returns false, in these cases:
+
+- Status-only paths such as index deletion (`indexops.Delete`), which carry
+  no richer cause.
+- A transform wait timeout whose latest poll failed with a retryable `_stats`
+  status (429, 502, 503 or 504). That rejection survives only as text in the
+  timeout error (`; last poll failed: ...`).
+- A response-body read failure on the mapping fetch or the transform `_stats`
+  poll. These keep their existing read-error chain without a rejection.
+- A transform that reports state `failed` inside a successful `_stats`
+  response. Its sanitized reason survives only as text in the
+  `transform "<id>" failed: <reason>` error.
+- Transport, validation, file and other non-Elasticsearch failures.
+
+Failures that do not end the run, such as a failed enrich policy or a bulk
+item rejection, are not returned as errors.
+
 Full lifecycle run:
 
 ```go
