@@ -1,8 +1,9 @@
 // Package observe carries one Run's notice and lifecycle sink on its context.
 // Package loader installs the sink; managed, enrich, indexops and the other
 // internal owners report an actionable condition (a Notice) through Notify and
-// a cluster change (an Event) through Record, next to their existing log
-// lines, which they never replace.
+// a lifecycle event (an Event: a completed cluster change, or the local
+// "resolved" event) through Record, next to their existing log lines, which
+// they never replace.
 //
 // # Context propagation
 //
@@ -33,7 +34,7 @@
 //
 // # Values
 //
-// The string values of the Code* and Kind* constants are the public contract:
+// The string values of the Code*, Kind* and Action* constants are the public contract:
 // package loader declares a typed twin of each by conversion (for example
 // NoticeEnrichPolicyMissing = NoticeCode(CodeEnrichPolicyMissing)), and a
 // parity test fails when a constant here has no twin. A Notice Message is the

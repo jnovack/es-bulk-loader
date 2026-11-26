@@ -38,7 +38,8 @@ import (
 const observeImportPath = "github.com/jnovack/es-bulk-loader/pkg/loader/internal/observe"
 
 // parityGroup maps internal constants named <internalPrefix><X> to public
-// twins named <publicPrefix><X> of type publicType. Phase 5 adds actions.
+// twins named <publicPrefix><X> of type publicType. The Action group covers
+// the lifecycle actions.
 //
 // tableRow selects how the README must document each constant: false requires
 // both `<value>` and `<PublicName>` somewhere in the README; true requires a
@@ -51,6 +52,7 @@ type parityGroup struct {
 var parityGroups = []parityGroup{
 	{internalPrefix: "Code", publicPrefix: "Notice", publicType: "NoticeCode", tableRow: true},
 	{internalPrefix: "Kind", publicPrefix: "ResourceKind", publicType: "ResourceKind"},
+	{internalPrefix: "Action", publicPrefix: "LifecycleAction", publicType: "LifecycleAction", tableRow: true},
 }
 
 // internalConst is one exported constant of internal/observe.
@@ -431,18 +433,22 @@ func TestCheckREADMEReportsMissingRows(t *testing.T) {
 	internals := []internalConst{
 		{name: "CodeKept", value: "kept", pos: "a:1", group: 0},
 		{name: "KindIndex", value: "index", pos: "a:2", group: 1},
+		{name: "ActionMade", value: "made", pos: "a:3", group: 2},
 	}
+	const actionRow = "\n| `made` | `LifecycleActionMade` | none |"
 	tests := []struct {
 		name, readme string
 		want         string
 	}{
-		{"complete", "x\n| `kept` | `NoticeKept` | none |\n`index` (`ResourceKindIndex`)", ""},
-		{"complete at start", "| `kept` | `NoticeKept` | none |\n`index` (`ResourceKindIndex`)", ""},
-		{"missing code row", "`index` (`ResourceKindIndex`)", "a:1: README has no table row starting | `kept` | `NoticeKept` |"},
-		{"code only in prose", "see `kept` and `NoticeKept`\n`index` (`ResourceKindIndex`)", "a:1: README has no table row"},
-		{"swapped cells", "| `NoticeKept` | `kept` |\n`index` (`ResourceKindIndex`)", "a:1: README has no table row"},
-		{"missing kind name", "| `kept` | `NoticeKept` |\n`index`", "a:2: README lacks `index` and `ResourceKindIndex`"},
-		{"missing kind value", "| `kept` | `NoticeKept` |\n`ResourceKindIndex`", "a:2: README lacks"},
+		{"complete", "x\n| `kept` | `NoticeKept` | none |\n`index` (`ResourceKindIndex`)" + actionRow, ""},
+		{"complete at start", "| `kept` | `NoticeKept` | none |\n`index` (`ResourceKindIndex`)" + actionRow, ""},
+		{"missing code row", "`index` (`ResourceKindIndex`)" + actionRow, "a:1: README has no table row starting | `kept` | `NoticeKept` |"},
+		{"code only in prose", "see `kept` and `NoticeKept`\n`index` (`ResourceKindIndex`)" + actionRow, "a:1: README has no table row"},
+		{"swapped cells", "| `NoticeKept` | `kept` |\n`index` (`ResourceKindIndex`)" + actionRow, "a:1: README has no table row"},
+		{"missing kind name", "| `kept` | `NoticeKept` |\n`index`" + actionRow, "a:2: README lacks `index` and `ResourceKindIndex`"},
+		{"missing kind value", "| `kept` | `NoticeKept` |\n`ResourceKindIndex`" + actionRow, "a:2: README lacks"},
+		{"missing action row", "| `kept` | `NoticeKept` |\n`index` (`ResourceKindIndex`)", "a:3: README has no table row starting | `made` | `LifecycleActionMade` |"},
+		{"action only in prose", "| `kept` | `NoticeKept` |\n`index` (`ResourceKindIndex`)\nsee `made` and `LifecycleActionMade`", "a:3: README has no table row"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -477,6 +483,9 @@ const (
 	Stray = "stray"
 	unexported = "ignored"
 	CodeSwapped = "swapped"
+	ActionKept = "kept"
+	ActionMissing = "missing"
+	ActionWrong = "wrong"
 )
 `)}
 	public := map[string][]byte{"observe.go": []byte(`package loader
@@ -496,6 +505,10 @@ const (
 	NoticeProbe             = NoticeCode("probe")
 	ResourceKindBar ResourceKind = "bar"
 	NoticeAgain             = NoticeCode(observe.CodeKept)
+	// The Action group: a correct twin is silent, a missing one and one of
+	// the wrong public type are reported.
+	LifecycleActionKept  = LifecycleAction(observe.ActionKept)
+	LifecycleActionWrong = NoticeCode(observe.ActionWrong)
 )
 
 // Unrelated public types and non-constant expressions are never classified.
@@ -517,6 +530,8 @@ func f(n int) NoticeCode { return NoticeCode("inside") }
 		`internal/observe/observe.go:10:2: exported constant Stray matches no parity group`,
 		`observe.go:9:2: unsupported constant shape for NoticeOdd`,
 		`parity group Kind* has no internal constants`,
+		`internal constant ActionMissing ("missing") has no public twin LifecycleActionMissing`,
+		`public LifecycleActionWrong is not LifecycleAction(observe.ActionWrong)`,
 		`observe.go:12:2: public NoticeSwapped is not NoticeCode(observe.CodeSwapped)`,
 		`public NoticeProbe of type NoticeCode has no internal source`,
 		`public ResourceKindBar of type ResourceKind has no internal source`,
@@ -527,7 +542,7 @@ func f(n int) NoticeCode { return NoticeCode("inside") }
 			t.Errorf("diagnostics lack %q; got:\n%s", want, got)
 		}
 	}
-	if strings.Contains(got, "CodeKept (") || strings.Contains(got, "unexported") {
+	if strings.Contains(got, "ActionKept") || strings.Contains(got, "LifecycleActionKept") || strings.Contains(got, "CodeKept (") || strings.Contains(got, "unexported") {
 		t.Errorf("a correct twin or an unexported constant was reported:\n%s", got)
 	}
 

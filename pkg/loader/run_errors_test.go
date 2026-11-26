@@ -1982,6 +1982,8 @@ func TestPublicTypeIdentity(t *testing.T) {
 		{ResourceKind(""), "ResourceKind"},
 		{NoticeCode(""), "NoticeCode"},
 		{Notice{}, "Notice"},
+		{LifecycleAction(""), "LifecycleAction"},
+		{LifecycleEvent{}, "LifecycleEvent"},
 	}
 	for _, tt := range tests {
 		typ := reflect.TypeOf(tt.value)

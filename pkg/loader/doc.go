@@ -54,6 +54,10 @@
 // the same way: each internal step reports an actionable condition inline on
 // Run's goroutine, through a per-Run sink carried on the context (never package
 // state), so concurrent Runs keep separate notices and de-duplication state.
+// Options.Lifecycle is delivered the same way, through the same sink, and
+// follows the Progress panic rule: events are inline, ordered, never concurrent
+// and not de-duplicated, report completed actions (the local "resolved" event
+// aside), and an action that ends the Run gets none. See LifecycleEvent.
 //
 // Logging. Run resolves its logger from Options.Logger and carries it on the
 // context under a private key, not zerolog's WithContext, which silently drops a

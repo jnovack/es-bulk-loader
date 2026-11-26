@@ -34,6 +34,21 @@ const (
 	CodePipelinePolicyUnresolved = "pipeline_policy_unresolved"
 )
 
+// Lifecycle actions an Event reports. Each value is the public
+// loader.LifecycleAction<X> twin of Action<X>.
+const (
+	ActionResolved        = "resolved"
+	ActionCreated         = "created"
+	ActionDeleted         = "deleted"
+	ActionFlushed         = "flushed"
+	ActionRepointed       = "repointed"
+	ActionUpserted        = "upserted"
+	ActionSettingsUpdated = "settings_updated"
+	ActionRefreshed       = "refreshed"
+	ActionStopped         = "stopped"
+	ActionStarted         = "started"
+)
+
 // Notice is one actionable condition. Code is a Code* constant; Kind is a
 // Kind* constant or "" when no single resource applies, and Name is then "".
 type Notice struct {
@@ -43,9 +58,10 @@ type Notice struct {
 	Name    string
 }
 
-// Event is one cluster change. Action names what happened; Kind and Name name
-// the resource; Alias and Logical are set only where the change involves an
-// alias or a logical (unhashed) name.
+// Event is one lifecycle event: a completed cluster change, or the local
+// "resolved" event that names a resource the Run computed. Action is an
+// Action* constant; Kind and Name name the resource; Alias is set only on
+// "repointed" and Logical only on a resolved policy.
 type Event struct {
 	Action  string
 	Kind    string

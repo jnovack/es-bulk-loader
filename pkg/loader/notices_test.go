@@ -442,7 +442,7 @@ func TestNoticeDeduplicationOncePerRun(t *testing.T) {
 		observe.Notify(ctx, observe.Notice{Code: code, Message: message, Kind: kind, Name: name})
 	}
 	var result Result
-	ctx := withRunSink(t.Context(), &result)
+	ctx := withRunSink(t.Context(), &result, nil)
 	emit(ctx, observe.CodeEnrichPolicyMissing, "first", observe.KindPolicy, "x")
 	emit(ctx, observe.CodeEnrichPolicyMissing, "reworded", observe.KindPolicy, "x")
 	emit(ctx, observe.CodeEnrichPolicyMissing, "other name", observe.KindPolicy, "y")
@@ -477,13 +477,13 @@ func TestNoticeDeduplicationOncePerRun(t *testing.T) {
 
 	// A second Run's sink has its own seen set.
 	var second Result
-	emit(withRunSink(t.Context(), &second), observe.CodeEnrichPolicyMissing, "first", observe.KindPolicy, "x")
+	emit(withRunSink(t.Context(), &second, nil), observe.CodeEnrichPolicyMissing, "first", observe.KindPolicy, "x")
 	if len(second.Notices) != 1 {
 		t.Fatalf("second sink Notices = %+v, want its own first notice", second.Notices)
 	}
 	// Installing a sink without emitting leaves Notices nil.
 	var quiet Result
-	_ = withRunSink(t.Context(), &quiet)
+	_ = withRunSink(t.Context(), &quiet, nil)
 	if quiet.Notices != nil {
 		t.Fatalf("Notices = %+v, want nil", quiet.Notices)
 	}

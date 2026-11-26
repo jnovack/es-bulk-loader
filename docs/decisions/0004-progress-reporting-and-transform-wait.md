@@ -130,6 +130,106 @@ commitment.
     `TestExecutePollRetriesPreserveContinuation` and
     `TestProgressEnrichOutcomes`.
 
+## Amended 2026-11-25 (LOG-OBSERVE-01)
+
+A library caller running with `Options.Logger = zerolog.Nop()` could not learn
+why a Run failed, why an enrich policy failed, which documents Elasticsearch
+rejected, or what the Run changed. This amendment adds one additive v1
+contract in five parts. Run's returned error stays the single authoritative
+failure signal: an action that ends the Run gets no `Final` progress event
+and no lifecycle event. The operator approved the exact public shapes on
+2026-11-25; they are listed in the README "Library Usage" section and the
+`pkg/loader` GoDoc, and changing one needs a new operator decision.
+
+- **Separate `Options.Lifecycle func(LifecycleEvent)`.** `ProgressStage` was
+  not extended, because the `Final` rule cannot mark a delete then recreate of
+  the same name at emit time. Delivery mirrors `Progress`: synchronous on
+  Run's goroutine, never concurrent, same panic rule (an error panic becomes
+  Run's error, a panicked `*RunError` is returned unchanged, any other value
+  propagates), nil creates no events. Events report completed actions
+  (Elasticsearch acknowledged with a 2xx response), never intent; skipped and
+  no-op actions get none. `resolved` is the one local event: it reports
+  computed names, even with `SyncManaged` false. Events are delivered
+  immediately per resource, are not de-duplicated, and are never rolled back
+  when a later resource or action fails.
+- **`Alias` only on `repointed`; every index delete reported once.** A
+  `deleted` event never carries `Alias`. Every index delete path (direct,
+  nuke, prune, `aliasops.DeleteIndices`) ends in `indexops.Delete`, the only
+  index-delete emit. Event `Name`, `Alias` and `Logical` are sanitized and
+  bounded (2,048 bytes) once, at the public adapter; emit sites pass raw names.
+- **`Result.Notices` beside a byte-identical `Warnings`.** `Warnings` keeps its
+  content and order. A `Notice{Code, Message, ResourceKind, Name}` is added for
+  each actionable condition, including the ones that only logged before.
+  Notices are de-duplicated once per run on the converted public tuple
+  (Code, ResourceKind, Name) after `Name` is sanitized; the first Message and
+  encounter order are kept. The unsupported-API Message differs between the
+  list, create and delete sites and the execute site, but de-duplication
+  excludes Message, so it stays one notice. Legacy warning-message
+  compatibility is not a new redaction or size guarantee.
+- **`ElasticsearchError` reachable through `RunError.As`.** The internal
+  rejection stays unexported; `(*RunError).As` handles only
+  `**ElasticsearchError` and returns a fresh projection per call, sharing no
+  `Causes` slice. `ElasticsearchError` keeps its message and any read error
+  unexported, so a caller-built value has an empty `Error()` and a nil
+  `Unwrap()`. Structured 2xx
+  failures use the additive `esresponse.NewDetailFrom`, not a changed
+  `NewDetail` signature. Documented exclusions: status-only paths
+  (`indexops.Delete`), the retryable `_stats` wait timeout, and mapping-fetch
+  and transform-getter body-read failures. A type alias into `esresponse` was
+  rejected, because public types stay defined in `loader`.
+- **Enrich outcomes.** `Result.EnrichOutcomes` holds one outcome per selected
+  policy (then per missing one) with the statuses `succeeded`, `failed`,
+  `unsupported`, `cancelled` and `missing`. Cancellation follows the actual
+  returned cause (`errors.Is` on `context.Canceled` or `DeadlineExceeded`,
+  including through a rejection's body-read error); a sleep error is always
+  `cancelled`; a truncated body and the Elasticsearch `CANCELLED` phase stay
+  `failed`. Missing outcomes have nil `Err` and no progress event; they are
+  populated on the no-targets return and absent on the unsupported,
+  empty-cluster and list-failure returns. An outcome `Err` and the `Final`
+  `Err` share cause reachability.
+  `EnrichFailed` counts failed, unsupported and cancelled. The one deliberate
+  visible change to existing text: the enrich `ProgressEvent.Err` gains
+  `: <cause>`; it was never documented. New cause text is sanitized and
+  bounded.
+- **Bulk sample.** `Result.BulkFailures` is a bounded sample of the first
+  `MaxBulkFailureSample` (100) rejected items in response order across all
+  batches, independent of the ten-per-batch log cap. `BulkFailuresOmitted`
+  makes `len(BulkFailures)+BulkFailuresOmitted == DocumentsFailed`. The sample
+  is filled only when the bulk stage completes and is retained when a later
+  stage fails; it is nil/zero after a bulk hard failure or with no data
+  action. Index, ID, Action, Type and Reason all pass `SanitizeText` (the log
+  keeps its raw fields). A null `error` item has an empty Type and
+  Reason. The bound is defined once, in `loader`, and passed to `bulk` as
+  `Config.SampleLimit`.
+- **Ctx-carried `internal/observe` sink.** Internal owners reach the notice
+  and lifecycle sink through a per-Run sink on the context (the `runlog`
+  pattern), so concurrent Runs stay isolated and no package state exists. The
+  rejected alternative was passing a sink explicitly through every owner's
+  signature, which touches every call site and leaves a nil to forget. One
+  sink carries both callbacks; a second `observe.WithSink` would replace it
+  and drop notices. `WithSink(ctx, nil)` disables delivery with no parent
+  fallback. Public string constants (`NoticeCode`, `LifecycleAction`,
+  `ResourceKind`) are conversions of the internal untyped constants, which
+  hold the value once. The public names derive from the internal ones:
+  `Code<X>` becomes `Notice<X>`, `Kind<X>` becomes `ResourceKind<X>` and
+  `Action<X>` becomes `LifecycleAction<X>`.
+- **Deferred: per-Op machine code.** A machine code on `RunError` is out of
+  scope (LOG-OPCODE-01).
+
+Guards: `TestRunElasticsearchErrorReachable`, `TestRunErrorAsContract`,
+`TestRunEnrichOutcomeCarriesCauseAndElasticsearchError`,
+`TestRunEnrichCancelledOutcomeKeepsContextIdentity`,
+`TestRunBulkFailuresSampleAcrossBatches`,
+`TestRunBulkFailuresPartialResultRules`, `TestNoticeDeduplicationOncePerRun`,
+`TestObserveConstantsHavePublicTwins`, `TestREADMEDocumentsEveryObserveConstant`,
+`TestPublicTypeIdentity`, `TestRunLifecycleEventSequences`,
+`TestRunLifecycleEventsSurviveLaterFailure`,
+`TestRunLifecycleGCFailureKeepsLaterEvents`, `TestRunLifecycleResolvedOrder`,
+`TestRunLifecycleNilCallbackAndSharedSink`,
+`TestRunLifecycleCallbackPanicContract`, `TestRunLifecycleInlineAndIsolated`,
+`TestEventAdapterSanitizesAndBounds` and
+`TestDeleteIndicesAndPruneReportEachDeleteOnce`.
+
 ## References
 
 - [pkg/loader/progress.go](../../pkg/loader/progress.go)

@@ -14,6 +14,7 @@ import (
 
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/config"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/esresponse"
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/observe"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/progress"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/runlog"
 )
@@ -122,6 +123,7 @@ func CreateOrUpdate(ctx context.Context, es *elasticsearch.Client, definitions c
 					esresponse.MaxPublicMessageBytes))
 		}
 		runlog.From(ctx).Info().Str("transform", name).Msg("Transform created")
+		observe.Record(ctx, observe.Event{Action: observe.ActionUpserted, Kind: observe.KindTransform, Name: name})
 	}
 	return nil
 }
@@ -196,6 +198,7 @@ func StopBestEffort(ctx context.Context, es *elasticsearch.Client, names []strin
 					esresponse.MaxPublicMessageBytes))
 		}
 		runlog.From(ctx).Debug().Str("transform", name).Msg("Transform stopped")
+		observe.Record(ctx, observe.Event{Action: observe.ActionStopped, Kind: observe.KindTransform, Name: name})
 	}
 	return nil
 }
@@ -232,6 +235,7 @@ func Delete(ctx context.Context, es *elasticsearch.Client, names []string) error
 					esresponse.MaxPublicMessageBytes))
 		}
 		runlog.From(ctx).Info().Str("transform", name).Msg("Transform deleted")
+		observe.Record(ctx, observe.Event{Action: observe.ActionDeleted, Kind: observe.KindTransform, Name: name})
 	}
 	return nil
 }
@@ -267,6 +271,7 @@ func Start(ctx context.Context, es *elasticsearch.Client, names []string) error 
 		}
 
 		runlog.From(ctx).Info().Str("transform", name).Msg("Transform started")
+		observe.Record(ctx, observe.Event{Action: observe.ActionStarted, Kind: observe.KindTransform, Name: name})
 	}
 	return nil
 }

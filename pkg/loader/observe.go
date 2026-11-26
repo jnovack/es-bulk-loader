@@ -7,6 +7,7 @@ import (
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/bulk"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/enrich"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/esresponse"
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/managed"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/observe"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/progress"
 )
@@ -307,9 +308,10 @@ func bulkFailuresFrom(sample []bulk.ItemFailure) []BulkItemFailure {
 	return out
 }
 
-// ResourceKind is the kind of cluster resource a Notice names. The values are
-// the strings "index", "alias", "pipeline", "policy" and "transform"; a Notice
-// that names no single resource has an empty ResourceKind.
+// ResourceKind is the kind of resource a Notice or LifecycleEvent names. The
+// values are the strings "index", "alias", "pipeline", "policy" and
+// "transform"; a Notice that names no single resource has an empty
+// ResourceKind.
 type ResourceKind string
 
 // The ResourceKind values.
@@ -447,16 +449,126 @@ func noticeFrom(n observe.Notice) Notice {
 	}
 }
 
+// LifecycleAction names what a LifecycleEvent reports. Each value is a stable
+// snake_case string, written out on its constant; compare against the
+// constants.
+type LifecycleAction string
+
+// The LifecycleAction values.
+const (
+	// LifecycleActionResolved ("resolved"): a local event, not a cluster
+	// action. The Run computed the name of a pipeline, enrich policy or
+	// selected transform it will manage. It is reported even when
+	// SyncManaged is false, and does not claim an upsert. For a policy, Name
+	// is the managed hashed name and Logical the logical key.
+	LifecycleActionResolved = LifecycleAction(observe.ActionResolved)
+	// LifecycleActionCreated ("created"): Elasticsearch acknowledged the
+	// creation of an index. The index may not be visible yet.
+	LifecycleActionCreated = LifecycleAction(observe.ActionCreated)
+	// LifecycleActionDeleted ("deleted"): Elasticsearch acknowledged the
+	// deletion of an index, pipeline, policy or transform. Every index delete
+	// is reported once. Alias is never set. A resource that was already
+	// absent is not reported.
+	LifecycleActionDeleted = LifecycleAction(observe.ActionDeleted)
+	// LifecycleActionFlushed ("flushed"): all documents of an index were
+	// deleted, with no shard failures.
+	LifecycleActionFlushed = LifecycleAction(observe.ActionFlushed)
+	// LifecycleActionRepointed ("repointed"): an alias now points to a new
+	// concrete index. ResourceKind is "alias", Name is the new index and
+	// Alias is the alias. It is the only action that sets Alias.
+	LifecycleActionRepointed = LifecycleAction(observe.ActionRepointed)
+	// LifecycleActionUpserted ("upserted"): a pipeline, enrich policy or
+	// transform was created or replaced. A policy that already existed under
+	// its hashed name is not reported.
+	LifecycleActionUpserted = LifecycleAction(observe.ActionUpserted)
+	// LifecycleActionSettingsUpdated ("settings_updated"): an index settings
+	// change was acknowledged (nuke clears index.default_pipeline).
+	LifecycleActionSettingsUpdated = LifecycleAction(observe.ActionSettingsUpdated)
+	// LifecycleActionRefreshed ("refreshed"): an index refresh succeeded. Name
+	// is the refresh target as the Run requested it: the concrete index, or
+	// in AliasMode without a new generation the alias name.
+	LifecycleActionRefreshed = LifecycleAction(observe.ActionRefreshed)
+	// LifecycleActionStopped ("stopped"): a running transform was stopped. A
+	// transform that was not running is not reported.
+	LifecycleActionStopped = LifecycleAction(observe.ActionStopped)
+	// LifecycleActionStarted ("started"): a transform was started. One that
+	// was already running is not reported.
+	LifecycleActionStarted = LifecycleAction(observe.ActionStarted)
+)
+
+// LifecycleEvent is one thing a Run did, delivered to Options.Lifecycle.
+// Build and compare it with keyed fields; fields may be added in minor
+// releases.
+//
+// Except for "resolved", an event reports an action Elasticsearch
+// acknowledged with a 2xx response, never an intent, a skipped step or a
+// failed one. Events are delivered in the order the actions completed and
+// are not de-duplicated: two acknowledged operations on one resource are two
+// events (for example "deleted" then "upserted" for a transform that
+// existed). An event already delivered stays delivered when a later action
+// or resource fails the Run.
+type LifecycleEvent struct {
+	// Action is what happened; see the LifecycleAction values.
+	Action LifecycleAction
+	// ResourceKind is the kind of resource Name names.
+	ResourceKind ResourceKind
+	// Name is the resource's name: for "repointed" the new concrete index,
+	// for a "resolved" policy its managed hashed name.
+	//
+	// Name, Alias and Logical are each sanitized single-line UTF-8 with
+	// recognizable credentials redacted, at most 2,048 bytes (a longer value
+	// ends with " [truncated]"), like Notice.Name.
+	Name string
+	// Alias is set only on "repointed", to the alias.
+	Alias string
+	// Logical is set only on "resolved" for a policy, to its logical key.
+	Logical string
+}
+
+// eventFrom is the one adapter from an internal event to the public
+// LifecycleEvent. It sanitizes and bounds Name, Alias and Logical, which may
+// hold names read from Elasticsearch, the same way noticeFrom does for a
+// Notice Name (SanitizeText: single-line UTF-8, credentials redacted, at most
+// 2,048 bytes). Emit sites pass raw names.
+func eventFrom(e observe.Event) LifecycleEvent {
+	return LifecycleEvent{
+		Action:       LifecycleAction(e.Action),
+		ResourceKind: ResourceKind(e.Kind),
+		Name:         esresponse.SanitizeText(e.Name, esresponse.MaxPublicMessageBytes),
+		Alias:        esresponse.SanitizeText(e.Alias, esresponse.MaxPublicMessageBytes),
+		Logical:      esresponse.SanitizeText(e.Logical, esresponse.MaxPublicMessageBytes),
+	}
+}
+
+// recordResolved reports the names this Run resolved, in order: pipelines,
+// then enrich policies (hashed name plus logical key, from the index-parallel
+// plan slices), then the transforms selected for this source index. It never
+// iterates a definitions map, so the order is the declared order. An empty
+// group reports nothing. It makes no cluster request.
+func recordResolved(ctx context.Context, pipelineNames []string, policyPlan managed.PolicyPlan, transformNames []string) {
+	for _, name := range pipelineNames {
+		observe.Record(ctx, observe.Event{Action: observe.ActionResolved, Kind: observe.KindPipeline, Name: name})
+	}
+	for i, name := range policyPlan.DesiredNames {
+		observe.Record(ctx, observe.Event{Action: observe.ActionResolved, Kind: observe.KindPolicy, Name: name, Logical: policyPlan.LogicalNames[i]})
+	}
+	for _, name := range transformNames {
+		observe.Record(ctx, observe.Event{Action: observe.ActionResolved, Kind: observe.KindTransform, Name: name})
+	}
+}
+
 // withRunSink installs this Run's observation sink on ctx, replacing any sink
 // ctx already carries, and returns the child. Its OnNotice appends each
 // notice to result.Notices once per (Code, ResourceKind, Name), keeping the
 // first occurrence and its order; the seen set lives in this closure, so it
-// belongs to one Run and never to the package or the caller's context.
-// Installing invokes no callback. OnEvent stays nil until lifecycle events
-// ship.
-func withRunSink(ctx context.Context, result *Result) context.Context {
+// belongs to one Run and never to the package or the caller's context. Its
+// OnEvent is set only when lifecycle is non-nil, and calls it inline with each
+// sanitized event, without de-duplication. One sink carries both callbacks: a
+// second observe.WithSink would replace this one and drop every notice.
+// Installing invokes no callback.
+func withRunSink(ctx context.Context, result *Result, lifecycle func(LifecycleEvent)) context.Context {
 	seen := make(map[noticeKey]struct{})
-	return observe.WithSink(ctx, &observe.Sink{
+	sink := &observe.Sink{
 		OnNotice: func(n observe.Notice) {
 			notice := noticeFrom(n)
 			key := noticeKey{code: notice.Code, kind: notice.ResourceKind, name: notice.Name}
@@ -466,5 +578,9 @@ func withRunSink(ctx context.Context, result *Result) context.Context {
 			seen[key] = struct{}{}
 			result.Notices = append(result.Notices, notice)
 		},
-	})
+	}
+	if lifecycle != nil {
+		sink.OnEvent = func(e observe.Event) { lifecycle(eventFrom(e)) }
+	}
+	return observe.WithSink(ctx, sink)
 }

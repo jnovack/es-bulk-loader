@@ -18,6 +18,7 @@ import (
 
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/esresponse"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/indexops"
+	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/observe"
 	"github.com/jnovack/es-bulk-loader/pkg/loader/internal/runlog"
 )
 
@@ -156,6 +157,8 @@ func Update(ctx context.Context, es *elasticsearch.Client, alias, index string) 
 	}
 
 	runlog.From(ctx).Info().Str("alias", alias).Str("index", index).Msg("Alias now points to index")
+	// The only event that sets Alias: Name is the new concrete index.
+	observe.Record(ctx, observe.Event{Action: observe.ActionRepointed, Kind: observe.KindAlias, Name: index, Alias: alias})
 	return nil
 }
 

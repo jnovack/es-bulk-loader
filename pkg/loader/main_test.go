@@ -68,6 +68,17 @@ func TestRunDoesNotMutateCallerOptions(t *testing.T) {
 				Enrich:            EnrichOptions{Policies: []string{"a", "b"}},
 			},
 		},
+		{
+			name: "callbacks are read-only",
+			opts: Options{
+				URL:           "http://127.0.0.1:1",
+				Index:         "products",
+				SyncManaged:   true,
+				PipelinesFile: filepath.Join(t.TempDir(), "missing-pipelines.json"),
+				Progress:      func(ProgressEvent) {},
+				Lifecycle:     func(LifecycleEvent) {},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -86,8 +97,17 @@ func TestRunDoesNotMutateCallerOptions(t *testing.T) {
 			if _, err := Run(t.Context(), tt.opts); err == nil {
 				t.Fatal("expected Run to fail for this fixture")
 			}
-			if !reflect.DeepEqual(tt.opts, want) {
-				t.Fatalf("Run mutated caller options:\n got %+v\nwant %+v", tt.opts, want)
+			// reflect.DeepEqual treats any non-nil func as unequal, so compare
+			// the callbacks by identity and DeepEqual the rest with them cleared.
+			got := tt.opts
+			if reflect.ValueOf(got.Progress).Pointer() != reflect.ValueOf(want.Progress).Pointer() ||
+				reflect.ValueOf(got.Lifecycle).Pointer() != reflect.ValueOf(want.Lifecycle).Pointer() {
+				t.Fatal("Run replaced a caller callback")
+			}
+			got.Progress, want.Progress = nil, nil
+			got.Lifecycle, want.Lifecycle = nil, nil
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("Run mutated caller options:\n got %+v\nwant %+v", got, want)
 			}
 		})
 	}

@@ -468,6 +468,7 @@ func deletePolicyBestEffort(ctx context.Context, es *elasticsearch.Client, polic
 	}
 
 	runlog.From(ctx).Info().Str("policy", policy).Msg("Managed policy GC deleted unreferenced policy")
+	observe.Record(ctx, observe.Event{Action: observe.ActionDeleted, Kind: observe.KindPolicy, Name: policy})
 }
 
 // CreatePipelines puts each pipeline in declared order and stops at the first
@@ -508,6 +509,7 @@ func CreatePipelines(ctx context.Context, es *elasticsearch.Client, definitions 
 		res.Body.Close()
 
 		runlog.From(ctx).Info().Str("pipeline", name).Msg("Pipeline created or updated")
+		observe.Record(ctx, observe.Event{Action: observe.ActionUpserted, Kind: observe.KindPipeline, Name: name})
 	}
 	return nil
 }
@@ -541,6 +543,7 @@ func deletePipelines(ctx context.Context, es *elasticsearch.Client, names []stri
 		res.Body.Close()
 
 		runlog.From(ctx).Info().Str("pipeline", name).Msg("Pipeline deleted")
+		observe.Record(ctx, observe.Event{Action: observe.ActionDeleted, Kind: observe.KindPipeline, Name: name})
 	}
 	return nil
 }
@@ -559,6 +562,7 @@ func CreatePolicies(ctx context.Context, es *elasticsearch.Client, definitions c
 			if !res.IsError() {
 				res.Body.Close()
 				runlog.From(ctx).Info().Str("policy", name).Msg("Created enrich policy")
+				observe.Record(ctx, observe.Event{Action: observe.ActionUpserted, Kind: observe.KindPolicy, Name: name})
 				break
 			}
 
@@ -706,6 +710,7 @@ func deletePolicies(ctx context.Context, es *elasticsearch.Client, names []strin
 			res.Body.Close()
 
 			runlog.From(ctx).Info().Str("policy", name).Msg("Deleted enrich policy")
+			observe.Record(ctx, observe.Event{Action: observe.ActionDeleted, Kind: observe.KindPolicy, Name: name})
 			break
 		}
 	}
@@ -797,6 +802,7 @@ func deletePipelinesForNuke(ctx context.Context, es *elasticsearch.Client, names
 		res.Body.Close()
 
 		runlog.From(ctx).Info().Str("pipeline", name).Msg("Pipeline deleted")
+		observe.Record(ctx, observe.Event{Action: observe.ActionDeleted, Kind: observe.KindPipeline, Name: name})
 	}
 	return nil
 }

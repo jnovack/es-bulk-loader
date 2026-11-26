@@ -286,6 +286,24 @@ type Options struct {
 	// Progress, when non-nil, receives ProgressEvents; see ProgressEvent for
 	// the delivery contract. nil creates no events.
 	Progress func(ProgressEvent)
+	// Lifecycle, when non-nil, receives one LifecycleEvent per action the Run
+	// completed, in the order the actions completed; see LifecycleEvent and
+	// the LifecycleAction values for the vocabulary. Delivery follows
+	// Progress: it is synchronous on Run's goroutine and never concurrent, so
+	// the callback must return promptly (Run waits for it) and needs no
+	// locking against Run itself. The event's Name, Alias and Logical are
+	// sanitized single-line UTF-8 with credentials redacted, at most 2,048
+	// bytes each. A callback that panics with an error fails
+	// the Run with that error, reachable with errors.Is, a panicked *RunError
+	// is returned unchanged, and any other panic value propagates unchanged;
+	// no later action runs. Events report completed actions, never intent. A
+	// skipped or no-op action (an absent resource, a policy that already
+	// exists, a transform already stopped or running) gets no event, and an
+	// action that ends the Run with an error gets none either: Run's error is
+	// the single failure signal. Events already delivered stay delivered when
+	// a later action fails. The "resolved" action is local: it reports names
+	// the Run computed, not a cluster action. nil creates no events.
+	Lifecycle func(LifecycleEvent)
 	// Logger, when non-nil, receives all of Run's log output — including a
 	// Disabled logger such as zerolog.Nop(), which silences Run. nil uses the
 	// zerolog global (log.Logger), read but never modified, so concurrent
@@ -516,10 +534,10 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 	// serialize Runs behind a mutex. The logger travels on ctx instead.
 	logger := runlog.Resolve(opts.Logger)
 	ctx = runlog.WithLogger(ctx, &logger)
-	// This Run's notice sink, on the same ctx, replacing any the caller's ctx
+	// This Run's notice and lifecycle sink, on the same ctx, replacing any the caller's ctx
 	// carries. Installing calls nothing; every emit happens after the recover
 	// below is active.
-	ctx = withRunSink(ctx, &result)
+	ctx = withRunSink(ctx, &result, opts.Lifecycle)
 
 	url := &opts.URL
 	insecure := &opts.InsecureSkipVerify
@@ -745,6 +763,7 @@ func Run(ctx context.Context, opts Options) (result Result, err error) {
 		logicalTransformNames,
 		transformNames,
 	)
+	recordResolved(ctx, pipelineNames, policyPlan, transformNames)
 	enrichSelection := managed.RemapEnrichSelection(ctx, requestedEnrich, policyNameMapping)
 	defaultPipeline := ""
 	if effectiveSyncManaged && len(pipelineNames) > 0 {

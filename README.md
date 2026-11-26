@@ -353,6 +353,61 @@ items` (see `DocumentsFailed` and `BulkFailures`) and enrich cancellation (see
 the `cancelled` outcome). A terminal rejection is `Run`'s error, not a notice.
 Build and compare `Notice` with keyed fields.
 
+### Lifecycle events
+
+`Options.Lifecycle func(LifecycleEvent)` receives one event for each action a
+Run completed, so a caller running with `zerolog.Nop()` can see what the Run
+changed in the cluster. `nil` creates no events.
+
+```go
+opts.Lifecycle = func(e loaderpkg.LifecycleEvent) {
+    switch e.Action {
+    case loaderpkg.LifecycleActionRepointed:
+        log.Printf("alias %s now points to %s", e.Alias, e.Name)
+    default:
+        log.Printf("%s %s %q", e.Action, e.ResourceKind, e.Name)
+    }
+}
+```
+
+| Field | Shape |
+| --- | --- |
+| `Action LifecycleAction` | What happened; one of the actions below. |
+| `ResourceKind ResourceKind` | `index`, `alias`, `pipeline`, `policy` or `transform`; the kind `Name` names. |
+| `Name string` | The resource. For `repointed` it is the new concrete index; for a `resolved` policy it is the managed hashed name. |
+| `Alias string` | Set only on `repointed`, to the alias. A `deleted` event never has an `Alias`. |
+| `Logical string` | Set only on `resolved` for a policy, to its logical key. |
+
+Every string field is sanitized single-line UTF-8 with recognizable
+credentials redacted, at most 2,048 bytes (a longer value ends with the
+`[truncated]` marker). Build and compare `LifecycleEvent` with keyed fields.
+
+| Action | Constant | Kind | Reported when |
+| --- | --- | --- | --- |
+| `resolved` | `LifecycleActionResolved` | `pipeline`, `policy`, `transform` | A local event, not a cluster action: the Run computed the name of a resource it manages. Sent once per pipeline, then policy, then selected transform (the transforms for this source index), in declared order, even when `SyncManaged` is false. It does not claim an upsert, and can be followed by a Run error before any cluster write. |
+| `created` | `LifecycleActionCreated` | `index` | Elasticsearch acknowledged the index create. The index may not be visible yet; a later visibility failure does not retract the event. |
+| `deleted` | `LifecycleActionDeleted` | `index`, `pipeline`, `policy`, `transform` | The delete was acknowledged. Every index delete (direct, nuke, `KeepLast` prune) is reported once. An already-absent resource is not reported. Includes the garbage collection of an unreferenced managed policy version. |
+| `flushed` | `LifecycleActionFlushed` | `index` | All documents were deleted, with no shard failures. |
+| `repointed` | `LifecycleActionRepointed` | `alias` | The alias now points to a new concrete index (`Name`), and `Alias` is the alias. The only action that sets `Alias`. |
+| `upserted` | `LifecycleActionUpserted` | `pipeline`, `policy`, `transform` | The resource was created or replaced. A policy that already exists under its hashed name is not reported. |
+| `settings_updated` | `LifecycleActionSettingsUpdated` | `index` | An index settings change was acknowledged (nuke clearing `index.default_pipeline`), once per index. |
+| `refreshed` | `LifecycleActionRefreshed` | `index` | An index refresh succeeded (before enrich or transform start). `Name` is the refresh target as requested: the alias name in alias mode without a new generation. |
+| `stopped` | `LifecycleActionStopped` | `transform` | A running transform was stopped. One that was not running is not reported. |
+| `started` | `LifecycleActionStarted` | `transform` | A transform was started. One that was already running is not reported. |
+
+Delivery follows `Options.Progress`: the callback runs synchronously on
+`Run`'s goroutine and never concurrently, so it must return promptly; a
+callback that panics with an error fails the `Run` with that error, a panicked
+`*RunError` is returned unchanged, and any other panic propagates. Events
+report completed actions, never intent: a skipped or no-op action, a failed
+action, and the action that ends the Run get no event, because `Run`'s error is
+the single failure signal. Events are delivered in the order the actions
+completed, are not de-duplicated, and stay delivered when a later action fails
+the Run. Two acknowledged operations on one resource are two events: updating
+an existing transform reports `deleted` then `upserted`, and an alias rollover
+reports `created`, `repointed`, then a `deleted` per pruned generation.
+Notices still reach `Result.Notices` when `Lifecycle` is set.
+
 Full lifecycle run:
 
 ```go

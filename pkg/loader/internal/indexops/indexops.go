@@ -335,6 +335,9 @@ func Delete(ctx context.Context, es *elasticsearch.Client, index string) error {
 	if res.IsError() {
 		return runlog.Fail(runlog.FailureEvent(ctx).Str("index", index), "Failed to delete index", nil)
 	}
+	// The one index-delete event: direct delete, nuke, prune and
+	// aliasops.DeleteIndices all end here, so none emits a second one.
+	observe.Record(ctx, observe.Event{Action: observe.ActionDeleted, Kind: observe.KindIndex, Name: index})
 	return nil
 }
 
@@ -398,6 +401,7 @@ func Flush(ctx context.Context, es *elasticsearch.Client, index string) error {
 			Int("shard_failures", len(result.Failures)),
 			"Index flush completed with shard-level failures", cause)
 	}
+	observe.Record(ctx, observe.Event{Action: observe.ActionFlushed, Kind: observe.KindIndex, Name: index})
 	return nil
 }
 
@@ -527,6 +531,7 @@ func ClearDefaultPipeline(ctx context.Context, es *elasticsearch.Client, indices
 		// No notice: an acknowledged settings change made for nuke cleanup, a
 		// requested cluster change rather than an actionable condition.
 		runlog.From(ctx).Warn().Str("index", index).Msg("Cleared index.default_pipeline to allow nuke cleanup")
+		observe.Record(ctx, observe.Event{Action: observe.ActionSettingsUpdated, Kind: observe.KindIndex, Name: index})
 	}
 	return nil
 }
@@ -552,6 +557,7 @@ func Refresh(ctx context.Context, es *elasticsearch.Client, index string) error 
 	}
 
 	runlog.From(ctx).Info().Str("index", index).Msg("Refreshed index")
+	observe.Record(ctx, observe.Event{Action: observe.ActionRefreshed, Kind: observe.KindIndex, Name: index})
 	return nil
 }
 
@@ -573,5 +579,8 @@ func Create(ctx context.Context, es *elasticsearch.Client, index, body string) e
 				"index", index, res.StatusCode, responseBody, readErr,
 				esresponse.MaxPublicMessageBytes))
 	}
+	// Acknowledged here, before the caller's WaitForIndex: a later visibility
+	// failure must not erase this event.
+	observe.Record(ctx, observe.Event{Action: observe.ActionCreated, Kind: observe.KindIndex, Name: index})
 	return nil
 }
