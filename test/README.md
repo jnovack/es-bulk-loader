@@ -50,13 +50,15 @@ The shell smoke test remains useful for manual debugging:
 
 ## What The Go E2E Suite Does
 
-The tagged E2E suite in [`e2e/e2e_test.go`](e2e/e2e_test.go) does the
+The tagged E2E suite in [`e2e_test.go`](e2e_test.go) does the
 following:
 
 1. Builds `./cmd/es-bulk-loader` once into a temporary binary.
 2. Starts a real Elasticsearch 9 container with Docker.
 3. Creates per-scenario fixture directories under `t.TempDir()`.
-4. Runs the compiled loader binary with real CLI flags.
+4. Runs the compiled loader binary with real CLI flags. One scenario,
+   [`e2e_inprocess_test.go`](e2e_inprocess_test.go), instead calls
+   `loader.Run` in-process.
 5. Verifies Elasticsearch with direct HTTP calls.
 6. Tears down the Docker container when the package finishes.
 
@@ -118,6 +120,19 @@ current scenarios cover:
   holds the expected documents when the loader exits, with no retry loop. The
   scenario deletes its transform and destination index before and after it
   runs.
+- `loader.Run` in-process (`in_process_observability`)
+  Calls the library directly with a no-op logger and checks the typed
+  observation contract. A mixed bulk load must report the rejected item in
+  `Result.BulkFailures` with status 400 and the pinned Elasticsearch error
+  type, and the failure counts must reconcile. Two
+  `-delete -sync-managed -enrich -alias -keep-last 1` rollovers must produce
+  the exact `Options.Lifecycle` sequence, with the prune `deleted` event only
+  on the second run, one `succeeded` enrich outcome per run, and the alias,
+  pruned generations and enrich backing index confirmed on the cluster. A
+  sync-only run with an unknown ingest processor must return an error that
+  `errors.As` reaches as an `*ElasticsearchError` (HTTP 400, resource
+  `pipeline`), leave the pipeline unchanged and emit no successful-action
+  event.
 
 Verbose mode prints the flag set and the intended checks for each scenario so
 the terminal output is easier to scan than a plain `ok`.

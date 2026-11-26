@@ -241,6 +241,13 @@ func TestEndToEndScenarios(t *testing.T) {
 			checks: "warns that the run is a reset that recreates nothing; the source index, its pipelines and policy are deleted, the dependent target pipeline is removed and the target index survives without a default pipeline",
 			run:    scenarioNukeSyncManagedResets,
 		},
+		{
+			// Appended last: the slice index sets each scenario's e2e-NN prefix.
+			name:   "in_process_observability",
+			flags:  "loader.Run in-process (no CLI): mixed bulk load; two -delete -sync-managed -enrich -alias -keep-last 1 rollovers; sync-only invalid pipeline",
+			checks: "BulkFailures sample, ordered Lifecycle events with the prune only on run 2, one succeeded EnrichOutcome, and ElasticsearchError for the rejected pipeline",
+			run:    scenarioInProcessObservability,
+		},
 	}
 
 	for i, sc := range scenarios {
@@ -1086,6 +1093,21 @@ func writeFixtureDir(t *testing.T, dir string, files map[string]string) {
 	}
 }
 
+// templateVariables is the single source of fixture template variables for both the CLI (runLoader env) and in-process (Options.TemplateVariables) paths, so the two cannot drift.
+func (ctx *scenarioContext) templateVariables() map[string]string {
+	return map[string]string{
+		"SOURCE_PIPELINE_PRIMARY":       ctx.sourcePipelinePrimary,
+		"SOURCE_PIPELINE_SECONDARY":     ctx.sourcePipelineSecondary,
+		"SOURCE_POLICY":                 ctx.sourcePolicy,
+		"ALT_SOURCE_PIPELINE_PRIMARY":   ctx.altSourcePipelinePrimary,
+		"ALT_SOURCE_PIPELINE_SECONDARY": ctx.altSourcePipelineSecondary,
+		"ALT_SOURCE_POLICY":             ctx.altSourcePolicy,
+		"TARGET_PIPELINE_PRIMARY":       ctx.targetPipelinePrimary,
+		"TARGET_PIPELINE_SECONDARY":     ctx.targetPipelineSecondary,
+		"SOURCE_POLICY_NAME":            ctx.sourcePolicyManaged,
+	}
+}
+
 // runLoader runs the built loader binary with args from the repo root and returns its combined output and error. extraEnv is added to the environment.
 func runLoader(t *testing.T, ctx *scenarioContext, extraEnv map[string]string, args []string) commandResult {
 	t.Helper()
@@ -1099,17 +1121,9 @@ func runLoader(t *testing.T, ctx *scenarioContext, extraEnv map[string]string, a
 	env := slices.DeleteFunc(os.Environ(), func(kv string) bool {
 		return strings.HasPrefix(kv, "REPLICAS=")
 	})
-	env = append(env,
-		"SOURCE_PIPELINE_PRIMARY="+ctx.sourcePipelinePrimary,
-		"SOURCE_PIPELINE_SECONDARY="+ctx.sourcePipelineSecondary,
-		"SOURCE_POLICY="+ctx.sourcePolicy,
-		"ALT_SOURCE_PIPELINE_PRIMARY="+ctx.altSourcePipelinePrimary,
-		"ALT_SOURCE_PIPELINE_SECONDARY="+ctx.altSourcePipelineSecondary,
-		"ALT_SOURCE_POLICY="+ctx.altSourcePolicy,
-		"TARGET_PIPELINE_PRIMARY="+ctx.targetPipelinePrimary,
-		"TARGET_PIPELINE_SECONDARY="+ctx.targetPipelineSecondary,
-		"SOURCE_POLICY_NAME="+ctx.sourcePolicyManaged,
-	)
+	for key, value := range ctx.templateVariables() {
+		env = append(env, key+"="+value)
+	}
 	for key, value := range extraEnv {
 		env = append(env, key+"="+value)
 	}
