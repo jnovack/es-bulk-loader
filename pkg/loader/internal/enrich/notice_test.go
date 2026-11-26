@@ -43,8 +43,8 @@ func TestListPoliciesUnsupportedNotice(t *testing.T) {
 		{"terminal rejection emits nothing", static(http.StatusInternalServerError, `{"error":{"type":"x","reason":"y"}}`), true, nil},
 		{"policy-missing 404 emits nothing", static(http.StatusNotFound, `{"error":{"type":"resource_not_found_exception"}}`), true, nil},
 		{"oversized 404 emits nothing", static(http.StatusNotFound, strings.Repeat(" ", esresponse.MaxRejectionBodyBytes+10)), true, nil},
-		{"unreadable 404 emits nothing", bodyReadFailure(http.StatusNotFound, `{`, errors.New("read failed")), true, nil},
-		{"transport failure emits nothing", failWith(errors.New("dial failed")), true, nil},
+		{"unreadable 404 emits nothing", bodytransport.ReadFail(http.StatusNotFound, `{`, errors.New("read failed")), true, nil},
+		{"transport failure emits nothing", bodytransport.Fail(errors.New("dial failed")), true, nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -136,7 +136,7 @@ func TestExecuteNotices(t *testing.T) {
 		{
 			name:         "unreadable execute 404 emits nothing",
 			sel:          &Selection{Enabled: true, All: true},
-			replies:      []func() bodytransport.Reply{okPolicies("policy-a"), aliasBefore, bodyReadFailure(http.StatusNotFound, `{`, errors.New("read failed"))},
+			replies:      []func() bodytransport.Reply{okPolicies("policy-a"), aliasBefore, bodytransport.ReadFail(http.StatusNotFound, `{`, errors.New("read failed"))},
 			wantStatuses: []Status{StatusFailed},
 		},
 		{

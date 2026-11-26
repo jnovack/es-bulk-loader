@@ -62,7 +62,7 @@ type Rejection struct {
 	resource     string
 	resourceName string
 	status       int
-	pairs        []errorPair
+	pairs        []Pair
 }
 
 // Error returns the sanitized, bounded rejection message.
@@ -85,7 +85,9 @@ func (r *Rejection) Status() int { return r.status }
 
 // Pair is one sanitized Elasticsearch type/reason, each field at most
 // MaxPublicMessageBytes bytes of single-line valid UTF-8; either may be empty,
-// never both. It is exported only so package loader can read Pairs.
+// never both. It is exported only so package loader can read Pairs. It is
+// also the retained storage form, built once by retainPairs from the
+// extraction's errorPair values.
 type Pair struct {
 	Type, Reason string
 }
@@ -98,11 +100,7 @@ func (r *Rejection) Pairs() []Pair {
 	if len(r.pairs) == 0 {
 		return nil
 	}
-	out := make([]Pair, len(r.pairs))
-	for i, p := range r.pairs {
-		out[i] = Pair{Type: p.typ, Reason: p.reason}
-	}
-	return out
+	return slices.Clone(r.pairs)
 }
 
 // NewRejection returns the cause for a rejected request on resource name
@@ -183,7 +181,7 @@ func NewDetailFrom(resource, name, prefix string, d FailureDetail) *Rejection {
 }
 
 // newDetail is the one constructor behind NewDetail and NewDetailFrom.
-func newDetail(resource, name, text string, pairs []errorPair) *Rejection {
+func newDetail(resource, name, text string, pairs []Pair) *Rejection {
 	displayName := capDisplayName(name)
 	var msg string
 	if name == "" {
@@ -207,7 +205,7 @@ func newDetail(resource, name, text string, pairs []errorPair) *Rejection {
 // NewDetailFrom turns one into a Rejection.
 type FailureDetail struct {
 	text  string
-	pairs []errorPair
+	pairs []Pair
 }
 
 // Text returns the detail text bounded to max bytes, with the same cut and
@@ -393,14 +391,15 @@ func errorValueDetail(v any) FailureDetail {
 }
 
 // retainPairs returns a new slice of pairs with each field bounded to
-// MaxPublicMessageBytes, for storage only. Fields are already sanitized, so
-// the cut can split a placeholder but never expose a secret.
-func retainPairs(pairs []errorPair) []errorPair {
-	out := make([]errorPair, len(pairs))
+// MaxPublicMessageBytes, for storage only. It is the one conversion from the
+// extraction's errorPair to the retained Pair. Fields are already sanitized,
+// so the cut can split a placeholder but never expose a secret.
+func retainPairs(pairs []errorPair) []Pair {
+	out := make([]Pair, len(pairs))
 	for i, p := range pairs {
-		out[i] = errorPair{
-			typ:    boundMessage(p.typ, MaxPublicMessageBytes),
-			reason: boundMessage(p.reason, MaxPublicMessageBytes),
+		out[i] = Pair{
+			Type:   boundMessage(p.typ, MaxPublicMessageBytes),
+			Reason: boundMessage(p.reason, MaxPublicMessageBytes),
 		}
 	}
 	return out
@@ -422,6 +421,11 @@ func decodeSingleJSON(data []byte) (any, bool) {
 }
 
 // errorPair is one sanitized Elasticsearch type/reason; either may be empty.
+// It is kept separate from the exported Pair because it is the unbounded
+// transient form that de-duplication and rendering must see in full (bounding
+// first would change existing text, order and omission markers), while Pair
+// holds values already cut to MaxPublicMessageBytes by retainPairs; folding
+// them would let unbounded values satisfy Pair's bound.
 type errorPair struct {
 	typ, reason string
 }

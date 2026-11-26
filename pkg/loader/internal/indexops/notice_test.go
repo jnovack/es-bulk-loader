@@ -32,7 +32,7 @@ func TestClusterReplicaCountNotices(t *testing.T) {
 		override *int
 		want     []observe.Notice
 	}{
-		{"transport failure", func() bodytransport.Reply { return bodytransport.Reply{Err: errors.New("dial FAKE-SECRET")} },
+		{"transport failure", bodytransport.Fail(errors.New("dial FAKE-SECRET")),
 			nil, defaulted("Could not query cluster nodes; defaulting to 0 replicas")},
 		{"HTTP failure", bodytransport.Static(http.StatusForbidden, `{"error":{"type":"security_exception","reason":"FAKE-SECRET"}}`),
 			nil, defaulted("Cluster nodes query failed; defaulting to 0 replicas")},
@@ -40,7 +40,7 @@ func TestClusterReplicaCountNotices(t *testing.T) {
 			nil, defaulted("Could not parse cluster nodes response; defaulting to 0 replicas")},
 		{"successful query emits nothing", bodytransport.Static(http.StatusOK, `{"nodes":{"n1":{}}}`), nil, nil},
 		{"nil client emits nothing", nil, nil, nil},
-		{"explicit override emits nothing", func() bodytransport.Reply { return bodytransport.Reply{Err: errors.New("must not be sent")} }, &one, nil},
+		{"explicit override emits nothing", bodytransport.Fail(errors.New("must not be sent")), &one, nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

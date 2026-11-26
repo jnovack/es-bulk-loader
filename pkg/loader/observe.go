@@ -113,20 +113,27 @@ func (e *ElasticsearchError) Unwrap() error {
 	return e.err
 }
 
-// elasticsearchErrorFrom projects the first *esresponse.Rejection in err's
-// chain into a new public ElasticsearchError. It is the single mapping from
-// the internal rejection, shared by RunError.As and later wrappers. Values are
-// copied as stored: they are already sanitized and bounded, so nothing is
-// re-sanitized or re-cut. Causes is freshly allocated, so a caller mutating it
-// cannot change the rejection or the next projection. A nil err, no
-// rejection, or a typed nil rejection yields (nil, false).
-func elasticsearchErrorFrom(err error) (*ElasticsearchError, bool) {
-	if err == nil {
-		return nil, false
+// asElasticsearchError is the one mapping from the internal rejection to the
+// public ElasticsearchError, and the one target handler behind every public
+// error path that offers it through errors.As: RunError.As and the enrich
+// error wrapper. For a **ElasticsearchError target it sets the target to a new
+// projection of the first *esresponse.Rejection in err's chain and reports
+// true. Any other target, a nil target pointer, a nil err, a chain without a
+// rejection or a typed nil rejection reports false and leaves the target
+// unchanged. Callers pass the inner error, never the value whose As is
+// running: errors.As on that value would call its As again.
+//
+// Values are copied as stored: they are already sanitized and bounded, so
+// nothing is re-sanitized or re-cut. Causes is freshly allocated per call, so
+// a caller mutating it cannot change the rejection or the next projection.
+func asElasticsearchError(err error, target any) bool {
+	esTarget, ok := target.(**ElasticsearchError)
+	if !ok || esTarget == nil {
+		return false
 	}
 	var rejection *esresponse.Rejection
 	if !errors.As(err, &rejection) || rejection == nil {
-		return nil, false
+		return false
 	}
 	pairs := rejection.Pairs()
 	var causes []ElasticsearchCause
@@ -136,34 +143,14 @@ func elasticsearchErrorFrom(err error) (*ElasticsearchError, bool) {
 			causes[i] = ElasticsearchCause{Type: p.Type, Reason: p.Reason}
 		}
 	}
-	return &ElasticsearchError{
+	*esTarget = &ElasticsearchError{
 		Resource:   rejection.Resource(),
 		Name:       rejection.ResourceName(),
 		StatusCode: rejection.Status(),
 		Causes:     causes,
 		msg:        rejection.Error(),
 		err:        rejection.Unwrap(),
-	}, true
-}
-
-// asElasticsearchError is the one target handler behind every public error
-// path that offers an ElasticsearchError through errors.As: RunError.As and
-// the enrich error wrapper. For a **ElasticsearchError target it sets the
-// target to a new projection of the first rejection in err's chain and
-// reports true. Any other target, a nil target pointer, a nil err or a chain
-// without a rejection reports false and leaves the target unchanged. Callers
-// pass the inner error, never the value whose As is running: errors.As on that
-// value would call its As again.
-func asElasticsearchError(err error, target any) bool {
-	esTarget, ok := target.(**ElasticsearchError)
-	if !ok || esTarget == nil {
-		return false
 	}
-	esErr, ok := elasticsearchErrorFrom(err)
-	if !ok {
-		return false
-	}
-	*esTarget = esErr
 	return true
 }
 

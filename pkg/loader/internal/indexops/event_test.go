@@ -9,7 +9,6 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"strings"
 	"testing"
 
 	"github.com/jnovack/es-bulk-loader/internal/testutil/bodytransport"
@@ -26,10 +25,8 @@ func TestIndexEvents(t *testing.T) {
 
 	rejected := bodytransport.Static(http.StatusInternalServerError, `{"error":{"type":"x","reason":"FAKE"}}`)
 	notFound := bodytransport.Static(http.StatusNotFound, `{"error":{"type":"index_not_found_exception"}}`)
-	transportErr := func() bodytransport.Reply { return bodytransport.Reply{Err: errors.New("dial FAKE")} }
-	readErr := func() bodytransport.Reply {
-		return bodytransport.Reply{Status: http.StatusOK, Body: &bodytransport.Body{R: strings.NewReader(`{"fail`), Err: errors.New("read FAKE")}}
-	}
+	transportErr := bodytransport.Fail(errors.New("dial FAKE"))
+	readErr := bodytransport.ReadFail(http.StatusOK, `{"fail`, errors.New("read FAKE"))
 	tests := []struct {
 		name    string
 		call    func(ctx context.Context, tr *bodytransport.Transport, t *testing.T) error

@@ -47,7 +47,7 @@ func TestCreatePipelinesEvents(t *testing.T) {
 		}, true, []observe.Event{ev(observe.ActionUpserted, observe.KindPipeline, "p1")}},
 		{"first fails emits nothing", []func() bodytransport.Reply{bodytransport.Static(http.StatusBadRequest, `{"error":{"type":"x"}}`)}, true, nil},
 		{"transport error emits nothing", []func() bodytransport.Reply{
-			func() bodytransport.Reply { return bodytransport.Reply{Err: errors.New("dial FAKE")} },
+			bodytransport.Fail(errors.New("dial FAKE")),
 		}, true, nil},
 	}
 	for _, tt := range tests {

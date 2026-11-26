@@ -647,8 +647,10 @@ func TestRunErrorAsContract(t *testing.T) {
 	t.Run("helper rejects nil and typed-nil inputs", func(t *testing.T) {
 		t.Parallel()
 		for _, err := range []error{nil, errors.New("plain"), failure.New(op, (*esresponse.Rejection)(nil))} {
-			if got, ok := elasticsearchErrorFrom(err); ok || got != nil {
-				t.Fatalf("elasticsearchErrorFrom(%T) = %#v, %v", err, got, ok)
+			keep := &ElasticsearchError{Resource: "keep"}
+			target := keep
+			if asElasticsearchError(err, &target) || target != keep {
+				t.Fatalf("asElasticsearchError(%T) = true or changed the target to %#v", err, target)
 			}
 		}
 	})

@@ -78,6 +78,19 @@ func Static(status int, s string) func() Reply {
 	return func() Reply { return Reply{Status: status, Body: &Body{R: strings.NewReader(s)}} }
 }
 
+// Fail returns a func producing a transport failure with err (no response).
+func Fail(err error) func() Reply {
+	return func() Reply { return Reply{Err: err} }
+}
+
+// ReadFail returns a func answering status with a body that serves partial and
+// then fails with err instead of io.EOF. Each call returns a fresh Body.
+func ReadFail(status int, partial string, err error) func() Reply {
+	return func() Reply {
+		return Reply{Status: status, Body: &Body{R: strings.NewReader(partial), Err: err}}
+	}
+}
+
 // RoundTrip implements http.RoundTripper.
 func (tr *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	tr.mu.Lock()

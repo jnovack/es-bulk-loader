@@ -36,17 +36,6 @@ func static(status int, body string) func() bodytransport.Reply {
 	return bodytransport.Static(status, body)
 }
 
-func failWith(err error) func() bodytransport.Reply {
-	return func() bodytransport.Reply { return bodytransport.Reply{Err: err} }
-}
-
-// bodyReadFailure answers status with a short body whose read ends in err.
-func bodyReadFailure(status int, partial string, err error) func() bodytransport.Reply {
-	return func() bodytransport.Reply {
-		return bodytransport.Reply{Status: status, Body: &bodytransport.Body{R: strings.NewReader(partial), Err: err}}
-	}
-}
-
 func scripted(replies ...func() bodytransport.Reply) *bodytransport.Transport {
 	return &bodytransport.Transport{Replies: replies}
 }
@@ -89,7 +78,7 @@ func TestExecutePolicyOutcomeClasses(t *testing.T) {
 	}{
 		{
 			name:    "kickoff transport error is failed with the error as cause",
-			replies: []func() bodytransport.Reply{aliasBefore, failWith(boom)},
+			replies: []func() bodytransport.Reply{aliasBefore, bodytransport.Fail(boom)},
 			want:    StatusFailed,
 			checkCause: func(t *testing.T, cause error) {
 				if !errors.Is(cause, boom) {
@@ -99,7 +88,7 @@ func TestExecutePolicyOutcomeClasses(t *testing.T) {
 		},
 		{
 			name:    "kickoff transport cancellation is cancelled",
-			replies: []func() bodytransport.Reply{aliasBefore, failWith(context.Canceled)},
+			replies: []func() bodytransport.Reply{aliasBefore, bodytransport.Fail(context.Canceled)},
 			want:    StatusCancelled,
 			checkCause: func(t *testing.T, cause error) {
 				if !errors.Is(cause, context.Canceled) {
@@ -109,7 +98,7 @@ func TestExecutePolicyOutcomeClasses(t *testing.T) {
 		},
 		{
 			name:    "kickoff transport deadline is cancelled",
-			replies: []func() bodytransport.Reply{aliasBefore, failWith(context.DeadlineExceeded)},
+			replies: []func() bodytransport.Reply{aliasBefore, bodytransport.Fail(context.DeadlineExceeded)},
 			want:    StatusCancelled,
 		},
 		{
@@ -134,7 +123,7 @@ func TestExecutePolicyOutcomeClasses(t *testing.T) {
 		{
 			name: "kickoff rejection whose body read was cancelled is cancelled and keeps both identities",
 			replies: []func() bodytransport.Reply{
-				aliasBefore, bodyReadFailure(http.StatusInternalServerError, `{"err`, context.Canceled),
+				aliasBefore, bodytransport.ReadFail(http.StatusInternalServerError, `{"err`, context.Canceled),
 			},
 			want: StatusCancelled,
 			checkCause: func(t *testing.T, cause error) {
@@ -147,7 +136,7 @@ func TestExecutePolicyOutcomeClasses(t *testing.T) {
 		{
 			name: "kickoff rejection with a truncated body stays failed",
 			replies: []func() bodytransport.Reply{
-				aliasBefore, bodyReadFailure(http.StatusInternalServerError, `{"err`, io.ErrUnexpectedEOF),
+				aliasBefore, bodytransport.ReadFail(http.StatusInternalServerError, `{"err`, io.ErrUnexpectedEOF),
 			},
 			want: StatusFailed,
 			checkCause: func(t *testing.T, cause error) {
@@ -170,7 +159,7 @@ func TestExecutePolicyOutcomeClasses(t *testing.T) {
 		{
 			name: "kickoff decode that hit a cancelled read is cancelled",
 			replies: []func() bodytransport.Reply{
-				aliasBefore, bodyReadFailure(http.StatusOK, `{"ta`, context.Canceled),
+				aliasBefore, bodytransport.ReadFail(http.StatusOK, `{"ta`, context.Canceled),
 			},
 			want: StatusCancelled,
 			checkCause: func(t *testing.T, cause error) {
@@ -192,7 +181,7 @@ func TestExecutePolicyOutcomeClasses(t *testing.T) {
 		},
 		{
 			name:    "task poll transport error is failed",
-			replies: []func() bodytransport.Reply{aliasBefore, static(http.StatusOK, taskKickoffBody), failWith(boom)},
+			replies: []func() bodytransport.Reply{aliasBefore, static(http.StatusOK, taskKickoffBody), bodytransport.Fail(boom)},
 			want:    StatusFailed,
 			checkCause: func(t *testing.T, cause error) {
 				if !errors.Is(cause, boom) {
@@ -202,7 +191,7 @@ func TestExecutePolicyOutcomeClasses(t *testing.T) {
 		},
 		{
 			name:    "task poll transport cancellation is cancelled",
-			replies: []func() bodytransport.Reply{aliasBefore, static(http.StatusOK, taskKickoffBody), failWith(context.Canceled)},
+			replies: []func() bodytransport.Reply{aliasBefore, static(http.StatusOK, taskKickoffBody), bodytransport.Fail(context.Canceled)},
 			want:    StatusCancelled,
 		},
 		{
@@ -233,7 +222,7 @@ func TestExecutePolicyOutcomeClasses(t *testing.T) {
 			name: "poll rejection whose body read was cancelled is cancelled and keeps both identities",
 			replies: []func() bodytransport.Reply{
 				aliasBefore, static(http.StatusOK, taskKickoffBody),
-				bodyReadFailure(http.StatusForbidden, `{"err`, context.Canceled),
+				bodytransport.ReadFail(http.StatusForbidden, `{"err`, context.Canceled),
 			},
 			want: StatusCancelled,
 			checkCause: func(t *testing.T, cause error) {
@@ -247,7 +236,7 @@ func TestExecutePolicyOutcomeClasses(t *testing.T) {
 			name: "poll rejection with a truncated body stays failed",
 			replies: []func() bodytransport.Reply{
 				aliasBefore, static(http.StatusOK, taskKickoffBody),
-				bodyReadFailure(http.StatusForbidden, `{"err`, io.ErrUnexpectedEOF),
+				bodytransport.ReadFail(http.StatusForbidden, `{"err`, io.ErrUnexpectedEOF),
 			},
 			want: StatusFailed,
 		},
@@ -255,7 +244,7 @@ func TestExecutePolicyOutcomeClasses(t *testing.T) {
 			name: "transient poll with an unreadable diagnostic body keeps the retry sequence",
 			replies: []func() bodytransport.Reply{
 				aliasBefore, static(http.StatusOK, taskKickoffBody),
-				bodyReadFailure(http.StatusServiceUnavailable, `{"err`, context.Canceled), // retried, not classified
+				bodytransport.ReadFail(http.StatusServiceUnavailable, `{"err`, context.Canceled), // retried, not classified
 				static(http.StatusOK, taskDoneBody),
 			},
 			want:      StatusSucceeded,
@@ -265,7 +254,7 @@ func TestExecutePolicyOutcomeClasses(t *testing.T) {
 			name: "transient poll then a failing sleep makes the sleep error the cause",
 			replies: []func() bodytransport.Reply{
 				aliasBefore, static(http.StatusOK, taskKickoffBody),
-				bodyReadFailure(http.StatusServiceUnavailable, `{"err`, io.ErrUnexpectedEOF),
+				bodytransport.ReadFail(http.StatusServiceUnavailable, `{"err`, io.ErrUnexpectedEOF),
 			},
 			sleepErr: errSleepSecond,
 			want:     StatusCancelled,
@@ -283,7 +272,7 @@ func TestExecutePolicyOutcomeClasses(t *testing.T) {
 		{
 			name: "task decode that hit a cancelled read is cancelled",
 			replies: []func() bodytransport.Reply{
-				aliasBefore, static(http.StatusOK, taskKickoffBody), bodyReadFailure(http.StatusOK, `{"com`, context.Canceled),
+				aliasBefore, static(http.StatusOK, taskKickoffBody), bodytransport.ReadFail(http.StatusOK, `{"com`, context.Canceled),
 			},
 			want: StatusCancelled,
 		},
@@ -445,12 +434,12 @@ func TestVerifyAliasOutcomeCauses(t *testing.T) {
 			// Documented: an unreadable alias is failed even when the read
 			// failed because the context ended, not cancelled.
 			name:    "after read fails with a cancelled context: failed, identity kept",
-			replies: []func() bodytransport.Reply{static(404, aliasMissingBody), kickoff, task404, failWith(context.Canceled)},
+			replies: []func() bodytransport.Reply{static(404, aliasMissingBody), kickoff, task404, bodytransport.Fail(context.Canceled)},
 			wantIs:  context.Canceled,
 		},
 		{
 			name:    "before read fails with a cancelled context: failed, identity kept",
-			replies: []func() bodytransport.Reply{failWith(context.Canceled), kickoff, task404, static(200, aliasNewTarget)},
+			replies: []func() bodytransport.Reply{bodytransport.Fail(context.Canceled), kickoff, task404, static(200, aliasNewTarget)},
 			wantIs:  context.Canceled,
 		},
 		{

@@ -56,7 +56,7 @@ func TestCreatePoliciesNotices(t *testing.T) {
 		{"already exists emits nothing", []func() bodytransport.Reply{bodytransport.Static(http.StatusBadRequest, `{"error":{"type":"resource_already_exists_exception"}}`)}, false, 2, nil},
 		{"terminal rejection emits nothing", []func() bodytransport.Reply{bodytransport.Static(http.StatusInternalServerError, `{"error":{"type":"x","reason":"FAKE"}}`)}, true, 1, nil},
 		{"oversized 404 emits nothing", []func() bodytransport.Reply{bodytransport.Static(http.StatusNotFound, strings.Repeat(" ", esresponse.MaxRejectionBodyBytes+10))}, true, 1, nil},
-		{"unreadable 404 emits nothing", []func() bodytransport.Reply{readFailed(http.StatusNotFound, `{`, errors.New("read failed"))}, true, 1, nil},
+		{"unreadable 404 emits nothing", []func() bodytransport.Reply{bodytransport.ReadFail(http.StatusNotFound, `{`, errors.New("read failed"))}, true, 1, nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -92,7 +92,7 @@ func TestDeletePoliciesNotices(t *testing.T) {
 		{"success emits nothing", bodytransport.Static(http.StatusOK, `{"acknowledged":true}`), false, nil},
 		{"terminal rejection emits nothing", bodytransport.Static(http.StatusInternalServerError, `{"error":{"type":"x","reason":"FAKE"}}`), true, nil},
 		{"oversized 404 emits nothing", bodytransport.Static(http.StatusNotFound, strings.Repeat(" ", esresponse.MaxRejectionBodyBytes+10)), true, nil},
-		{"unreadable 404 emits nothing", readFailed(http.StatusNotFound, `{`, errors.New("read failed")), true, nil},
+		{"unreadable 404 emits nothing", bodytransport.ReadFail(http.StatusNotFound, `{`, errors.New("read failed")), true, nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -121,7 +121,7 @@ func TestPolicyGCNotices(t *testing.T) {
 		reply func() bodytransport.Reply
 		want  []observe.Notice
 	}{
-		{"transport failure", func() bodytransport.Reply { return bodytransport.Reply{Err: errors.New("dial FAKE")} }, gcFailed("Managed policy GC failed while deleting policy")},
+		{"transport failure", bodytransport.Fail(errors.New("dial FAKE")), gcFailed("Managed policy GC failed while deleting policy")},
 		{"HTTP rejection", bodytransport.Static(http.StatusConflict, `{"error":{"type":"x","reason":"FAKE password=hunter2"}}`), gcFailed("Managed policy GC could not delete policy")},
 		{"already absent emits nothing", bodytransport.Static(http.StatusNotFound, `{"error":{"type":"resource_not_found_exception"}}`), nil},
 		{"success emits nothing", bodytransport.Static(http.StatusOK, `{"acknowledged":true}`), nil},
